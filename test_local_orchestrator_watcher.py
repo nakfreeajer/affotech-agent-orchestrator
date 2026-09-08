@@ -655,6 +655,25 @@ def test_wrong_child_project_fails_closed_before_process_or_prompt_delivery(tmp_
         raise AssertionError("wrong project was accepted")
 
 
+def test_child_project_identity_does_not_require_hybrid_v2_branch(tmp_path):
+    from local_orchestrator_watcher import verify_child_project_binding
+    (tmp_path / ".git").mkdir()
+    calls = []
+    import local_orchestrator_watcher as watcher_module
+    original = watcher_module.subprocess.check_output
+    def fake_check_output(args, **kwargs):
+        calls.append(args)
+        if "--show-toplevel" in args: return str(tmp_path)
+        return "origin\thttps://github.com/nakfreeajer/affotech-system-v2-hybrid.git (fetch)\n"
+    watcher_module.subprocess.check_output = fake_check_output
+    try:
+        identity = verify_child_project_binding(str(tmp_path))
+    finally:
+        watcher_module.subprocess.check_output = original
+    assert identity["repositoryIdentity"] == "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
+    assert all("branch" not in call for call in calls)
+
+
 def test_result_submission_key_is_publication_and_result_identity():
     assert result_submission_key("PUB-A", "result") != result_submission_key("PUB-B", "result")
     assert result_submission_key("PUB-A", "result") == result_submission_key("PUB-A", "result")

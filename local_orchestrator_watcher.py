@@ -25,7 +25,7 @@ RELAY_REPOSITORY = "https://github.com/nakfreeajer/affotech-agent-relay.git"
 RELAY_POINTER = "relay/current/LATEST_ARCHITECT_PROMPT.json"
 RESULT_SCHEMA_VERSION = "1.0"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
-AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\Projects\AffotechSystemV2Hybrid"
+AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
 
 
