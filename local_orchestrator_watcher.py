@@ -24,6 +24,8 @@ DOCUMENTATION_SYNC = "DOCUMENTATION_SYNC_COMPLETE"
 RELAY_REPOSITORY = "https://github.com/nakfreeajer/affotech-agent-relay.git"
 RELAY_POINTER = "relay/current/LATEST_ARCHITECT_PROMPT.json"
 RESULT_SCHEMA_VERSION = "1.0"
+ARCHITECT_MEMORY_THRESHOLD_BYTES = 1_073_741_824
+ARCHITECT_MEMORY_THRESHOLD_MIB = 1024
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
@@ -39,6 +41,43 @@ class ResultSubmissionError(RuntimeError):
     def __init__(self, code: str, detail: str | None = None):
         self.code = code
         super().__init__(f"{code}{':' + detail if detail else ''}")
+
+
+def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[str, Any]] | None = None) -> int:
+    """Return working-set bytes for one explicitly governed Windows process tree.
+
+    Ownership is established by the caller-provided root PID; process names are
+    never used as an identity heuristic.  The optional rows argument makes the
+    aggregation deterministic in tests.
+    """
+    if not isinstance(root_pid, int) or root_pid <= 0:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
+    if process_rows is None:
+        if os.name != "nt":
+            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
+        script = "Get-CimInstance Win32_Process | ForEach-Object { $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { '{0}`t{1}`t{2}' -f $_.ProcessId, $_.ParentProcessId, $p.WorkingSet64 } }"
+        try:
+            raw = subprocess.check_output(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], text=True, encoding="utf-8", errors="strict")
+            process_rows = []
+            for line in raw.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 3:
+                    process_rows.append({"pid": int(parts[0]), "parentPid": int(parts[1]), "workingSet": int(parts[2])})
+        except (OSError, subprocess.CalledProcessError, ValueError, UnicodeError) as error:
+            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED") from error
+    by_parent: dict[int, list[dict[str, Any]]] = {}
+    for row in process_rows:
+        by_parent.setdefault(int(row["parentPid"]), []).append(row)
+    pids = {root_pid}
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
+        for row in by_parent.get(parent, []):
+            pid = int(row["pid"])
+            if pid not in pids:
+                pids.add(pid)
+                pending.append(pid)
+    return sum(int(row.get("workingSet", 0)) for row in process_rows if int(row["pid"]) in pids)
 
 
 def stable_json(value: Any) -> str:
@@ -268,7 +307,7 @@ ARCHITECT_HANDOVER_READY"""
 
 
 class ArchitectSessionRollover:
-    """Small crash-safe state machine for the approved 30-response rollover."""
+    """Small crash-safe state machine with memory-first rollover policy."""
     def __init__(self, watcher: "LocalWatcher"):
         self.watcher = watcher
 
@@ -276,7 +315,41 @@ class ArchitectSessionRollover:
         self.watcher.state["architectResponseCount"] = 0
         self.watcher.state["handoverRequested"] = False
         self.watcher.state["handoverReady"] = False
+        self.watcher.state["rolloverPending"] = False
+        self.watcher.state.pop("rolloverTrigger", None)
         self.watcher.save()
+
+    def sample_memory(self, memory_reader: Callable[[], int] | None = None, emit: Callable[[str], None] = print) -> str | None:
+        """Sample only the explicitly governed Architect process tree."""
+        reader = memory_reader or getattr(self.watcher, "architect_memory_reader", None)
+        if reader is None:
+            return None
+        try:
+            memory_bytes = reader()
+        except RuntimeError as error:
+            self.watcher.state["architectMemoryOwnership"] = "INCONCLUSIVE"
+            self.watcher.state["architectMemoryError"] = str(error)
+            self.watcher.save()
+            return None
+        if not isinstance(memory_bytes, int) or memory_bytes < 0:
+            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_INVALID")
+        self.watcher.state["architectMemoryBytes"] = memory_bytes
+        self.watcher.state["architectMemoryMiB"] = round(memory_bytes / (1024 * 1024), 2)
+        trigger = self.rollover_trigger(memory_bytes, int(self.watcher.state.get("architectResponseCount", 0)))
+        if trigger and not self.watcher.state.get("rolloverPending"):
+            self.watcher.state["rolloverPending"] = True
+            self.watcher.state["rolloverTrigger"] = trigger
+            self.watcher.save()
+            emit(f"ROLLOVER_PENDING trigger={trigger}")
+        return trigger
+
+    @staticmethod
+    def rollover_trigger(memory_bytes: int, response_count: int = 0) -> str | None:
+        if memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES:
+            return "MEMORY_THRESHOLD"
+        if response_count >= 30:
+            return "RESPONSE_COUNT_FALLBACK"
+        return None
 
     def observe_complete_response(self, response: str, response_id: str | None = None) -> bool:
         if self.watcher.state.get("handoverRequested") or not architect_response_finished(response):
@@ -289,11 +362,16 @@ class ArchitectSessionRollover:
         self.watcher.save()
         return True
 
-    def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print) -> bool:
-        if int(self.watcher.state.get("architectResponseCount", 0)) < 30:
+    def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False) -> bool:
+        count = int(self.watcher.state.get("architectResponseCount", 0))
+        memory_bytes = int(self.watcher.state.get("architectMemoryBytes", 0))
+        trigger = self.watcher.state.get("rolloverTrigger") or self.rollover_trigger(memory_bytes, count)
+        if not trigger:
             return False
-        if not latest_prompt_dispatched or not executor_running or self.watcher.state.get("handoverRequested"):
+        if architect_generating or not latest_prompt_dispatched or not executor_running or self.watcher.state.get("handoverRequested"):
             return False
+        self.watcher.state["rolloverPending"] = True
+        self.watcher.state["rolloverTrigger"] = trigger
         self.watcher.state["handoverRequested"] = True
         self.watcher.state["handoverReady"] = False
         self.watcher.save()
@@ -322,6 +400,8 @@ class ArchitectSessionRollover:
             self.watcher.state["architectResponseCount"] = 0
             self.watcher.state["handoverRequested"] = False
             self.watcher.state["handoverReady"] = False
+            self.watcher.state["rolloverPending"] = False
+            self.watcher.state.pop("rolloverTrigger", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
             emit("ARCHITECT_SESSION_ROLLOVER_COMPLETE")
@@ -1008,6 +1088,9 @@ class LocalWatcher:
         if "architectResponseCount" not in self.state:
             self.state["architectResponseCount"] = 0
         self.loop_guard = LoopGuard(self.state)
+        root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
+        self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
+        self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
         self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR)
         self.session_rollover = ArchitectSessionRollover(self)
 
@@ -1207,6 +1290,7 @@ class LocalWatcher:
         return {**observed, "prompt": prompt}, next_baseline
 
     def run_forever(self, bridge: ArchitectPlaywright, sleep_seconds: float = 0.5, response_timeout: float = 120.0, emit: Callable[[str], None] = print) -> None:
+        self.session_rollover.sample_memory(emit=emit)
         baseline = bridge.assistant_baseline()
         emit("ARCHITECT_CONNECTED")
         emit(f"STARTUP_SCAN_MOUNTED count={bridge.assistant_count()}")
@@ -1229,6 +1313,7 @@ class LocalWatcher:
         else:
             emit("STATE=IDLE")
         while True:
+            self.session_rollover.sample_memory(emit=emit)
             observed, next_baseline = self.observe_response(bridge, baseline, response_timeout)
             if observed["state"] == "NOT_YET":
                 continue

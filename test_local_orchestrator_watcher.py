@@ -338,6 +338,54 @@ def test_architect_rollover_requires_running_executor_and_dedupes_events(tmp_pat
     assert bridge.calls == 1
 
 
+def test_architect_memory_tree_aggregates_only_owned_root_and_descendants():
+    from local_orchestrator_watcher import architect_process_tree_memory_bytes
+    rows = [
+        {"pid": 10, "parentPid": 1, "workingSet": 100},
+        {"pid": 11, "parentPid": 10, "workingSet": 200},
+        {"pid": 12, "parentPid": 11, "workingSet": 300},
+        {"pid": 99, "parentPid": 1, "workingSet": 9999},
+    ]
+    assert architect_process_tree_memory_bytes(10, rows) == 600
+
+
+def test_memory_threshold_is_primary_and_creates_one_pending_rollover(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_THRESHOLD_BYTES
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    rollover = ArchitectSessionRollover(watcher)
+    lines = []
+    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES, lines.append) == "MEMORY_THRESHOLD"
+    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES + 1, lines.append) == "MEMORY_THRESHOLD"
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
+    assert lines == ["ROLLOVER_PENDING trigger=MEMORY_THRESHOLD"]
+
+
+def test_rollover_waits_for_generation_and_requests_once_after_threshold(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_THRESHOLD_BYTES
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    rollover = ArchitectSessionRollover(watcher)
+    rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES, lambda _: None)
+    class Bridge:
+        def __init__(self): self.calls = 0
+        def submit_result_bounded(self, value): self.calls += 1
+    bridge = Bridge()
+    assert not rollover.request_if_due(bridge, True, True, lambda _: None, architect_generating=True)
+    assert rollover.request_if_due(bridge, True, True, lambda _: None)
+    assert not rollover.request_if_due(bridge, True, True, lambda _: None)
+    assert bridge.calls == 1
+
+
+def test_response_count_remains_fallback_when_memory_is_below_threshold(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    rollover = ArchitectSessionRollover(watcher)
+    watcher.state["architectResponseCount"] = 29
+    assert rollover.rollover_trigger(0, 29) is None
+    assert rollover.rollover_trigger(0, 30) == "RESPONSE_COUNT_FALLBACK"
+    assert rollover.rollover_trigger(1_073_741_824, 0) == "MEMORY_THRESHOLD"
+
+
 def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab_failure(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
