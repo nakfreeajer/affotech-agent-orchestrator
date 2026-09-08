@@ -30,6 +30,9 @@ AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
+DOCUMENTATION_KINDS = frozenset({"IMPLEMENTATION", "BUG_FIX", "REPAIR", "RECOVERY", "ARCHITECTURE_CHANGE", "GOVERNANCE_CHANGE", "INCIDENT_CLOSURE"})
+DOCUMENTATION_REQUIRED = "REQUIRED"
+DOCUMENTATION_NONE = "NONE"
 
 
 class RelayAuthorityError(RuntimeError):
@@ -42,6 +45,78 @@ class ResultSubmissionError(RuntimeError):
     def __init__(self, code: str, detail: str | None = None):
         self.code = code
         super().__init__(f"{code}{':' + detail if detail else ''}")
+
+
+def documentation_requirement(accepted_record: dict[str, Any]) -> tuple[bool, str | None]:
+    """Evaluate structured accepted-state fields only; prose is never inspected."""
+    if accepted_record.get("classification") != "ACCEPTED" and accepted_record.get("accepted") is not True:
+        return False, None
+    override = accepted_record.get("documentationOnAcceptance")
+    if override == DOCUMENTATION_NONE:
+        return False, None
+    if override == DOCUMENTATION_REQUIRED:
+        return True, "EXPLICIT_DOCUMENTATION_REQUIRED"
+    kind = accepted_record.get("milestoneKind")
+    if kind in DOCUMENTATION_KINDS:
+        if kind == "INCIDENT_CLOSURE":
+            return True, "ACCEPTED_INCIDENT_CLOSURE"
+        if kind == "REPAIR":
+            return True, "ACCEPTED_REPAIR"
+        if kind == "BUG_FIX":
+            return True, "ACCEPTED_BUG_FIX"
+        if kind == "RECOVERY":
+            return True, "ACCEPTED_RECOVERY"
+        return True, f"ACCEPTED_{kind}"
+    if accepted_record.get("implementationChanged") is True or accepted_record.get("implementationCommit"):
+        return True, "ACCEPTED_IMPLEMENTATION_CHANGE"
+    if accepted_record.get("problemDetected") is True and accepted_record.get("problemResolved") is True:
+        return True, "ACCEPTED_DISCOVERED_AND_RESOLVED_PROBLEM"
+    return False, None
+
+
+class DocumentationDoorbell:
+    """Exactly-once Architect doorbell for structured accepted milestones."""
+    def __init__(self, watcher: "LocalWatcher"):
+        self.watcher = watcher
+
+    def evaluate_and_trigger(self, accepted_record: dict[str, Any], bridge: Any, emit: Callable[[str], None] = print) -> str:
+        required, reason = documentation_requirement(accepted_record)
+        if not required:
+            self.watcher.state["documentationStatus"] = "NOT_REQUIRED"
+            self.watcher.save()
+            return "NOT_REQUIRED"
+        milestone_id = accepted_record.get("milestoneId") or accepted_record.get("milestone")
+        publication_id = accepted_record.get("acceptedPublicationId") or accepted_record.get("publicationId")
+        if not isinstance(milestone_id, str) or not isinstance(publication_id, str):
+            raise RuntimeError("DOCUMENTATION_ACCEPTED_IDENTITY_MISSING")
+        key = f"{milestone_id}:{publication_id}"
+        if self.watcher.state.get("documentationStatus") in {"TRIGGER_SENT", "CURATOR_PENDING", "COMPLETE"} and self.watcher.state.get("docTriggerKey") == key:
+            return self.watcher.state["documentationStatus"]
+        message = "\n".join([
+            "DOCUMENTATION_SYNC_REQUIRED",
+            f"reason={reason}",
+            f"milestone={milestone_id}",
+            f"acceptedPublication={publication_id}",
+            f"implementationCommit={accepted_record.get('implementationCommit') or 'NONE'}",
+            f"problemId={accepted_record.get('problemId') or 'NONE'}",
+            f"milestoneKind={accepted_record.get('milestoneKind') or 'NONE'}",
+            "documentationStatus=PENDING",
+            "Issue the bounded Documentation Curator instruction for this accepted milestone.",
+            "Do not reopen accepted implementation.",
+        ])
+        send = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result", None)
+        if send is None:
+            raise RuntimeError("ARCHITECT_DOORBELL_UNAVAILABLE")
+        self.watcher.state["documentationStatus"] = "PENDING"
+        self.watcher.state["documentationReason"] = reason
+        self.watcher.state["docTriggerKey"] = key
+        self.watcher.save()
+        send(message)
+        self.watcher.state["documentationStatus"] = "TRIGGER_SENT"
+        self.watcher.state["documentationTriggerCount"] = int(self.watcher.state.get("documentationTriggerCount", 0)) + 1
+        self.watcher.save()
+        emit("DOCUMENTATION_SYNC_REQUIRED")
+        return "TRIGGER_SENT"
 
 
 def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[str, Any]] | None = None) -> int:
@@ -1099,6 +1174,7 @@ class LocalWatcher:
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
         self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
         self.session_rollover = ArchitectSessionRollover(self)
+        self.documentation_doorbell = DocumentationDoorbell(self)
 
     def startup_candidate(self, bridge: ArchitectPlaywright, scan_history: bool = True, emit: Callable[[str], None] | None = None) -> str | None:
         """Find a fresh completed prompt without requiring a new response."""

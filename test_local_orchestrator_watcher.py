@@ -395,6 +395,51 @@ def test_pending_rollover_blocks_new_relay_execution(tmp_path):
     assert watcher.run_relay_once(Source(), None, emit=lambda _: None) == "ROLLOVER_PENDING"
 
 
+def test_documentation_requires_structured_architect_acceptance_and_dedupes(tmp_path):
+    from local_orchestrator_watcher import DocumentationDoorbell, documentation_requirement
+    record = {"classification": "ACCEPTED", "milestoneId": "M-1", "acceptedPublicationId": "PUB-1", "milestoneKind": "IMPLEMENTATION", "implementationCommit": "abc"}
+    assert documentation_requirement(record) == (True, "ACCEPTED_IMPLEMENTATION")
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    class Bridge:
+        def __init__(self): self.messages = []
+        def submit_result_bounded(self, value): self.messages.append(value)
+    bridge = Bridge(); doorbell = DocumentationDoorbell(watcher)
+    assert doorbell.evaluate_and_trigger(record, bridge, lambda _: None) == "TRIGGER_SENT"
+    assert doorbell.evaluate_and_trigger(record, bridge, lambda _: None) == "TRIGGER_SENT"
+    assert len(bridge.messages) == 1
+    assert "problemDetected" not in bridge.messages[0]
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["docTriggerKey"] == "M-1:PUB-1"
+    assert saved["documentationTriggerCount"] == 1
+
+
+def test_documentation_trigger_defaults_and_overrides_are_fail_closed(tmp_path):
+    from local_orchestrator_watcher import documentation_requirement
+    base = {"classification": "ACCEPTED"}
+    for kind in ("BUG_FIX", "REPAIR", "RECOVERY", "ARCHITECTURE_CHANGE", "GOVERNANCE_CHANGE", "INCIDENT_CLOSURE"):
+        assert documentation_requirement({**base, "milestoneKind": kind})[0] is True
+    assert documentation_requirement({**base, "milestoneKind": "DIAGNOSTIC"}) == (False, None)
+    assert documentation_requirement({"classification": "BLOCKED", "milestoneKind": "REPAIR"}) == (False, None)
+    assert documentation_requirement({**base, "milestoneKind": "IMPLEMENTATION", "documentationOnAcceptance": "NONE"}) == (False, None)
+    assert documentation_requirement({**base, "documentationOnAcceptance": "REQUIRED"})[0] is True
+    assert documentation_requirement({**base, "problemDetected": True, "problemResolved": True}) == (True, "ACCEPTED_DISCOVERED_AND_RESOLVED_PROBLEM")
+    assert documentation_requirement({**base, "problemDetected": True, "problemResolved": False}) == (False, None)
+
+
+def test_documentation_restart_does_not_duplicate_trigger(tmp_path):
+    from local_orchestrator_watcher import DocumentationDoorbell
+    record = {"classification": "ACCEPTED", "milestone": "M-2", "publicationId": "PUB-2", "milestoneKind": "REPAIR"}
+    state_path = tmp_path / "state.json"
+    first = LocalWatcher(str(tmp_path), state_path, runner=object())
+    class Bridge:
+        def __init__(self): self.messages = []
+        def submit_result_bounded(self, value): self.messages.append(value)
+    b1 = Bridge(); assert DocumentationDoorbell(first).evaluate_and_trigger(record, b1, lambda _: None) == "TRIGGER_SENT"
+    second = LocalWatcher(str(tmp_path), state_path, runner=object())
+    b2 = Bridge(); assert DocumentationDoorbell(second).evaluate_and_trigger(record, b2, lambda _: None) == "TRIGGER_SENT"
+    assert b1.messages and not b2.messages
+
+
 def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab_failure(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
