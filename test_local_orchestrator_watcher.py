@@ -186,6 +186,17 @@ def test_relay_reader_pins_all_authority_reads_to_remote_head_not_dirty_worktree
     assert ref == git(cache, "rev-parse", "refs/remotes/origin/main")
     assert source.read_current()["publicationId"] == publication
     assert source.captured_ref == ref
+    class Runner:
+        def __init__(self): self.calls = []
+        def run(self, prompt, timeout):
+            self.calls.append(prompt)
+            return CodexResult("COMPLETED", "fixture result", 0, False)
+    class Bridge:
+        def submit_result(self, result): pass
+    runner = Runner()
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=runner)
+    assert watcher.run_relay_once(source, Bridge(), emit=lambda _: None) == "COMPLETED"
+    assert runner.calls == [prompt]
 
 
 def test_bootstrap_is_required_and_precedes_exact_task(tmp_path):
