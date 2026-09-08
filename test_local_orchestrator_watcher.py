@@ -386,6 +386,15 @@ def test_response_count_remains_fallback_when_memory_is_below_threshold(tmp_path
     assert rollover.rollover_trigger(1_073_741_824, 0) == "MEMORY_THRESHOLD"
 
 
+def test_pending_rollover_blocks_new_relay_execution(tmp_path):
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.state["rolloverPending"] = True
+    class Source:
+        def read_current(self):
+            return {"publicationId": "PUB-" + "a" * 32, "contentSha256": "b" * 64, "prompt": "must not run"}
+    assert watcher.run_relay_once(Source(), None, emit=lambda _: None) == "ROLLOVER_PENDING"
+
+
 def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab_failure(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())

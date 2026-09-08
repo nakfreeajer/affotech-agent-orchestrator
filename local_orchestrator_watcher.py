@@ -1151,6 +1151,9 @@ class LocalWatcher:
         publication_id = observation["publicationId"]
         relay_key = relay_task_key(publication_id, observation["contentSha256"])
         emit(f"LATEST_PROMPT publication={publication_id}")
+        if self.state.get("rolloverPending") and not self.state.get("handoverRequested"):
+            emit("STATE=ROLLOVER_PENDING")
+            return "ROLLOVER_PENDING"
         if self.state.get("result_pending"):
             pending_key = self.state.get("in_flight_relay_key") or relay_key
             result_path = self.state.get("result_file")
