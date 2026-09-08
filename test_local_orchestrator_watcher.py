@@ -1,4 +1,6 @@
 import json
+import hashlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -143,6 +145,47 @@ def test_relay_pointer_and_manifest_are_verified_from_one_captured_ref():
     from local_orchestrator_watcher import RELAY_POINTER
     result = Source().read_current()
     assert result["prompt"] == "EXACT RELAY PROMPT"
+
+
+def test_relay_reader_pins_all_authority_reads_to_remote_head_not_dirty_worktree(tmp_path):
+    """A fetched remote snapshot wins over a stale local checkout."""
+    bare = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    cache = tmp_path / "cache"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main", str(seed)], check=True, capture_output=True)
+    def git(path, *args):
+        return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
+    git(seed, "config", "user.email", "test@example.invalid")
+    git(seed, "config", "user.name", "Test")
+    git(seed, "remote", "add", "origin", str(bare))
+    publication = "PUB-" + "a" * 32
+    prompt = "REMOTE SNAPSHOT → prompt\n"
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    manifest = {"protocolVersion":"1.0", "publicationId":publication,
+                "contentSha256":digest, "recipientRole":"EXECUTOR",
+                "status":"READY_FOR_EXECUTION", "executionTarget":"WINDOWS_LOCAL_CODEX",
+                "requiredInvariantSetId":"AFFOTECH-NR-001", "requiredInvariantContentSha256":"a" * 64,
+                "prompt":prompt}
+    pointer = {"publicationId":publication, "contentSha256":digest}
+    current = seed / "relay" / "current"
+    prompt_dir = seed / "relay" / "architect" / "prompts" / publication
+    current.mkdir(parents=True)
+    prompt_dir.mkdir(parents=True)
+    (current / "LATEST_ARCHITECT_PROMPT.json").write_text(json.dumps(pointer), encoding="utf-8")
+    (prompt_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (prompt_dir / "prompt.md").write_bytes(prompt.encode("utf-8"))
+    git(seed, "add", "."); git(seed, "commit", "-m", "remote authority"); git(seed, "push", "origin", "main")
+    subprocess.run(["git", "-C", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(bare), str(cache)], check=True, capture_output=True)
+    # Make the cache working tree disagree and create a newer remote snapshot.
+    (cache / "relay" / "current" / "LATEST_ARCHITECT_PROMPT.json").write_text("{\"stale\":true}", encoding="utf-8")
+    git(seed, "commit", "--allow-empty", "-m", "remote followup"); git(seed, "push", "origin", "main")
+    source = RelayPromptSource(cache)
+    ref = source.refresh()
+    assert ref == git(cache, "rev-parse", "refs/remotes/origin/main")
+    assert source.read_current()["publicationId"] == publication
+    assert source.captured_ref == ref
 
 
 def test_bootstrap_is_required_and_precedes_exact_task(tmp_path):

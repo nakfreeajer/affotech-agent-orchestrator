@@ -227,15 +227,23 @@ class RelayPromptSource:
             subprocess.run(["git", "-C", str(self.cache_dir), "fetch", "--quiet", "origin", "main"], check=True, capture_output=True, text=True)
         except (OSError, subprocess.CalledProcessError) as error:
             raise RelayAuthorityError(f"RELAY_FETCH_FAILED:{error}") from error
-        self.captured_ref = self._git("rev-parse", "FETCH_HEAD")
+        # Pin every authority read to the remote-tracking ref resolved after
+        # fetch.  FETCH_HEAD is mutable fetch bookkeeping and may be stale or
+        # refer to a different fetch in a shared cache.
+        self.captured_ref = self._git("rev-parse", "refs/remotes/origin/main")
         return self.captured_ref
 
-    def _show_json(self, path: str) -> dict[str, Any]:
+    def _show_bytes(self, path: str) -> bytes:
         if not self.captured_ref:
             raise RelayAuthorityError("RELAY_REF_NOT_CAPTURED")
         try:
-            raw = subprocess.check_output(["git", "-C", str(self.cache_dir), "show", f"{self.captured_ref}:{path}"], text=True, encoding="utf-8")
-            value = json.loads(raw)
+            return subprocess.check_output(["git", "-C", str(self.cache_dir), "show", f"{self.captured_ref}:{path}"])
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RelayAuthorityError(f"RELAY_OBJECT_INVALID:{path}") from error
+
+    def _show_json(self, path: str) -> dict[str, Any]:
+        try:
+            value = json.loads(self._show_bytes(path).decode("utf-8"))
         except (OSError, subprocess.CalledProcessError, UnicodeError, json.JSONDecodeError) as error:
             raise RelayAuthorityError(f"RELAY_OBJECT_INVALID:{path}") from error
         if not isinstance(value, dict):
@@ -268,8 +276,21 @@ class RelayPromptSource:
         prompt = manifest.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise RelayAuthorityError("RELAY_PROMPT_EMPTY")
-        if hashlib.sha256(prompt.encode("utf-8")).hexdigest() != pointer_hash:
+        prompt_bytes = prompt.encode("utf-8")
+        if hashlib.sha256(prompt_bytes).hexdigest() != pointer_hash:
             raise RelayAuthorityError("RELAY_CONTENT_HASH_MISMATCH")
+        # Real relay publications carry prompt.md as the immutable prompt
+        # artifact.  Compare its raw bytes to the decoded manifest prompt,
+        # while allowing lightweight unit doubles without a Git object store.
+        if (self.cache_dir / ".git").exists():
+            try:
+                published_prompt_bytes = self._show_bytes(manifest_path.rsplit("/", 1)[0] + "/prompt.md")
+            except RelayAuthorityError as error:
+                if "prompt.md" in str(error):
+                    raise RelayAuthorityError("RELAY_PROMPT_ARTIFACT_MISSING") from error
+                raise
+            if published_prompt_bytes != prompt_bytes:
+                raise RelayAuthorityError("RELAY_PROMPT_ARTIFACT_MISMATCH")
         return {"publicationId": publication_id, "contentSha256": pointer_hash, "prompt": prompt, "manifest": manifest}
 
 
