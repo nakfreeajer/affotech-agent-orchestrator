@@ -291,7 +291,8 @@ class RelayPromptSource:
                 raise
             if published_prompt_bytes != prompt_bytes:
                 raise RelayAuthorityError("RELAY_PROMPT_ARTIFACT_MISMATCH")
-        return {"publicationId": publication_id, "contentSha256": pointer_hash, "prompt": prompt, "manifest": manifest}
+        return {"snapshotCommit": self.captured_ref, "publicationId": publication_id, "contentSha256": pointer_hash,
+                "promptBytes": prompt_bytes, "prompt": prompt, "manifest": manifest}
 
 
 def normalize_prompt(text: str) -> str:
@@ -554,9 +555,10 @@ class CodexRunner:
         self.on_start: Callable[[int], None] | None = None
         self.lifecycle_state = "CLOSED"
         self.active_child_pid: int | None = None
+        self.relay_authority: dict[str, Any] | None = None
 
     def run(self, prompt: str, timeout: float = 300.0) -> CodexResult:
-        assembled_prompt = self.assemble_prompt(prompt)
+        assembled_prompt = self.assemble_prompt(prompt, self.relay_authority)
         try:
             assembled_prompt_bytes = assembled_prompt.encode("utf-8", errors="strict")
         except UnicodeEncodeError as error:
@@ -731,14 +733,28 @@ process.stdin.on("end", () => {
             return CodexResult("BLOCKED", output, exit_code, False, stdout, stderr, last_message_path, bool(last_message))
         return CodexResult("COMPLETED" if last_message.strip() else "STALLED", output, exit_code, False, stdout, stderr, last_message_path, bool(last_message))
 
-    def assemble_prompt(self, task_prompt: str) -> str:
+    def assemble_prompt(self, task_prompt: str, relay_authority: dict[str, Any] | None = None) -> str:
         try:
             bootstrap = self.bootstrap_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             raise RuntimeError(f"AFFOTECH_EXECUTOR_BOOTSTRAP_UNAVAILABLE:{self.bootstrap_path}") from error
         if not bootstrap.strip():
             raise RuntimeError("AFFOTECH_EXECUTOR_BOOTSTRAP_EMPTY")
-        return bootstrap.rstrip("\r\n") + "\n\n" + task_prompt
+        context = ""
+        if relay_authority is not None:
+            snapshot = relay_authority.get("snapshotCommit")
+            publication = relay_authority.get("publicationId")
+            content_hash = relay_authority.get("contentSha256")
+            if not all(isinstance(value, str) and value for value in (snapshot, publication, content_hash)):
+                raise RuntimeError("RELAY_AUTHORITY_CONTEXT_INVALID")
+            context = "\n\n".join((
+                "ORCHESTRATOR_VALIDATED_RELAY_SNAPSHOT",
+                f"snapshotCommit={snapshot}",
+                f"publicationId={publication}",
+                f"contentSha256={content_hash}",
+                "Use this already-validated immutable snapshot for the current task; do not substitute another relay generation.",
+            ))
+        return bootstrap.rstrip("\r\n") + ("\n\n" + context if context else "") + "\n\n" + task_prompt
 
 
 def discover_codex_launcher(executable: str = "codex") -> list[str]:
@@ -1308,7 +1324,8 @@ class LocalWatcher:
         try:
             self._execution_publication_id = publication_id
             self._execution_dispatch_id = observation.get("dispatchId")
-            submitted = self._execute_prompt(bridge, observation["prompt"], timeout, emit)
+            authority = observation if observation.get("snapshotCommit") else None
+            submitted = self._execute_prompt(bridge, observation["prompt"], timeout, emit, relay_authority=authority)
         except Exception:
             self.save()
             raise
@@ -1438,8 +1455,10 @@ class LocalWatcher:
             emit("STATE=IDLE")
             time.sleep(sleep_seconds)
 
-    def _execute_prompt(self, bridge: ArchitectPlaywright | None, prompt: str, timeout: float, emit: Callable[[str], None], publication_id: str | None = None, dispatch_id: str | None = None) -> bool:
+    def _execute_prompt(self, bridge: ArchitectPlaywright | None, prompt: str, timeout: float, emit: Callable[[str], None], publication_id: str | None = None, dispatch_id: str | None = None, relay_authority: dict[str, Any] | None = None) -> bool:
         emit("EXECUTOR_PROMPT_READY")
+        if relay_authority is not None:
+            self.runner.relay_authority = relay_authority
         if hasattr(self.runner, "on_start"):
             self.runner.on_start = lambda pid: emit(f"CODEX_STARTED pid={pid}")
         result = self.forward(prompt, timeout=timeout)

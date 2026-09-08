@@ -187,7 +187,7 @@ def test_relay_reader_pins_all_authority_reads_to_remote_head_not_dirty_worktree
     assert source.read_current()["publicationId"] == publication
     assert source.captured_ref == ref
     class Runner:
-        def __init__(self): self.calls = []
+        def __init__(self): self.calls = []; self.relay_authority = None
         def run(self, prompt, timeout):
             self.calls.append(prompt)
             return CodexResult("COMPLETED", "fixture result", 0, False)
@@ -197,6 +197,8 @@ def test_relay_reader_pins_all_authority_reads_to_remote_head_not_dirty_worktree
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=runner)
     assert watcher.run_relay_once(source, Bridge(), emit=lambda _: None) == "COMPLETED"
     assert runner.calls == [prompt]
+    assert runner.relay_authority["snapshotCommit"] == ref
+    assert runner.relay_authority["publicationId"] == publication
 
 
 def test_bootstrap_is_required_and_precedes_exact_task(tmp_path):
@@ -304,7 +306,7 @@ def test_relay_prompt_discovery_does_not_read_architect_dom(tmp_path):
         def __getattr__(self, name): raise AssertionError(f"Architect DOM read: {name}")
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     seen = []
-    def intercepted(bridge, prompt, timeout, emit): seen.append((bridge, prompt)); return True
+    def intercepted(bridge, prompt, timeout, emit, **kwargs): seen.append((bridge, prompt)); return True
     watcher._execute_prompt = intercepted
     assert watcher.run_relay_once(Source(), ForbiddenArchitect(), emit=lambda _: None) == "COMPLETED"
     assert seen[0][1] == "relay prompt"
