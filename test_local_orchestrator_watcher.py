@@ -731,6 +731,44 @@ def test_child_project_identity_does_not_require_hybrid_v2_branch(tmp_path):
     assert all("branch" not in call for call in calls)
 
 
+def test_affotech_codex_runner_resumes_dedicated_session_from_bound_cwd(tmp_path, monkeypatch):
+    import local_orchestrator_watcher as watcher_module
+    bootstrap = tmp_path / "bootstrap.md"
+    bootstrap.write_text("AFFOTECH COLD START\n", encoding="utf-8")
+    calls = {}
+    class Process:
+        pid = 4321
+        def communicate(self, input=None, timeout=None):
+            calls["input"] = input
+            return "", ""
+        def poll(self): return 0
+        def wait(self): return 0
+    def fake_popen(command, **kwargs):
+        calls["command"] = command
+        calls["cwd"] = kwargs["cwd"]
+        return Process()
+    monkeypatch.setattr(watcher_module.subprocess, "Popen", fake_popen)
+    runner = CodexRunner(
+        str(tmp_path), sys.executable, bootstrap_path=bootstrap,
+        child_project_dir=str(tmp_path),
+        child_identity_verifier=lambda cwd: {"childCwd": cwd, "repositoryIdentity": "synthetic"},
+        session_id="019f842e-98bc-7672-a619-51441d91be00",
+    )
+    result = runner.run("CURRENT IMMUTABLE TASK", timeout=1)
+    assert result.exit_code == 0
+    assert calls["cwd"] == str(tmp_path)
+    assert calls["command"][0:3] == [sys.executable, "exec", "resume"]
+    assert "019f842e-98bc-7672-a619-51441d91be00" in calls["command"]
+    assert "--ephemeral" not in calls["command"]
+    assert "AFFOTECH COLD START" in calls["input"]
+    assert "CURRENT IMMUTABLE TASK" in calls["input"]
+
+
+def test_non_affotech_runner_does_not_use_dedicated_affotech_session(tmp_path):
+    runner = CodexRunner(str(tmp_path), executable=sys.executable)
+    assert runner.session_id is None
+
+
 def test_result_submission_key_is_publication_and_result_identity():
     assert result_submission_key("PUB-A", "result") != result_submission_key("PUB-B", "result")
     assert result_submission_key("PUB-A", "result") == result_submission_key("PUB-A", "result")

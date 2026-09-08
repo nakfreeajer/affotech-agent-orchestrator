@@ -26,6 +26,7 @@ RELAY_POINTER = "relay/current/LATEST_ARCHITECT_PROMPT.json"
 RESULT_SCHEMA_VERSION = "1.0"
 ARCHITECT_MEMORY_THRESHOLD_BYTES = 1_073_741_824
 ARCHITECT_MEMORY_THRESHOLD_MIB = 1024
+AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
@@ -444,10 +445,11 @@ class CodexResult:
 
 
 class CodexRunner:
-    def __init__(self, project_dir: str | os.PathLike[str], executable: str = "codex", bootstrap_path: str | os.PathLike[str] | None = None, child_project_dir: str | os.PathLike[str] | None = None, child_identity_verifier: Callable[[str], dict[str, Any]] | None = None):
+    def __init__(self, project_dir: str | os.PathLike[str], executable: str = "codex", bootstrap_path: str | os.PathLike[str] | None = None, child_project_dir: str | os.PathLike[str] | None = None, child_identity_verifier: Callable[[str], dict[str, Any]] | None = None, session_id: str | None = None):
         self.project_dir = str(project_dir)
         self.child_project_dir = str(child_project_dir) if child_project_dir else None
         self.child_identity_verifier = child_identity_verifier or verify_child_project_binding
+        self.session_id = session_id
         self.executable = executable
         self.bootstrap_path = Path(bootstrap_path) if bootstrap_path else Path(self.project_dir) / "AFFOTECH_EXECUTOR_BOOTSTRAP.md"
         self.launcher = discover_codex_launcher(executable)
@@ -469,7 +471,10 @@ class CodexRunner:
             os.unlink(last_message_path)
         except FileNotFoundError:
             pass
-        args = ["exec", "--ephemeral", "--sandbox", "read-only", "-C", self.project_dir, "-o", last_message_path, "-"]
+        if self.session_id:
+            args = ["exec", "resume", self.session_id, "-o", last_message_path, "-"]
+        else:
+            args = ["exec", "--ephemeral", "--sandbox", "read-only", "-C", self.project_dir, "-o", last_message_path, "-"]
         if os.name == "nt" and self.launcher[0].lower().endswith(".ps1"):
             command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", self.executable, *args]
         else:
@@ -477,7 +482,8 @@ class CodexRunner:
         child_cwd = self.child_project_dir or self.project_dir
         if self.child_project_dir:
             self.child_identity = self.child_identity_verifier(child_cwd)
-            command[command.index("-C") + 1] = child_cwd
+            if "-C" in command:
+                command[command.index("-C") + 1] = child_cwd
         if self.lifecycle_state != "CLOSED" or self.running_observed:
             raise RuntimeError("CODEX_CHILD_LIFECYCLE_NOT_CLOSED")
         self.lifecycle_state = "STARTING"
@@ -1091,7 +1097,7 @@ class LocalWatcher:
         root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
         self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
-        self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR)
+        self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
         self.session_rollover = ArchitectSessionRollover(self)
 
     def startup_candidate(self, bridge: ArchitectPlaywright, scan_history: bool = True, emit: Callable[[str], None] | None = None) -> str | None:
