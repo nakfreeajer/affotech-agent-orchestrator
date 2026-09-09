@@ -403,6 +403,52 @@ def result_submission_key(publication_id: str, result_text: str) -> str:
     return f"{publication_id}:{hashlib.sha256(result_text.encode('utf-8')).hexdigest()}"
 
 
+def publish_durable_executor_terminal(evidence_repo: str | os.PathLike[str], relay_publication_id: str, result_text: str, envelope: dict[str, Any]) -> dict[str, Any]:
+    """Publish one immutable terminal and advance the governed terminal pointer."""
+    root = Path(evidence_repo).resolve()
+    result_sha = hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+    publication_id = f"GH-PUB-{hashlib.sha256((relay_publication_id + ':' + result_sha).encode()).hexdigest()[:32]}-EXECUTOR-TERMINAL"
+    terminal_dir = root / "evidence" / "terminal" / "executor" / publication_id
+    terminal_dir.mkdir(parents=True, exist_ok=True)
+    terminal = {"schemaVersion": "1.0", "recordType": "EXECUTOR_TERMINAL", "publicationId": publication_id, "executedRelayPublicationId": relay_publication_id, "resultSha256": result_sha, "status": envelope["status"], "machineResultEnvelope": envelope}
+    receipt = {"schemaVersion": "1.0", "recordType": "EXECUTOR_RECEIPT", "publicationId": publication_id, "executedRelayPublicationId": relay_publication_id, "resultSha256": result_sha, "terminalDurable": True}
+    files = {"terminal.json": stable_json(terminal).encode("utf-8"), "report.md": result_text.encode("utf-8"), "receipt.json": stable_json(receipt).encode("utf-8")}
+    for name, data in files.items():
+        path = terminal_dir / name
+        try:
+            with path.open("xb") as handle:
+                handle.write(data)
+        except FileExistsError:
+            if path.read_bytes() != data:
+                raise RuntimeError("DURABLE_TERMINAL_IMMUTABLE_COLLISION")
+        if path.read_bytes() != data:
+            raise RuntimeError("DURABLE_TERMINAL_READBACK_FAILED")
+    pointer = {"schemaVersion": "1.0", "pointerKind": "LATEST_EXECUTOR_TERMINAL", "publicationId": publication_id, "terminalPath": f"evidence/terminal/executor/{publication_id}/terminal.json", "reportPath": f"evidence/terminal/executor/{publication_id}/report.md", "receiptPath": f"evidence/terminal/executor/{publication_id}/receipt.json", "status": envelope["status"], "executedRelayPublicationId": relay_publication_id, "resultSha256": result_sha}
+    current_dir = root / "evidence" / "current"
+    current_dir.mkdir(parents=True, exist_ok=True)
+    pointer_path = current_dir / "LATEST_EXECUTOR_TERMINAL.json"
+    pointer_data = stable_json(pointer).encode("utf-8")
+    if pointer_path.exists() and pointer_path.read_bytes() != pointer_data:
+        temp = pointer_path.with_name(pointer_path.name + ".pending")
+        try:
+            with temp.open("xb") as handle:
+                handle.write(pointer_data)
+            os.replace(temp, pointer_path)
+        finally:
+            temp.unlink(missing_ok=True)
+    elif not pointer_path.exists():
+        temp = pointer_path.with_name(pointer_path.name + ".pending")
+        try:
+            with temp.open("xb") as handle:
+                handle.write(pointer_data)
+            os.replace(temp, pointer_path)
+        finally:
+            temp.unlink(missing_ok=True)
+    if pointer_path.read_bytes() != pointer_data:
+        raise RuntimeError("DURABLE_TERMINAL_POINTER_READBACK_FAILED")
+    return {"publicationId": publication_id, "pointerPath": str(pointer_path), "resultSha256": result_sha}
+
+
 def verify_child_project_binding(child_cwd: str | os.PathLike[str], expected_remote: str = AFFOTECH_CHILD_REMOTE) -> dict[str, Any]:
     """Read-only project identity gate for the AFFOTECH child boundary."""
     path = Path(child_cwd).resolve()
@@ -1291,7 +1337,7 @@ class ArchitectPlaywright:
 
 
 class LocalWatcher:
-    def __init__(self, project_dir: str, state_path: str | os.PathLike[str] = "orchestrator-state.json", runner: CodexRunner | None = None, durable_decision_reader: Callable[[str], dict[str, Any] | None] | None = None):
+    def __init__(self, project_dir: str, state_path: str | os.PathLike[str] = "orchestrator-state.json", runner: CodexRunner | None = None, durable_decision_reader: Callable[[str], dict[str, Any] | None] | None = None, durable_terminal_publisher: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None):
         self.project_dir = project_dir
         self.state_path = Path(state_path)
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {"cycle_count": 0, "in_flight": False}
@@ -1307,6 +1353,8 @@ class LocalWatcher:
         else:
             evidence_repo = self.state.get("evidenceRepository") or str(Path(project_dir) / ".agent-work" / "evidence-repo")
             self.durable_decision_reader = lambda publication_id: read_matching_architect_decision(evidence_repo, publication_id)
+        evidence_repo = self.state.get("evidenceRepository") or str(Path(project_dir) / ".agent-work" / "evidence-repo")
+        self.durable_terminal_publisher = durable_terminal_publisher or (lambda publication_id, result_text, envelope: publish_durable_executor_terminal(evidence_repo, publication_id, result_text, envelope))
         self.session_rollover = ArchitectSessionRollover(self)
         self.documentation_doorbell = DocumentationDoorbell(self)
 
@@ -1396,6 +1444,26 @@ class LocalWatcher:
             raise RuntimeError("LEGACY_STATE_ATOMIC_WRITE_FAILED")
         return True
 
+    def _ensure_durable_terminal(self, relay_publication_id: str, result_text: str, envelope: dict[str, Any]) -> dict[str, Any]:
+        existing = self.state.get("durable_terminal_publication_id")
+        if self.state.get("durable_terminal_published") and isinstance(existing, str) and existing:
+            return {"publicationId": existing, "resultSha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(), "alreadyPublished": True}
+        published = self.durable_terminal_publisher(relay_publication_id, result_text, envelope)
+        if not isinstance(published, dict) or not isinstance(published.get("publicationId"), str):
+            raise RuntimeError("DURABLE_TERMINAL_PUBLICATION_INVALID")
+        self.state["durable_terminal_publication_id"] = published["publicationId"]
+        self.state["durable_terminal_result_sha256"] = published.get("resultSha256") or hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+        self.state["durable_terminal_published"] = True
+        self.state["durable_terminal_readback"] = True
+        self.save()
+        return published
+
+    def _retire_after_durable_terminal(self, relay_key: str) -> None:
+        self.state["last_completed_relay_key"] = relay_key
+        self.state.pop("in_flight_relay_key", None)
+        self.state["relay_execution_retired"] = True
+        self.save()
+
     def reconcile_durable_recovery(self, emit: Callable[[str], None] = print) -> bool:
         """Clear recovery only after an exact durable Architect decision match."""
         if not self.state.get("in_flight_relay_key"):
@@ -1450,8 +1518,10 @@ class LocalWatcher:
             result_text = None
             try:
                 envelope_path = self.state.get("result_envelope_file") or f"{result_path}.envelope.json"
-                read_result_envelope(envelope_path)
+                envelope = read_result_envelope(envelope_path)
                 result_text = Path(result_path).read_text(encoding="utf-8")
+                self._ensure_durable_terminal(self.state.get("relay_publication_id", publication_id), result_text, envelope)
+                self._retire_after_durable_terminal(pending_key)
                 submission_key = result_submission_key(self.state.get("relay_publication_id", publication_id), result_text)
                 if self.state.get("last_submitted_result_key") != submission_key:
                     submit = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
@@ -1494,6 +1564,7 @@ class LocalWatcher:
         try:
             self._execution_publication_id = publication_id
             self._execution_dispatch_id = observation.get("dispatchId")
+            self._execution_relay_key = relay_key
             authority = observation if observation.get("snapshotCommit") else None
             submitted = self._execute_prompt(bridge, observation["prompt"], timeout, emit, relay_authority=authority)
         except Exception:
@@ -1660,6 +1731,14 @@ class LocalWatcher:
         Path(envelope_path).write_text(stable_json(envelope), encoding="utf-8")
         self.state["result_envelope_file"] = envelope_path
         self.save()
+        try:
+            self._ensure_durable_terminal(result_publication_id or "LOCAL", result.output, envelope)
+            self._retire_after_durable_terminal(getattr(self, "_execution_relay_key", self.state.get("in_flight_relay_key")))
+        except Exception as error:
+            emit("STATE=RESULT_PENDING")
+            emit(f"DURABLE_TERMINAL_PUBLICATION_DEFERRED reason={type(error).__name__}:{error}")
+            emit(f"RESULT_FILE={result_path}")
+            return False
         if bridge is None or not Path(result_path).exists():
             emit("STATE=RESULT_PENDING")
             reason = "ARCHITECT_BRIDGE_UNAVAILABLE" if bridge is None else "RESULT_FILE_UNAVAILABLE"

@@ -437,6 +437,63 @@ def test_restart_recovers_pending_result_without_launching_codex(tmp_path):
     assert saved["last_completed_relay_key"].startswith("PUB-" + "7" * 32)
 
 
+def test_completed_result_publishes_terminal_before_browser_dependency_and_retires_once(tmp_path):
+    make_bootstrap(tmp_path)
+    publication = "PUB-" + "a" * 32
+    calls = []
+    watcher = None
+    def publisher(pub, text, envelope):
+        calls.append((pub, text, envelope, watcher.state.get("in_flight_relay_key")))
+        return {"publicationId": "GH-PUB-terminal-a", "resultSha256": hashlib.sha256(text.encode()).hexdigest()}
+    class Runner:
+        def run(self, prompt, timeout): return CodexResult("COMPLETED", "durable result", 0, False)
+    class Bridge:
+        def submit_result_bounded(self, result): raise TimeoutError("browser unavailable")
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", Runner(), durable_terminal_publisher=publisher)
+    watcher.state["in_flight_relay_key"] = publication + ":" + "b" * 64
+    watcher.state["relay_publication_id"] = publication
+    assert watcher._execute_prompt(Bridge(), "task", 1, lambda _: None) is False
+    assert len(calls) == 1 and calls[0][3] == publication + ":" + "b" * 64
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["durable_terminal_published"] is True
+    assert saved["last_completed_relay_key"] == publication + ":" + "b" * 64
+    assert "in_flight_relay_key" not in saved and saved["result_pending"] is True
+
+
+def test_pending_restart_retries_browser_only_after_terminal_is_durable(tmp_path):
+    result_path = tmp_path / "result.txt"
+    result_path.write_text("same result", encoding="utf-8")
+    publication = "PUB-" + "c" * 32
+    (tmp_path / "result.txt.envelope.json").write_text(json.dumps(build_result_envelope("D", "PASS", publication)), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"result_pending": True, "executor_completed": True, "result_file": str(result_path), "result_envelope_file": str(tmp_path / "result.txt.envelope.json"), "relay_publication_id": publication, "in_flight_relay_key": publication + ":" + "d" * 64, "durable_terminal_published": True, "durable_terminal_publication_id": "GH-PUB-terminal-c"}), encoding="utf-8")
+    calls = []
+    def forbidden_publisher(*args): raise AssertionError("terminal must not republish after restart")
+    class Source:
+        def read_current(self): return {"publicationId": "PUB-" + "e" * 32, "contentSha256": "f" * 64, "prompt": "unused"}
+    class Bridge:
+        def submit_result_bounded(self, result): calls.append(result)
+    class Runner:
+        def run(self, prompt, timeout): raise AssertionError("Codex must not rerun")
+    watcher = LocalWatcher(str(tmp_path), state_path, Runner(), durable_terminal_publisher=forbidden_publisher)
+    assert watcher.run_relay_once(Source(), Bridge(), emit=lambda _: None) == "COMPLETED"
+    assert calls == ["same result"]
+
+
+def test_terminal_publisher_failure_preserves_pending_and_does_not_retire(tmp_path):
+    make_bootstrap(tmp_path)
+    publication = "PUB-" + "1" * 32
+    class Runner:
+        def run(self, prompt, timeout): return CodexResult("COMPLETED", "result", 0, False)
+    def publisher(*args): raise OSError("evidence unavailable")
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", Runner(), durable_terminal_publisher=publisher)
+    watcher.state["in_flight_relay_key"] = publication + ":" + "2" * 64
+    watcher.state["relay_publication_id"] = publication
+    assert watcher._execute_prompt(None, "task", 1, lambda _: None) is False
+    assert watcher.state["result_pending"] is True
+    assert watcher.state["in_flight_relay_key"].startswith(publication + ":")
+
+
 def test_architect_rollover_counts_to_thirty_and_requests_once(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover, STANDARD_HANDOVER_REQUEST
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
