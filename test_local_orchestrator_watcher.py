@@ -354,6 +354,30 @@ def test_recovery_reconciliation_persists_across_restart_and_does_not_rerun(tmp_
     assert restarted.state["last_completed_relay_key"] == "PUB-20281:hash"
 
 
+def test_legacy_inflight_migration_requires_proof_and_preserves_unrelated_marker(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"in_flight": True, "in_flight_relay_key": "PUB-A:h", "relay_publication_id": "PUB-A", "retired_relay_keys": {"PUB-old:x": {"state": "SUPERSEDED_UNRECOVERABLE"}}}))
+    watcher = LocalWatcher(str(tmp_path), state_path, runner=object())
+    assert watcher.migrate_legacy_inflight_state(None) is False
+    proof = {"decisionPublicationId": "DEC-A", "replacementPublicationId": "PUB-B", "currentPublicationId": "PUB-B", "snapshotCommit": "c"}
+    assert watcher.migrate_legacy_inflight_state(proof) is True
+    assert watcher.state["legacy_inflight_migration"]["resolution"] == "SUPERSEDED_WITHOUT_RETRY"
+    assert watcher.state["retired_relay_keys"]["PUB-old:x"]["state"] == "SUPERSEDED_UNRECOVERABLE"
+    assert (tmp_path / "state.json.pre-legacy-migration.bak").exists()
+    restarted = LocalWatcher(str(tmp_path), state_path, runner=object())
+    assert restarted.state["in_flight"] is False
+    assert restarted.state["retired_relay_keys"]["PUB-A:h"]["executionAuthorized"] is False
+
+
+def test_legacy_inflight_migration_refuses_active_or_unresolved_execution(tmp_path):
+    proof = {"decisionPublicationId": "DEC-A", "replacementPublicationId": "PUB-B", "currentPublicationId": "PUB-B"}
+    for extra in ({"active_codex_pid": 12}, {"result_pending": True}, {"executor_completed": True}):
+        state_path = tmp_path / ("state-" + str(len(extra)) + ".json")
+        state_path.write_text(json.dumps({"in_flight": True, "in_flight_relay_key": "PUB-A:h", "relay_publication_id": "PUB-A", **extra}))
+        watcher = LocalWatcher(str(tmp_path), state_path, runner=object())
+        assert watcher.migrate_legacy_inflight_state(proof) is False
+
+
 def test_relay_prompt_discovery_does_not_read_architect_dom(tmp_path):
     class Source:
         def read_current(self): return {"publicationId": "PUB-" + "1" * 32, "contentSha256": "2" * 64, "prompt": "relay prompt"}

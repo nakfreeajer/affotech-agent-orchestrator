@@ -211,6 +211,47 @@ def read_matching_architect_decision(evidence_repo: str | os.PathLike[str], term
         return None
 
 
+def read_durable_consumed_relay_key(evidence_repo: str | os.PathLike[str], publication_id: str, content_sha256: str) -> dict[str, Any] | None:
+    """Find execution-and-acceptance evidence for one relay publication."""
+    repo = Path(evidence_repo)
+    try:
+        ref = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "refs/remotes/origin/main"], text=True, encoding="utf-8").strip()
+        needle = f'"publicationId": "{publication_id}"'
+        commits = subprocess.check_output(["git", "-C", str(repo), "log", ref, "--all", "--format=%H", "-S", needle, "--", "evidence/terminal"], text=True, encoding="utf-8").splitlines()
+        names = []
+        for commit in commits[:20]:
+            names.extend(subprocess.check_output(["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", commit, "--", "evidence/terminal"], text=True, encoding="utf-8").splitlines())
+        names = list(dict.fromkeys(names))
+        terminal_ids = []
+        for result in names:
+            name = result.split(":", 1)[1] if ":" in result else result
+            if not name.endswith("/terminal.json"):
+                continue
+            value = json.loads(subprocess.check_output(["git", "-C", str(repo), "show", f"{ref}:{name}"]).decode("utf-8"))
+            context = value.get("authorityContext") if isinstance(value, dict) else None
+            execution = value.get("execution") if isinstance(value, dict) else None
+            if ((isinstance(context, dict) and context.get("publicationId") == publication_id)
+                    or (isinstance(value, dict) and value.get("executedPublicationId") == publication_id)) and isinstance(execution, dict) and execution.get("publicationExecutionCount") == 1:
+                terminal_ids.append(Path(name).parent.name)
+        if len(terminal_ids) != 1:
+            return None
+        decision_needle = f'"reviewedPublicationId": "{terminal_ids[0]}"'
+        decision_commits = subprocess.check_output(["git", "-C", str(repo), "log", ref, "--all", "--format=%H", "-S", decision_needle, "--", "evidence/architect-decisions"], text=True, encoding="utf-8").splitlines()
+        decision_names = []
+        for commit in decision_commits[:20]:
+            decision_names.extend(subprocess.check_output(["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", commit, "--", "evidence/architect-decisions"], text=True, encoding="utf-8").splitlines())
+        for result in decision_names:
+            name = result.split(":", 1)[1] if ":" in result else result
+            if not name.endswith("/decision.json"):
+                continue
+            value = json.loads(subprocess.check_output(["git", "-C", str(repo), "show", f"{ref}:{name}"]).decode("utf-8"))
+            if isinstance(value, dict) and value.get("reviewedPublicationId") == terminal_ids[0] and value.get("decision") == "ACCEPTED":
+                return {"publicationId": publication_id, "contentSha256": content_sha256, "terminalPublicationId": terminal_ids[0], "decisionPublicationId": Path(name).parent.name}
+        return None
+    except (OSError, subprocess.CalledProcessError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
 def reconcile_executor_result(envelope_path: str | os.PathLike[str], current_terminal_publication: str | None = None, publication_exists: Callable[[str], bool] | None = None, advance_pointer: Callable[[str], None] | None = None) -> str:
     """Reconcile machine evidence without inspecting Codex prose."""
     envelope = read_result_envelope(envelope_path)
@@ -317,6 +358,33 @@ class RelayPromptSource:
                 raise RelayAuthorityError("RELAY_PROMPT_ARTIFACT_MISMATCH")
         return {"snapshotCommit": self.captured_ref, "publicationId": publication_id, "contentSha256": pointer_hash,
                 "promptBytes": prompt_bytes, "prompt": prompt, "manifest": manifest}
+
+    def legacy_supersession_proof(self, publication_id: str) -> dict[str, Any] | None:
+        """Return safe, snapshot-pinned proof that a legacy prompt was superseded."""
+        if not self.captured_ref:
+            raise RelayAuthorityError("RELAY_REF_NOT_CAPTURED")
+        try:
+            current = self._show_json(RELAY_POINTER).get("publicationId")
+            if current == publication_id:
+                return None
+            needle = publication_id
+            names = subprocess.check_output(["git", "-C", str(self.cache_dir), "grep", "-l", "-F", "--", needle, self.captured_ref, "--", "relay/architect/decisions"], text=True, encoding="utf-8").splitlines()
+            matches = []
+            for result in names:
+                name = result.split(":", 1)[1] if ":" in result else result
+                if not name.endswith("/decision.json"):
+                    continue
+                value = json.loads(self._show_bytes(name).decode("utf-8"))
+                if (value.get("decision") == "SUPERSEDED"
+                        and (value.get("supersededPublicationId") == publication_id or value.get("parentPublicationId") == publication_id)):
+                    decision_dir = Path(name).parent.as_posix()
+                    manifest = self._show_json(decision_dir + "/manifest.json")
+                    replacement = value.get("replacementPublicationId") or manifest.get("replacementPublicationId")
+                    if isinstance(replacement, str) and replacement:
+                        matches.append({"decisionPublicationId": Path(name).parent.name, "replacementPublicationId": replacement, "reason": value.get("reason"), "currentPublicationId": current, "snapshotCommit": self.captured_ref})
+            return matches[0] if len(matches) == 1 else None
+        except (OSError, subprocess.CalledProcessError, UnicodeError, json.JSONDecodeError):
+            return None
 
 
 def normalize_prompt(text: str) -> str:
@@ -1294,6 +1362,40 @@ class LocalWatcher:
         self.save()
         return True
 
+    def migrate_legacy_inflight_state(self, supersession_proof: dict[str, Any] | None, consumed_relay_keys: dict[str, dict[str, Any]] | None = None) -> bool:
+        """Atomically retire a proven legacy in-flight record without calling it PASS."""
+        key = self.state.get("in_flight_relay_key")
+        publication_id = self.state.get("relay_publication_id")
+        if not self.state.get("in_flight") or not isinstance(key, str) or not isinstance(publication_id, str):
+            return False
+        if self.state.get("result_pending") or self.state.get("executor_completed") or self.state.get("active_codex_pid") or self.state.get("codex_pid"):
+            return False
+        if not isinstance(supersession_proof, dict) or supersession_proof.get("currentPublicationId") == publication_id:
+            return False
+        backup = self.state_path.with_name(self.state_path.name + ".pre-legacy-migration.bak")
+        if backup.exists():
+            raise RuntimeError("LEGACY_STATE_BACKUP_ALREADY_EXISTS")
+        original = self.state_path.read_bytes()
+        backup.write_bytes(original)
+        if backup.read_bytes() != original:
+            raise RuntimeError("LEGACY_STATE_BACKUP_HASH_MISMATCH")
+        retired = self.state.setdefault("retired_relay_keys", {})
+        retired[key] = {"publicationId": publication_id, "resolution": "SUPERSEDED_WITHOUT_RETRY", "executionAuthorized": False, "historical": True, "resolvedFromLegacyState": True, "supersessionEvidence": supersession_proof}
+        for consumed_key, evidence in (consumed_relay_keys or {}).items():
+            retired.setdefault(consumed_key, {"resolution": "ALREADY_EXECUTED_AND_REVIEWED", "executionAuthorized": False, "historical": True, "supersessionEvidence": evidence})
+        self.state.pop("in_flight_relay_key", None)
+        self.state["in_flight"] = False
+        self.state["relay_recovery_state"] = "SUPERSEDED_WITHOUT_RETRY"
+        self.state["legacy_inflight_migration"] = {"publicationId": publication_id, "resolution": "SUPERSEDED_WITHOUT_RETRY", "executionAuthorized": False, "historical": True, "resolvedFromLegacyState": True, "supersessionEvidence": supersession_proof}
+        self.save()
+        try:
+            json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            self.state_path.write_bytes(original)
+            self.state = json.loads(original.decode("utf-8"))
+            raise RuntimeError("LEGACY_STATE_ATOMIC_WRITE_FAILED")
+        return True
+
     def reconcile_durable_recovery(self, emit: Callable[[str], None] = print) -> bool:
         """Clear recovery only after an exact durable Architect decision match."""
         if not self.state.get("in_flight_relay_key"):
@@ -1587,6 +1689,20 @@ def main() -> None:
     work_area = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_WORK_AREA", str(Path(project) / ".agent-work")))
     watcher = LocalWatcher(project)
     source = RelayPromptSource(work_area / "affotech-agent-relay")
+    # Migrate only a legacy in-flight record with immutable relay supersession
+    # proof.  This runs before browser attachment and never infers identity
+    # from age, publication ordering, or the current pointer alone.
+    if watcher.state.get("in_flight") and not watcher.state.get("result_pending"):
+        current = source.read_current()
+        legacy_id = watcher.state.get("relay_publication_id")
+        proof = source.legacy_supersession_proof(legacy_id) if isinstance(legacy_id, str) else None
+        consumed = {}
+        evidence_repo = watcher.state.get("evidenceRepository") or str(Path(project) / ".agent-work" / "evidence-repo")
+        consumed_key = read_durable_consumed_relay_key(evidence_repo, current["publicationId"], current["contentSha256"])
+        if consumed_key:
+            consumed[relay_task_key(current["publicationId"], current["contentSha256"])] = consumed_key
+        if proof:
+            watcher.migrate_legacy_inflight_state(proof, consumed)
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     conversation_id = watcher.state.get("currentArchitectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
     bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
