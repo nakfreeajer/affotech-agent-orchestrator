@@ -299,6 +299,61 @@ def test_relay_inflight_key_fails_closed_without_retry(tmp_path):
     assert output[-1] == "STATE=RECOVERY_REQUIRED"
 
 
+def _recovery_fixture(tmp_path, reader, terminal="GH-PUB-265-AFFOTECH-READONLY-RECONCILIATION-EXECUTION-000001"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "in_flight_relay_key": "PUB-20281:hash",
+        "relay_publication_id": "PUB-20281",
+        "recovery_terminal_publication_id": terminal,
+        "in_flight": True,
+    }))
+    return LocalWatcher(str(tmp_path), state_path, runner=object(), durable_decision_reader=reader)
+
+
+def _matching_recovery_record(publication, *, required=False, accepted=True):
+    return {"decision": {"reviewedPublicationId": publication, "requiresArchitectDecision": required, "decision": "ACCEPTED"},
+            "acceptedPointer": {"accepted": accepted, "publicationId": publication}}
+
+
+def test_matching_durable_architect_decision_reconciles_recovery_without_launch(tmp_path):
+    publication = "GH-PUB-265-AFFOTECH-READONLY-RECONCILIATION-EXECUTION-000001"
+    watcher = _recovery_fixture(tmp_path, lambda value: _matching_recovery_record(publication))
+    source = type("Source", (), {"read_current": lambda self: {"publicationId": "PUB-20281", "contentSha256": "hash", "prompt": "unused"}})()
+    output = []
+    assert watcher.run_relay_once(source, None, emit=output.append) == "IDLE"
+    assert watcher.state["recovery_reconciled"] is True
+    assert "RECOVERY_REQUIRED" not in output
+
+
+def test_nonmatching_or_missing_or_pending_architect_decision_keeps_recovery(tmp_path):
+    publication = "GH-PUB-265-AFFOTECH-READONLY-RECONCILIATION-EXECUTION-000001"
+    source = type("Source", (), {"read_current": lambda self: {"publicationId": "PUB-20281", "contentSha256": "hash", "prompt": "unused"}})()
+    for reader in (
+        lambda value: _matching_recovery_record("GH-PUB-other"),
+        lambda value: None,
+        lambda value: _matching_recovery_record(publication, required=True),
+        lambda value: {"decision": {"reviewedPublicationId": publication, "requiresArchitectDecision": False}, "acceptedPointer": {"accepted": True, "publicationId": "GH-PUB-other"}},
+    ):
+        watcher = _recovery_fixture(tmp_path / str(id(reader)), reader)
+        output = []
+        assert watcher.run_relay_once(source, None, emit=output.append) == "RECOVERY_REQUIRED"
+        assert output[-1] == "STATE=RECOVERY_REQUIRED"
+
+
+def test_recovery_reconciliation_persists_across_restart_and_does_not_rerun(tmp_path):
+    publication = "GH-PUB-265-AFFOTECH-READONLY-RECONCILIATION-EXECUTION-000001"
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"in_flight_relay_key": "PUB-20281:hash", "recovery_terminal_publication_id": publication, "in_flight": True}))
+    reader = lambda value: _matching_recovery_record(publication)
+    watcher = LocalWatcher(str(tmp_path), state_path, runner=object(), durable_decision_reader=reader)
+    source = type("Source", (), {"read_current": lambda self: {"publicationId": "PUB-20281", "contentSha256": "hash", "prompt": "unused"}})()
+    assert watcher.run_relay_once(source, None, emit=lambda _: None) == "IDLE"
+    restarted = LocalWatcher(str(tmp_path), state_path, runner=object(), durable_decision_reader=lambda _: (_ for _ in ()).throw(AssertionError("decision re-read")))
+    assert restarted.run_relay_once(source, None, emit=lambda _: None) == "IDLE"
+    assert restarted.state["last_completed_relay_key"] == "PUB-20281:hash"
+
+
 def test_relay_prompt_discovery_does_not_read_architect_dom(tmp_path):
     class Source:
         def read_current(self): return {"publicationId": "PUB-" + "1" * 32, "contentSha256": "2" * 64, "prompt": "relay prompt"}

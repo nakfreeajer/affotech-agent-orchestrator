@@ -187,6 +187,30 @@ def read_result_envelope(path: str | os.PathLike[str]) -> dict[str, Any]:
     return envelope
 
 
+def read_matching_architect_decision(evidence_repo: str | os.PathLike[str], terminal_publication_id: str) -> dict[str, Any] | None:
+    """Read the matching Architect decision and accepted pointer from one evidence ref."""
+    repo = Path(evidence_repo)
+    try:
+        subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin", "main"], check=True, capture_output=True, text=True)
+        ref = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "refs/remotes/origin/main"], text=True, encoding="utf-8").strip()
+        names = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", ref], text=True, encoding="utf-8").splitlines()
+        decisions: list[dict[str, Any]] = []
+        for name in names:
+            if not name.startswith("evidence/architect-decisions/") or not name.endswith("/decision.json"):
+                continue
+            value = json.loads(subprocess.check_output(["git", "-C", str(repo), "show", f"{ref}:{name}"]).decode("utf-8"))
+            if isinstance(value, dict) and value.get("reviewedPublicationId") == terminal_publication_id:
+                decisions.append(value)
+        if len(decisions) != 1:
+            return None
+        pointer = json.loads(subprocess.check_output(["git", "-C", str(repo), "show", f"{ref}:evidence/current/LATEST_EXECUTOR_ACCEPTED.json"]).decode("utf-8"))
+        if not isinstance(pointer, dict):
+            return None
+        return {"decision": decisions[0], "acceptedPointer": pointer, "snapshotCommit": ref}
+    except (OSError, subprocess.CalledProcessError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
 def reconcile_executor_result(envelope_path: str | os.PathLike[str], current_terminal_publication: str | None = None, publication_exists: Callable[[str], bool] | None = None, advance_pointer: Callable[[str], None] | None = None) -> str:
     """Reconcile machine evidence without inspecting Codex prose."""
     envelope = read_result_envelope(envelope_path)
@@ -1199,7 +1223,7 @@ class ArchitectPlaywright:
 
 
 class LocalWatcher:
-    def __init__(self, project_dir: str, state_path: str | os.PathLike[str] = "orchestrator-state.json", runner: CodexRunner | None = None):
+    def __init__(self, project_dir: str, state_path: str | os.PathLike[str] = "orchestrator-state.json", runner: CodexRunner | None = None, durable_decision_reader: Callable[[str], dict[str, Any] | None] | None = None):
         self.project_dir = project_dir
         self.state_path = Path(state_path)
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {"cycle_count": 0, "in_flight": False}
@@ -1210,6 +1234,11 @@ class LocalWatcher:
         self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
         self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
+        if durable_decision_reader is not None:
+            self.durable_decision_reader = durable_decision_reader
+        else:
+            evidence_repo = self.state.get("evidenceRepository") or str(Path(project_dir) / ".agent-work" / "evidence-repo")
+            self.durable_decision_reader = lambda publication_id: read_matching_architect_decision(evidence_repo, publication_id)
         self.session_rollover = ArchitectSessionRollover(self)
         self.documentation_doorbell = DocumentationDoorbell(self)
 
@@ -1265,6 +1294,41 @@ class LocalWatcher:
         self.save()
         return True
 
+    def reconcile_durable_recovery(self, emit: Callable[[str], None] = print) -> bool:
+        """Clear recovery only after an exact durable Architect decision match."""
+        if not self.state.get("in_flight_relay_key"):
+            return False
+        terminal_publication = (self.state.get("recovery_terminal_publication_id")
+                                or self.state.get("in_flight_terminal_publication_id")
+                                or self.state.get("executor_terminal_publication_id"))
+        if not isinstance(terminal_publication, str) or not terminal_publication:
+            return False
+        record = self.durable_decision_reader(terminal_publication)
+        if not isinstance(record, dict):
+            return False
+        decision, pointer = record.get("decision"), record.get("acceptedPointer")
+        if not isinstance(decision, dict) or not isinstance(pointer, dict):
+            return False
+        if decision.get("reviewedPublicationId") != terminal_publication:
+            return False
+        if decision.get("requiresArchitectDecision") is not False:
+            return False
+        if decision.get("decision") not in {None, "ACCEPTED"} and decision.get("classification") != "ACCEPTED":
+            return False
+        if pointer.get("accepted") is not True or pointer.get("publicationId") != terminal_publication:
+            return False
+        relay_key = self.state["in_flight_relay_key"]
+        self.state["last_completed_relay_key"] = relay_key
+        self.state.pop("in_flight_relay_key", None)
+        self.state.pop("in_flight_prompt_hash", None)
+        self.state["in_flight"] = False
+        self.state["relay_recovery_state"] = "ARCHITECT_REVIEWED"
+        self.state["recovery_reconciled"] = True
+        self.state["recovery_reconciled_publication_id"] = terminal_publication
+        self.save()
+        emit(f"RECOVERY_RECONCILED publication={terminal_publication}")
+        return True
+
     def run_relay_once(self, source: RelayPromptSource, bridge: ArchitectPlaywright | None, timeout: float = 300.0, emit: Callable[[str], None] = print) -> str:
         observation = source.read_current()
         publication_id = observation["publicationId"]
@@ -1311,6 +1375,10 @@ class LocalWatcher:
             if self.state.get("in_flight_relay_key") in self.state.get("retired_relay_keys", {}):
                 emit("STATE=IDLE")
                 return "IDLE"
+            if self.reconcile_durable_recovery(emit=emit):
+                if self.state.get("last_completed_relay_key") == relay_key:
+                    emit("STATE=IDLE")
+                    return "IDLE"
             emit("STATE=RECOVERY_REQUIRED")
             return "RECOVERY_REQUIRED"
         if self.state.get("last_completed_relay_key") == relay_key:
