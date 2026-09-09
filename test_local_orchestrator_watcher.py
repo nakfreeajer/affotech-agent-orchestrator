@@ -1046,11 +1046,11 @@ def test_codex_child_completion_requires_waited_integer_exit_and_real_pid(tmp_pa
     runner.on_start = started.append
     result = runner.run("prompt", timeout=1)
     assert started == [8123]
-    assert result.state == "STALLED"  # no last-message file means no completed result
+    assert result.state == "FAILED"  # exit=0 without a result is missing-result evidence
     assert result.exit_code == 0
 
 
-def test_codex_nonzero_exit_and_timeout_are_truthful(tmp_path, monkeypatch):
+def test_codex_nonzero_exit_is_truthful_and_executor_has_no_timeout(tmp_path, monkeypatch):
     make_bootstrap(tmp_path)
     import local_orchestrator_watcher as watcher_module
     class Nonzero:
@@ -1064,21 +1064,17 @@ def test_codex_nonzero_exit_and_timeout_are_truthful(tmp_path, monkeypatch):
     result = CodexRunner(str(tmp_path), "codex").run("prompt", timeout=1)
     assert result.state == "BLOCKED" and result.exit_code == 7
 
-    class TimeoutProcess:
+    class LongRunningProcess:
         pid = 8125
-        returncode = None
-        calls = 0
+        returncode = 0
         def poll(self): return None
         def communicate(self, **kwargs):
-            self.calls += 1
-            if self.calls == 1: raise watcher_module.subprocess.TimeoutExpired("cmd", 1)
-            self.returncode = -9
-            return "", "killed"
-        def kill(self): pass
+            assert "timeout" not in kwargs
+            return "", ""
         def wait(self): return self.returncode
-    monkeypatch.setattr(watcher_module.subprocess, "Popen", lambda *args, **kwargs: TimeoutProcess())
-    result = CodexRunner(str(tmp_path), "codex").run("prompt", timeout=1)
-    assert result.state == "STALLED" and result.timed_out is True and result.exit_code == -9
+    monkeypatch.setattr(watcher_module.subprocess, "Popen", lambda *args, **kwargs: LongRunningProcess())
+    result = CodexRunner(str(tmp_path), "codex").run("prompt", timeout=0.001)
+    assert result.state == "FAILED" and result.timed_out is False and result.exit_code == 0
 
 
 def test_result_submission_is_impossible_without_terminal_integer(tmp_path):
@@ -1090,8 +1086,88 @@ def test_result_submission_is_impossible_without_terminal_integer(tmp_path):
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", Runner())
     bridge = Bridge(); output = []
     watcher._execute_prompt(bridge, "prompt", 1, output.append)
-    assert "CODEX_STALLED timeout=false exit=unknown" in output
+    assert "CODEX_FAILED exit=unknown reason=missing_exit_evidence" in output
     assert bridge.submitted == []
+
+
+def test_live_codex_beyond_former_timeout_remains_running_and_never_stalls(tmp_path, monkeypatch):
+    make_bootstrap(tmp_path)
+    import local_orchestrator_watcher as watcher_module
+    seen = {}
+    class LiveProcess:
+        pid = 9010
+        def poll(self): return None
+        def communicate(self, **kwargs):
+            seen["communicate_kwargs"] = kwargs
+            return "", ""
+        def wait(self): return 0
+    monkeypatch.setattr(watcher_module.subprocess, "Popen", lambda *a, **k: LiveProcess())
+    monkeypatch.setattr(watcher_module, "discover_codex_launcher", lambda executable="codex": [sys.executable])
+    result = CodexRunner(str(tmp_path), "codex").run("long task", timeout=0.0001)
+    assert result.timed_out is False
+    assert "timeout" not in seen["communicate_kwargs"]
+    assert result.exit_code == 0
+
+
+def test_restart_with_alive_recorded_pid_stays_running_without_duplicate(tmp_path, monkeypatch):
+    publication = "PUB-" + "a" * 32
+    key = publication + ":" + "b" * 64
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"in_flight": True, "in_flight_relay_key": key,
+                                      "relay_publication_id": publication,
+                                      "active_codex_pid": 14304}), encoding="utf-8")
+    class Source:
+        def read_current(self): return {"publicationId": publication, "contentSha256": "b" * 64, "prompt": "must not rerun"}
+    class Runner:
+        def run(self, prompt, timeout): raise AssertionError("live executor must not rerun")
+    watcher = LocalWatcher(str(tmp_path), state_path, Runner())
+    monkeypatch.setattr(watcher, "process_alive", lambda pid: pid == 14304)
+    output = []
+    assert watcher.run_relay_once(Source(), None, emit=output.append) == "RUNNING"
+    assert "CODEX_RUNNING pid=14304" in output
+
+
+def test_restart_dead_pid_recovers_result_without_rerun(tmp_path, monkeypatch):
+    publication = "PUB-" + "c" * 32
+    key = publication + ":" + "d" * 64
+    result_path = tmp_path / "result.txt"
+    result_path.write_text("recovered", encoding="utf-8")
+    envelope_path = tmp_path / "result.txt.envelope.json"
+    envelope_path.write_text(json.dumps(build_result_envelope("D", "PASS", publication)), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"in_flight": True, "in_flight_relay_key": key,
+                                      "relay_publication_id": publication, "active_codex_pid": 14304,
+                                      "result_file": str(result_path), "result_envelope_file": str(envelope_path)}), encoding="utf-8")
+    class Source:
+        def read_current(self): return {"publicationId": publication, "contentSha256": "d" * 64, "prompt": "must not rerun"}
+    class Runner:
+        def run(self, prompt, timeout): raise AssertionError("dead executor result must be reused")
+    class Bridge:
+        def __init__(self): self.results = []
+        def submit_result_bounded(self, result): self.results.append(result)
+    watcher = LocalWatcher(str(tmp_path), state_path, Runner(),
+                           durable_terminal_publisher=lambda *a: {"publicationId": "GH-recovered"})
+    monkeypatch.setattr(watcher, "process_alive", lambda pid: False)
+    assert watcher.run_relay_once(Source(), Bridge(), emit=lambda _: None) == "COMPLETED"
+    assert json.loads(state_path.read_text())["last_completed_relay_key"] == key
+
+
+def test_restart_dead_pid_without_result_requires_recovery_and_never_reruns(tmp_path, monkeypatch):
+    publication = "PUB-" + "e" * 32
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"in_flight": True, "in_flight_relay_key": publication + ":" + "f" * 64,
+                                      "relay_publication_id": publication, "active_codex_pid": 14304,
+                                      "rerunAuthorized": False}), encoding="utf-8")
+    class Source:
+        def read_current(self): return {"publicationId": publication, "contentSha256": "f" * 64, "prompt": "must not rerun"}
+    class Runner:
+        def run(self, prompt, timeout): raise AssertionError("recovery must not rerun Codex")
+    watcher = LocalWatcher(str(tmp_path), state_path, Runner())
+    monkeypatch.setattr(watcher, "process_alive", lambda pid: False)
+    assert watcher.run_relay_once(Source(), None, emit=lambda _: None) == "RECOVERY_REQUIRED"
+    saved = json.loads(state_path.read_text())
+    assert saved["rerunAuthorized"] is False
+    assert saved["executor_state"] == "EXITED_WITHOUT_RECOVERABLE_RESULT"
 
 
 def test_completed_result_emits_real_exit_and_submits_after_terminal_state(tmp_path):
@@ -1206,7 +1282,9 @@ def test_newer_relay_publication_remains_observable_after_old_retirement(tmp_pat
         def run(self, prompt, timeout): return CodexResult("STALLED", "", -1, True)
     restarted = LocalWatcher(str(tmp_path), tmp_path / "state.json", Runner())
     assert restarted.run_relay_once(Source(), None, emit=lambda _: None) == "RESULT_PENDING"
-    assert restarted.state.get("in_flight_relay_key", "").startswith(new + ":")
+    assert restarted.state.get("relay_publication_id") == new
+    assert restarted.state["result_pending"] is True
+    assert restarted.state["relay_execution_retired"] is True
 
 
 def test_long_generation_in_progress_is_not_forwarded_and_unchanged_stays_idle():

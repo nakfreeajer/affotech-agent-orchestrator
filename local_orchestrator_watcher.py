@@ -696,6 +696,12 @@ class CodexRunner:
         self.relay_authority: dict[str, Any] | None = None
 
     def run(self, prompt: str, timeout: float = 300.0) -> CodexResult:
+        """Run until the child exits; ``timeout`` is retained for API compatibility.
+
+        Executor duration is deliberately not governed by a wall-clock deadline.
+        Callers may use short timers for transport/polling, but only child exit
+        evidence determines executor completion.
+        """
         assembled_prompt = self.assemble_prompt(prompt, self.relay_authority)
         try:
             assembled_prompt_bytes = assembled_prompt.encode("utf-8", errors="strict")
@@ -730,27 +736,17 @@ class CodexRunner:
                 self.lifecycle_state = "CLOSED"
                 self.running_observed = False
                 self.active_child_pid = None
-        try:
-            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="strict", cwd=child_cwd)
-            self.last_pid = process.pid
-            self.active_child_pid = process.pid
-            if self.on_start:
-                self.on_start(process.pid)
-            self.running_observed = process.poll() is None
-            stdout, stderr = process.communicate(input=assembled_prompt, timeout=timeout)
-            returncode = process.wait()
-            if not isinstance(returncode, int):
-                raise RuntimeError("CODEX_RETURN_CODE_NOT_INTEGER")
-            completed = type("Completed", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
-        except subprocess.TimeoutExpired as error:
-            process.kill()
-            stdout, stderr = process.communicate()
-            returncode = process.wait()
-            output = stdout or stderr or ""
-            self.lifecycle_state = "CLOSED"
-            self.running_observed = False
-            self.active_child_pid = None
-            return CodexResult("STALLED", output, returncode if isinstance(returncode, int) else None, True, stdout, stderr, last_message_path, os.path.exists(last_message_path))
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="strict", cwd=child_cwd)
+        self.last_pid = process.pid
+        self.active_child_pid = process.pid
+        if self.on_start:
+            self.on_start(process.pid)
+        self.running_observed = process.poll() is None
+        stdout, stderr = process.communicate(input=assembled_prompt)
+        returncode = process.wait()
+        if not isinstance(returncode, int):
+            raise RuntimeError("CODEX_RETURN_CODE_NOT_INTEGER")
+        completed = type("Completed", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
         self.lifecycle_state = "CLOSED"
         self.running_observed = False
         self.active_child_pid = None
@@ -760,7 +756,7 @@ class CodexRunner:
         output = last_message.strip() or stdout.strip() or stderr.strip()
         if completed.returncode != 0:
             return CodexResult("BLOCKED", output, completed.returncode, False, stdout, stderr, last_message_path, bool(last_message))
-        return CodexResult("COMPLETED" if last_message.strip() else "STALLED", output, completed.returncode, False, stdout, stderr, last_message_path, bool(last_message))
+        return CodexResult("COMPLETED" if last_message.strip() else "FAILED", output, completed.returncode, False, stdout, stderr, last_message_path, bool(last_message))
 
     def _use_visible_windows_console(self) -> bool:
         """Use the visible host only for an actual production subprocess call."""
@@ -828,9 +824,8 @@ process.stdin.on("end", () => {
                 raise RuntimeError("VISIBLE_EXECUTOR_STDIN_UNAVAILABLE")
             host.stdin.write(assembled_prompt_bytes)
             host.stdin.close()
-            deadline = time.monotonic() + timeout
             status: dict[str, Any] = {}
-            while time.monotonic() < deadline:
+            while True:
                 try:
                     candidate = json.loads(Path(status_path).read_text(encoding="utf-8"))
                     if isinstance(candidate, dict):
@@ -848,11 +843,6 @@ process.stdin.on("end", () => {
                         raise RuntimeError("CODEX_RETURN_CODE_NOT_INTEGER")
                     break
                 time.sleep(0.05)
-            else:
-                pid = status.get("pid")
-                if isinstance(pid, int):
-                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
-                return CodexResult("STALLED", "", None, True, "", "", last_message_path, os.path.exists(last_message_path))
             stdout = ""
             stderr = ""
             exit_code = int(status["exitCode"])
@@ -869,7 +859,7 @@ process.stdin.on("end", () => {
         output = last_message.strip() or stderr.strip()
         if exit_code != 0:
             return CodexResult("BLOCKED", output, exit_code, False, stdout, stderr, last_message_path, bool(last_message))
-        return CodexResult("COMPLETED" if last_message.strip() else "STALLED", output, exit_code, False, stdout, stderr, last_message_path, bool(last_message))
+        return CodexResult("COMPLETED" if last_message.strip() else "FAILED", output, exit_code, False, stdout, stderr, last_message_path, bool(last_message))
 
     def assemble_prompt(self, task_prompt: str, relay_authority: dict[str, Any] | None = None) -> str:
         try:
@@ -1398,6 +1388,68 @@ class LocalWatcher:
         self.state.update({"last_prompt_hash": self.loop_guard.last_prompt_hash, "last_result_hash": self.loop_guard.last_result_hash})
         self.state_path.write_text(json.dumps(self.state, indent=2) + "\n")
 
+    @staticmethod
+    def process_alive(pid: Any) -> bool:
+        """Return whether an independently launched executor is still alive."""
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+        return True
+
+    def _record_executor_start(self, pid: int, emit: Callable[[str], None]) -> None:
+        # Persist before any result handling so a watcher restart cannot launch
+        # a second child for the same immutable relay task.
+        self.state["active_codex_pid"] = pid
+        self.state["codex_pid"] = pid
+        self.state["executor_state"] = "RUNNING"
+        self.state["in_flight"] = True
+        self.save()
+        emit(f"CODEX_STARTED pid={pid}")
+
+    def _clear_executor_start(self) -> None:
+        self.state.pop("active_codex_pid", None)
+        self.state.pop("codex_pid", None)
+        self.state["executor_state"] = "EXITED"
+        self.save()
+
+    def _recoverable_result_exists(self) -> bool:
+        result_path = self.state.get("result_file")
+        if not isinstance(result_path, str) or not Path(result_path).is_file():
+            return False
+        envelope_path = self.state.get("result_envelope_file") or f"{result_path}.envelope.json"
+        try:
+            read_result_envelope(envelope_path)
+            Path(result_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError, RuntimeError, json.JSONDecodeError):
+            return False
+        return True
+
+    def _reconcile_inflight_executor(self, source: RelayPromptSource, bridge: ArchitectPlaywright | None, timeout: float, emit: Callable[[str], None]) -> str | None:
+        """Reconcile an in-flight child without inferring failure from age."""
+        pid = self.state.get("active_codex_pid") or self.state.get("codex_pid")
+        if self.process_alive(pid):
+            self.state["in_flight"] = True
+            self.state["executor_state"] = "RUNNING"
+            self.save()
+            emit(f"CODEX_RUNNING pid={pid}")
+            return "RUNNING"
+        if self._recoverable_result_exists():
+            self.state["result_pending"] = True
+            self.state["executor_completed"] = True
+            self.state["executor_state"] = "EXITED_RESULT_RECOVERABLE"
+            self.save()
+            # Re-enter the durable-result path; this never launches Codex.
+            return self.run_relay_once(source, bridge, timeout, emit)
+        if pid is not None:
+            self.state["executor_state"] = "EXITED_WITHOUT_RECOVERABLE_RESULT"
+            self.save()
+        return None
+
     def retire_unrecoverable_relay(self, publication_id: str, content_sha256: str, reason: str = "SUPERSEDED_UNRECOVERABLE") -> bool:
         """Retire one proven-lost execution without manufacturing a result."""
         key = f"{publication_id}:{content_sha256}"
@@ -1551,6 +1603,9 @@ class LocalWatcher:
                 if self.state.get("last_completed_relay_key") == relay_key:
                     emit("STATE=IDLE")
                     return "IDLE"
+            reconciled = self._reconcile_inflight_executor(source, bridge, timeout, emit)
+            if reconciled is not None:
+                return reconciled
             emit("STATE=RECOVERY_REQUIRED")
             return "RECOVERY_REQUIRED"
         if self.state.get("last_completed_relay_key") == relay_key:
@@ -1701,18 +1756,16 @@ class LocalWatcher:
         if relay_authority is not None:
             self.runner.relay_authority = relay_authority
         if hasattr(self.runner, "on_start"):
-            self.runner.on_start = lambda pid: emit(f"CODEX_STARTED pid={pid}")
+            self.runner.on_start = lambda pid: self._record_executor_start(pid, emit)
         result = self.forward(prompt, timeout=timeout)
+        self._clear_executor_start()
         if isinstance(result, dict):
             emit(f"STATE={result['state']}")
             return False
-        if result.state == "STALLED":
-            emit(f"CODEX_STALLED timeout={str(result.timed_out).lower()} exit={result.exit_code}")
-            return False
         if not isinstance(result.exit_code, int):
-            emit("CODEX_STALLED timeout=false exit=unknown")
+            emit("CODEX_FAILED exit=unknown reason=missing_exit_evidence")
             return False
-        emit(f"CODEX_COMPLETED exit={result.exit_code}")
+        emit(f"CODEX_COMPLETED exit=0" if result.exit_code == 0 else f"CODEX_FAILED exit={result.exit_code}")
         self.state["executor_completed"] = True
         self.state["result_pending"] = True
         result_path = result.last_message_path
