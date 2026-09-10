@@ -1,4 +1,5 @@
 import json
+import inspect
 import subprocess
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestrator,
                                         ResultSubmissionError, atomic_write,
                                         parse_orchestrator_result)
+import local_orchestrator_watcher as watcher_module
 
 
 def envelope(task, action="EXECUTE", prompt="next task"):
@@ -289,3 +291,62 @@ def test_next_prompt_persisted_and_launches_exactly_one_codex_child(tmp_path):
     watcher.launch_next(lambda prompt, path: (launches.append(prompt) or Process()))
     assert launches == ["next"]
     assert watcher.launch_next(lambda *_: (_ for _ in ()).throw(AssertionError("duplicate launch"))) is None
+
+
+class FakeResponseBridge(ArchitectPlaywright):
+    def __init__(self, entries, generation):
+        self.entries = iter(entries)
+        self.generation = iter(generation)
+        self.polls = 0
+
+    def _assistant_entries(self):
+        self.polls += 1
+        return next(self.entries)
+
+    def generation_visible(self):
+        return next(self.generation)
+
+
+def test_architect_generation_has_no_wall_clock_failure_authority(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    bridge = FakeResponseBridge(
+        [[{"id": "a", "text": "draft"}], [{"id": "a", "text": "final " + watcher_module.COMPLETE}]],
+        [True, False],
+    )
+    observed = bridge.wait_for_new_response({"count": 0, "text_hash": "", "entries": []}, poll_interval=999999)
+    assert observed["state"] == "COMPLETED"
+    assert bridge.polls == 2
+    assert "timeout" not in inspect.signature(ArchitectPlaywright.wait_for_new_response).parameters
+
+
+def test_architect_response_requires_stopped_stable_final_envelope(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    response = envelope("task-1", prompt="next") + "\nARCHITECT_RESPONSE_COMPLETE"
+    bridge = FakeResponseBridge(
+        [[{"id": "a", "text": "draft"}], [{"id": "a", "text": response}]],
+        [True, False],
+    )
+    observed = bridge.wait_for_new_response({"count": 0, "text_hash": "", "entries": []}, poll_interval=1)
+    assert observed["state"] == "COMPLETED"
+    assert parse_orchestrator_result(observed["text"], "task-1")["action"] == "EXECUTE"
+
+
+def test_restart_architect_running_uses_persisted_baseline_without_resend(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": {"count": 1, "text_hash": "h", "entries": []}})
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.state["state"] == "ARCHITECT_RUNNING"
+    assert "executorResultPath" in restarted.state
+
+
+def test_stopped_malformed_architect_response_is_safe_without_resend(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    bridge = FakeResponseBridge(
+        [[{"id": "a", "text": "malformed final"}]],
+        [False],
+    )
+    observed = bridge.wait_for_new_response({"count": 0, "text_hash": "", "entries": []}, poll_interval=1)
+    assert observed["state"] == "BLOCKED"
+    with pytest.raises(ValueError):
+        parse_orchestrator_result(observed["text"], "task-1")

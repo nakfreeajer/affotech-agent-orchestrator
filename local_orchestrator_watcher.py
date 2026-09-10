@@ -1105,17 +1105,16 @@ class ArchitectPlaywright:
             time.sleep(0.25)
         return False
 
-    def wait_for_new_completed_response(self, baseline: dict[str, Any], timeout: float = 120.0) -> str:
-        observed = self.wait_for_new_response(baseline, timeout)
+    def wait_for_new_completed_response(self, baseline: dict[str, Any], poll_interval: float = 0.5) -> str:
+        observed = self.wait_for_new_response(baseline, poll_interval)
         if observed["state"] != "COMPLETED":
             raise TimeoutError("ARCHITECT_NEW_RESPONSE_NOT_READY")
         return observed["text"]
 
-    def wait_for_new_response(self, baseline: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
+    def wait_for_new_response(self, baseline: dict[str, Any], poll_interval: float = 0.5) -> dict[str, Any]:
         stable_hash = None
         stable_polls = 0
-        while time.monotonic() < deadline:
+        while True:
             entries = self._assistant_entries()
             snapshot = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
             current = {"count": len(entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": entries}
@@ -1131,7 +1130,7 @@ class ArchitectPlaywright:
                     self.last_state = "RUNNING"
                 else:
                     self.last_state = "NOT_YET"
-                time.sleep(0.5)
+                time.sleep(poll_interval)
                 continue
             if identity_changed and text.rstrip().endswith(COMPLETE):
                 self.last_state = "COMPLETED"
@@ -1148,7 +1147,7 @@ class ArchitectPlaywright:
                     self.last_state = "COMPLETED"
                     return {"state": "COMPLETED", "text": text}
                 self.last_state = "RUNNING"
-                time.sleep(0.5)
+                time.sleep(poll_interval)
                 continue
             stable_hash = None
             stable_polls = 0
@@ -1156,14 +1155,13 @@ class ArchitectPlaywright:
                 self.last_state = "BLOCKED"
                 return {"state": "BLOCKED", "text": text}
             self.last_state = "NOT_YET"
-            time.sleep(0.5)
-        return {"state": "NOT_YET", "text": ""}
+            time.sleep(poll_interval)
 
-    def submit_and_wait(self, message: str, timeout: float = 120.0) -> str:
+    def submit_and_wait(self, message: str, poll_interval: float = 0.5) -> str:
         baseline = self.assistant_baseline()
         if not self.submit_user_and_confirm(message):
             raise RuntimeError("ARCHITECT_SUBMISSION_NOT_CONFIRMED")
-        return self.wait_for_new_completed_response(baseline, timeout)
+        return self.wait_for_new_completed_response(baseline, poll_interval)
 
     def submit_result(self, result: str) -> None:
         composer = self.page.get_by_role("textbox").last
@@ -1838,7 +1836,10 @@ def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
 
 
 def parse_orchestrator_result(text: str, completed_task_id: str) -> dict[str, str]:
-    match = ORCHESTRATOR_RESULT_RE.search(text.rstrip())
+    candidate = text.rstrip()
+    if candidate.endswith(COMPLETE):
+        candidate = candidate[: -len(COMPLETE)].rstrip()
+    match = ORCHESTRATOR_RESULT_RE.search(candidate)
     if not match or match.group(3).strip() != completed_task_id:
         raise ValueError("ARCHITECT_ENVELOPE_INVALID")
     prompt = match.group(4).replace("\r\n", "\n").replace("\r", "\n")
@@ -1946,7 +1947,8 @@ class LocalFirstOrchestrator:
                        "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
         sender(instruction + report)
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None})
+        baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
 
     def accept_architect_response(self, response: str) -> dict[str, str]:
@@ -1982,7 +1984,7 @@ def main() -> None:
     watcher = LocalFirstOrchestrator(project, os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR"))
     if watcher.state.get("state") == "IDLE" and watcher.state.get("lastCompletedTaskId") != "PUB-aa3b4121887c4047b3c056bcccaa6a96":
         watcher.recover_5c()
-    if watcher.state.get("state") != "RESULT_READY":
+    if watcher.state.get("state") not in {"RESULT_READY", "ARCHITECT_RUNNING"}:
         print(f"STATE={watcher.state.get('state')}")
         return
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
@@ -1991,13 +1993,23 @@ def main() -> None:
     watcher.state["architectConversationId"] = conversation_id
     watcher.save()
     try:
-        watcher.deliver_result(bridge)
-        baseline = bridge.assistant_baseline()
+        if watcher.state.get("state") == "RESULT_READY":
+            watcher.deliver_result(bridge)
+        baseline = watcher.state.get("architectBaseline")
+        if not isinstance(baseline, dict):
+            entries = bridge._assistant_entries()
+            prior = entries[:-1] if entries else []
+            snapshot = json.dumps(prior, ensure_ascii=False, separators=(",", ":"))
+            baseline = {"count": len(prior), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": prior}
         while True:
-            observed = bridge.wait_for_new_response(baseline, timeout=5.0)
-            if observed.get("state") != "COMPLETED":
+            try:
+                observed = bridge.wait_for_new_response(baseline, poll_interval=5.0)
+            except Exception:
                 watcher.state["state"] = "ARCHITECT_RUNNING"
                 watcher.save()
+                bridge.close()
+                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                time.sleep(1.0)
                 continue
             decision = watcher.accept_architect_response(observed["text"])
             if decision.get("action") != "EXECUTE":
