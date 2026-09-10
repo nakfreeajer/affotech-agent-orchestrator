@@ -96,13 +96,31 @@ def test_atomic_write_and_github_free_evidence(tmp_path):
 
 
 class FakeComposer:
-    last = None
+    def __init__(self, page):
+        self.page = page
+        self.last = self
 
     def is_visible(self, **_):
         return True
 
     def is_editable(self, **_):
         return True
+
+    def scroll_into_view_if_needed(self, **_):
+        return None
+
+    def focus(self, **_):
+        if not self.page.focus:
+            raise TimeoutError("composer focus blocked")
+
+    def press(self, key, **_):
+        if key == "ControlOrMeta+A":
+            self.page.content = ""
+        elif key == "Enter":
+            self.page.submit()
+
+    def inner_text(self, **_):
+        return self.page.content
 
 
 class FakeKeyboard:
@@ -129,17 +147,34 @@ class FakeButton:
         return self.page.logical_enabled
 
     def click(self, **_):
-        self.page.sent.append(self.page.content)
-        self.page.content = ""
+        if not self.page.click_actionable:
+            raise TimeoutError("send button actionability blocked")
+        self.page.submit()
+
+    def scroll_into_view_if_needed(self, **_):
+        return None
+
+
+class FakeStopButton:
+    last = None
+
+    def __init__(self):
+        self.last = self
+
+    def count(self):
+        return 0
+
+    def is_visible(self, **_):
+        return False
 
 
 class FakeComposerPage:
-    def __init__(self, *, available=True, focus=True, native_method="dom.click", transition=True, logical_enabled=True):
+    def __init__(self, *, available=True, focus=True, transition=True, logical_enabled=True, click_actionable=True):
         self.available = available
         self.focus = focus
-        self.native_method = native_method
         self.transition = transition
         self.logical_enabled = logical_enabled
+        self.click_actionable = click_actionable
         self.content = ""
         self.sent = []
         self.native_submissions = 0
@@ -149,9 +184,9 @@ class FakeComposerPage:
         if role == "textbox":
             if not self.available:
                 return FakeUnavailable()
-            composer = FakeComposer()
-            composer.last = composer
-            return composer
+            return FakeComposer(self)
+        if role == "button" and "stop" in str(_.get("name", "")).lower():
+            return FakeStopButton()
         return FakeButton(self)
 
     def locator(self, selector):
@@ -164,20 +199,11 @@ class FakeComposerPage:
 
         return Count(self)
 
-    def evaluate(self, script):
-        if "document.activeElement === e" in script:
-            return self.focus
-        if "send.form.requestSubmit" in script:
-            self.native_submissions += 1
-            if self.logical_enabled and self.native_method in {"form.requestSubmit", "dom.click"}:
-                if self.transition:
-                    self.sent.append(self.content)
-                    self.content = ""
-                return {"ok": True, "method": self.native_method}
-            return {"ok": False, "reason": "disabled"}
-        if "const composerEmpty" in script:
-            return {"composerEmpty": self.content == "", "generationVisible": False, "assistantCount": 0}
-        return self.content
+    def submit(self):
+        self.native_submissions += 1
+        if self.transition:
+            self.sent.append(self.content)
+            self.content = ""
 
 
 class FakeUnavailable:
@@ -198,18 +224,16 @@ def test_current_composer_receives_exact_text_and_is_confirmed():
     assert page.sent == [result]
 
 
-def test_form_request_submit_is_preferred_when_available():
-    page = FakeComposerPage(native_method="form.requestSubmit")
-    ArchitectPlaywright(page).submit_result_bounded("form result", timeout=1)
-    assert page.native_submissions == 1
-    assert page.sent == ["form result"]
+def test_normal_playwright_click_sends_exact_text():
+    page = FakeComposerPage()
+    ArchitectPlaywright(page).submit_result_bounded("click result", timeout=1)
+    assert page.sent == ["click result"]
 
 
-def test_direct_dom_click_is_used_when_request_submit_is_unavailable():
-    page = FakeComposerPage(native_method="dom.click")
-    ArchitectPlaywright(page).submit_result_bounded("dom result", timeout=1)
-    assert page.native_submissions == 1
-    assert page.sent == ["dom result"]
+def test_actionability_timeout_uses_playwright_enter_fallback():
+    page = FakeComposerPage(click_actionable=False)
+    ArchitectPlaywright(page).submit_result_bounded("fallback result", timeout=1)
+    assert page.sent == ["fallback result"]
 
 
 def test_disabled_send_is_never_forced():

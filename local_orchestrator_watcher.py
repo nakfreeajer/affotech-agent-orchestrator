@@ -1194,49 +1194,26 @@ class ArchitectPlaywright:
         # keyboard route after explicit focus; this updates the same editor
         # state as user typing/pasting and handles multiline Markdown.
         try:
-            evaluate = getattr(self.page, "evaluate", None)
-            if evaluate is None:
-                raise RuntimeError("COMPOSER_DOM_FOCUS_UNAVAILABLE")
-            focused = evaluate("""
-            () => {
-              const nodes = [...document.querySelectorAll('[role="textbox"], textarea, [contenteditable="true"]')];
-              const visible = nodes.filter((e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length));
-              const e = visible[visible.length - 1];
-              if (!e) return false;
-              e.focus({preventScroll: true});
-              return document.activeElement === e;
-            }
-            """)
-            if focused is not True:
-                raise RuntimeError("COMPOSER_DOM_FOCUS_REJECTED")
+            composer.scroll_into_view_if_needed(timeout=1000)
+            composer.focus(timeout=1000)
+            composer.press("ControlOrMeta+A", timeout=1000)
             keyboard = getattr(self.page, "keyboard", None)
             if keyboard is None:
                 raise RuntimeError("KEYBOARD_INPUT_UNAVAILABLE")
-            keyboard.press("ControlOrMeta+A")
             keyboard.insert_text(result)
         except Exception as error:
             code = "ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
             raise ResultSubmissionError(code, type(error).__name__) from error
 
-        # Filling is not enough if the application editor rejected the input
-        # event.  Prefer one atomic browser-side read when available.
-        evaluate = getattr(self.page, "evaluate", None)
-        if evaluate is not None:
-            try:
-                observed = evaluate("""() => {
-                    const nodes = [...document.querySelectorAll('[role="textbox"], textarea, [contenteditable="true"]')];
-                    const visible = nodes.filter((e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length));
-                    const e = visible[visible.length - 1];
-                    if (!e) return null;
-                    return String(e.value ?? e.innerText ?? e.textContent ?? '');
-                }""")
-            except Exception as error:
-                code = "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
-                raise ResultSubmissionError(code, type(error).__name__) from error
-            if not isinstance(observed, str) or not observed.strip():
-                raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED")
-            if normalize_prompt(observed) != normalize_prompt(result):
-                raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", "CONTENT_MISMATCH")
+        try:
+            observed = composer.inner_text(timeout=1000)
+        except Exception as error:
+            code = "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
+            raise ResultSubmissionError(code, type(error).__name__) from error
+        if not isinstance(observed, str) or not observed.strip():
+            raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED")
+        if normalize_prompt(observed) != normalize_prompt(result):
+            raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", "CONTENT_MISMATCH")
         assistant_count_before = self.assistant_count()
 
         try:
@@ -1252,35 +1229,23 @@ class ArchitectPlaywright:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE", type(error).__name__) from error
         if not enabled:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
+        send.scroll_into_view_if_needed(timeout=1000)
         try:
-            native = evaluate("""
-            () => {
-              const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-              const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
-              const send = buttons.find(e => /send(?: prompt)?/i.test(e.getAttribute('aria-label') || e.innerText || ''));
-              if (!send) return {ok: false, reason: 'missing'};
-              if (send.disabled || send.getAttribute('aria-disabled') === 'true') {
-                return {ok: false, reason: 'disabled', disabled: !!send.disabled, ariaDisabled: send.getAttribute('aria-disabled')};
-              }
-              if (send.form && typeof send.form.requestSubmit === 'function') {
-                send.form.requestSubmit(send);
-                return {ok: true, method: 'form.requestSubmit'};
-              }
-              if (typeof send.click === 'function') {
-                send.click();
-                return {ok: true, method: 'dom.click'};
-              }
-              return {ok: false, reason: 'unsubmittable'};
-            }
-            """)
-            if not isinstance(native, dict) or native.get("reason") == "disabled":
-                raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
-            if native.get("ok") is not True:
-                raise RuntimeError("ARCHITECT_SEND_NATIVE_SUBMIT_UNAVAILABLE")
+            send.click(timeout=1000)
+            self.last_send_method = "playwright.click"
         except Exception as error:
-            if isinstance(error, ResultSubmissionError):
-                raise
-            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(error).__name__) from error
+            if type(error).__name__ != "TimeoutError":
+                raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(error).__name__) from error
+            # A visible, enabled button can still be actionability-blocked by
+            # transient layout.  Enter is a Playwright-only fallback on the
+            # already confirmed active composer; transition confirmation below
+            # remains the delivery authority.
+            try:
+                composer.focus(timeout=1000)
+                composer.press("Enter", timeout=1000)
+                self.last_send_method = "playwright.composer.press(Enter)"
+            except Exception as fallback_error:
+                raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(fallback_error).__name__) from fallback_error
 
         # A bounded acknowledgement is the first observable post-send state:
         # the live composer no longer contains the submitted result.  Do not
@@ -1288,20 +1253,11 @@ class ArchitectPlaywright:
         ack_deadline = min(deadline, time.monotonic() + 5.0)
         while time.monotonic() < ack_deadline:
             try:
-                if evaluate is None:
-                    return
-                transition = evaluate("""() => {
-                    const nodes = [...document.querySelectorAll('[role="textbox"], textarea, [contenteditable="true"]')];
-                    const visible = nodes.filter((e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length));
-                    const e = visible[visible.length - 1];
-                    const composerEmpty = !e || String(e.value ?? e.innerText ?? e.textContent ?? '').trim() === '';
-                    const generationVisible = [...document.querySelectorAll('button,[role="button"]')]
-                      .filter((button) => !!(button.offsetWidth || button.offsetHeight || button.getClientRects().length))
-                      .some((button) => /stop(?: generating)?/i.test(button.innerText || button.getAttribute('aria-label') || ''));
-                    const assistantCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-                    return {composerEmpty, generationVisible, assistantCount};
-                }""")
-                if isinstance(transition, dict) and (transition.get("composerEmpty") or transition.get("generationVisible") or int(transition.get("assistantCount", 0)) > assistant_count_before):
+                composer_empty = not composer.inner_text(timeout=1000).strip()
+                stop = self.page.get_by_role("button", name=re.compile(r"stop(?: generating)?", re.I)).last
+                generation_visible = stop.count() > 0 and stop.is_visible(timeout=1000)
+                assistant_started = self.assistant_count() > assistant_count_before
+                if composer_empty or generation_visible or assistant_started:
                     return
             except Exception as error:
                 last_error = error
