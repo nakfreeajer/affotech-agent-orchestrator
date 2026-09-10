@@ -808,7 +808,8 @@ process.stdin.on("end", () => {
   });
 });
 '''
-        Path(launcher_path).write_text(launcher, encoding="utf-8", newline="\n")
+        with open(launcher_path, "w", encoding="utf-8", newline="\n") as launcher_file:
+            launcher_file.write(launcher)
         host_command = [self.launcher[0], launcher_path, status_path, *command]
         try:
             host = subprocess.Popen(
@@ -1816,35 +1817,206 @@ class LocalWatcher:
         return True
 
 
+ORCHESTRATOR_STATES = {"IDLE", "EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY", "HUMAN_REQUIRED", "EXECUTOR_CRASHED"}
+ORCHESTRATOR_RESULT_RE = re.compile(
+    r"<ORCHESTRATOR_RESULT>\s*"
+    r"classification=(ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT)\s*"
+    r"action=(EXECUTE|HUMAN_REQUIRED|STOP)\s*"
+    r"taskId=([^\r\n]+)\s*"
+    r"promptBegin\s*\r?\n?(.*?)\r?\npromptEnd\s*"
+    r"</ORCHESTRATOR_RESULT>\s*$",
+    re.S,
+)
+
+
+def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
+    """Durably replace one local file without exposing a partial document."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(data)
+    os.replace(temporary, target)
+
+
+def parse_orchestrator_result(text: str, completed_task_id: str) -> dict[str, str]:
+    match = ORCHESTRATOR_RESULT_RE.search(text.rstrip())
+    if not match or match.group(3).strip() != completed_task_id:
+        raise ValueError("ARCHITECT_ENVELOPE_INVALID")
+    prompt = match.group(4).replace("\r\n", "\n").replace("\r", "\n")
+    action = match.group(2)
+    if action == "EXECUTE" and not prompt.strip():
+        raise ValueError("ARCHITECT_ENVELOPE_PROMPT_REQUIRED")
+    if action != "EXECUTE" and prompt.strip():
+        raise ValueError("ARCHITECT_ENVELOPE_PROMPT_FORBIDDEN")
+    return {"classification": match.group(1), "action": action, "taskId": completed_task_id, "prompt": prompt}
+
+
+def repository_evidence(repo: str | os.PathLike[str]) -> dict[str, str]:
+    def git(*args: str) -> str:
+        try:
+            return subprocess.check_output(["git", "-C", str(repo), *args], text=True, encoding="utf-8", errors="replace").strip()
+        except (OSError, subprocess.CalledProcessError):
+            return "UNAVAILABLE"
+    status = git("status", "--porcelain")
+    return {"head": git("rev-parse", "HEAD"), "statusPorcelain": status, "changedFileSummary": status}
+
+
+class LocalFirstOrchestrator:
+    """Small durable local control loop; GitHub is deliberately absent from it."""
+    def __init__(self, project_dir: str, state_dir: str | os.PathLike[str] | None = None, process_factory: Callable[[str, Path], Any] | None = None):
+        self.project_dir = Path(project_dir)
+        self.state_dir = Path(state_dir or self.project_dir / ".agent-work" / "orchestrator")
+        self.results_dir, self.prompts_dir, self.logs_dir = (self.state_dir / name for name in ("results", "prompts", "logs"))
+        self.state_path = self.state_dir / "state.json"
+        self.process_factory = process_factory
+        self.state = self._load_state()
+
+    def _load_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {"state": "IDLE", "targetProject": str(self.project_dir), "targetRepo": str(self.project_dir)}
+        value = json.loads(self.state_path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("ORCHESTRATOR_STATE_INVALID")
+        value.setdefault("state", "IDLE")
+        return value
+
+    def save(self) -> None:
+        atomic_write(self.state_path, (json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+    def _result_path(self, task_id: str) -> Path:
+        return self.results_dir / f"{task_id}.txt"
+
+    def recover_5c(self, legacy_path: str | os.PathLike[str] = r"C:\Users\nitro\AppData\Local\Temp\codex-last-message-h_2bryhl.txt") -> bool:
+        source = Path(legacy_path)
+        if not source.is_file() or not source.read_text(encoding="utf-8", errors="replace").strip():
+            self.state.update({"state": "HUMAN_REQUIRED", "current5CRecoverableResult": False})
+            self.save()
+            return False
+        destination = self._result_path("PUB-aa3b4121887c4047b3c056bcccaa6a96")
+        atomic_write(destination, source.read_bytes())
+        self.state.update({"state": "RESULT_READY", "taskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96", "executorResultPath": str(destination), "current5CRecoverableResult": True, "current5CRecoveredResultPath": str(destination), "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96"})
+        self.save()
+        return True
+
+    def _capture_result(self, task_id: str, source: Path) -> Path:
+        destination = self._result_path(task_id)
+        if source.resolve() != destination.resolve():
+            atomic_write(destination, source.read_bytes())
+        if not destination.is_file() or not destination.read_text(encoding="utf-8", errors="replace").strip():
+            raise RuntimeError("EXECUTOR_RESULT_MISSING")
+        return destination
+
+    def reconcile_executor(self) -> str:
+        if self.state.get("state") != "EXECUTOR_RUNNING":
+            return self.state.get("state", "IDLE")
+        pid = self.state.get("codexPid")
+        if LocalWatcher.process_alive(pid):
+            return "EXECUTOR_RUNNING"
+        path = self.state.get("executorResultPath")
+        if isinstance(path, str) and Path(path).is_file() and Path(path).read_text(encoding="utf-8", errors="replace").strip():
+            self.state["state"] = "RESULT_READY"
+        else:
+            self.state["state"] = "EXECUTOR_CRASHED"
+        self.save()
+        return self.state["state"]
+
+    def mark_executor_started(self, task_id: str, pid: int, result_path: str | os.PathLike[str]) -> None:
+        self.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": str(self.project_dir), "executorResultPath": str(result_path)})
+        self.save()
+
+    def mark_executor_exit(self, exit_code: int, result_path: str | os.PathLike[str]) -> str:
+        task_id = str(self.state.get("taskId", "unknown"))
+        try:
+            result = self._capture_result(task_id, Path(result_path))
+        except (OSError, RuntimeError):
+            self.state["state"] = "EXECUTOR_CRASHED"
+            self.save()
+            return "EXECUTOR_CRASHED"
+        self.state.update({"state": "RESULT_READY", "executorResultPath": str(result), "executorExitCode": exit_code, "repositoryEvidence": repository_evidence(self.project_dir)})
+        self.save()
+        return "RESULT_READY"
+
+    def deliver_result(self, bridge: Any) -> None:
+        if self.state.get("state") != "RESULT_READY":
+            raise RuntimeError("RESULT_NOT_READY")
+        path = Path(self.state["executorResultPath"])
+        report = path.read_text(encoding="utf-8")
+        task_id = str(self.state["taskId"])
+        instruction = ("Verify the completed Executor report below, classify it, decide the next bounded action, "
+                       "and finish with exactly one <ORCHESTRATOR_RESULT> envelope using taskId=" + task_id + ".\n"
+                       "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
+        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
+        sender(instruction + report)
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None})
+        self.save()
+
+    def accept_architect_response(self, response: str) -> dict[str, str]:
+        fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        if fingerprint == self.state.get("architectResultFingerprint"):
+            return {"action": "DUPLICATE"}
+        decision = parse_orchestrator_result(response, str(self.state["taskId"]))
+        self.state["architectResultFingerprint"] = fingerprint
+        if decision["action"] == "EXECUTE":
+            sequence = int(self.state.get("taskSequence", 0)) + 1
+            next_id = f"{sequence:06d}"
+            path = self.prompts_dir / f"{next_id}.txt"
+            atomic_write(path, decision["prompt"].encode("utf-8"))
+            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id})
+        elif decision["action"] == "HUMAN_REQUIRED":
+            self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None})
+        else:
+            self.state.update({"state": "IDLE", "nextPromptPath": None})
+        self.save()
+        return decision
+
+    def launch_next(self, launcher: Callable[[str, Path], Any]) -> Any:
+        if self.state.get("state") != "NEXT_PROMPT_READY":
+            return None
+        prompt_path = Path(self.state["nextPromptPath"])
+        process = launcher(prompt_path.read_text(encoding="utf-8"), self._result_path(str(self.state["nextTaskId"])))
+        self.mark_executor_started(str(self.state["nextTaskId"]), int(process.pid), self._result_path(str(self.state["nextTaskId"])))
+        return process
+
+
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
-    work_area = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_WORK_AREA", str(Path(project) / ".agent-work")))
-    watcher = LocalWatcher(project)
-    source = RelayPromptSource(work_area / "affotech-agent-relay")
-    # Migrate only a legacy in-flight record with immutable relay supersession
-    # proof.  This runs before browser attachment and never infers identity
-    # from age, publication ordering, or the current pointer alone.
-    if watcher.state.get("in_flight") and not watcher.state.get("result_pending"):
-        current = source.read_current()
-        legacy_id = watcher.state.get("relay_publication_id")
-        proof = source.legacy_supersession_proof(legacy_id) if isinstance(legacy_id, str) else None
-        consumed = {}
-        evidence_repo = watcher.state.get("evidenceRepository") or str(Path(project) / ".agent-work" / "evidence-repo")
-        consumed_key = read_durable_consumed_relay_key(evidence_repo, current["publicationId"], current["contentSha256"])
-        if consumed_key:
-            consumed[relay_task_key(current["publicationId"], current["contentSha256"])] = consumed_key
-        if proof:
-            watcher.migrate_legacy_inflight_state(proof, consumed)
+    watcher = LocalFirstOrchestrator(project, os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR"))
+    if watcher.state.get("state") == "IDLE" and watcher.state.get("lastCompletedTaskId") != "PUB-aa3b4121887c4047b3c056bcccaa6a96":
+        watcher.recover_5c()
+    if watcher.state.get("state") != "RESULT_READY":
+        print(f"STATE={watcher.state.get('state')}")
+        return
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
-    conversation_id = watcher.state.get("currentArchitectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+    conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
     bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
-    watcher.state["currentArchitectConversationId"] = conversation_id
+    watcher.state["architectConversationId"] = conversation_id
     watcher.save()
     try:
-        watcher.run_relay_forever(source, bridge)
+        watcher.deliver_result(bridge)
+        baseline = bridge.assistant_baseline()
+        while True:
+            observed = bridge.wait_for_new_response(baseline, timeout=5.0)
+            if observed.get("state") != "COMPLETED":
+                watcher.state["state"] = "ARCHITECT_RUNNING"
+                watcher.save()
+                continue
+            decision = watcher.accept_architect_response(observed["text"])
+            if decision.get("action") != "EXECUTE":
+                print(f"STATE={watcher.state['state']}")
+                return
+            runner = CodexRunner(project, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
+            def launch(prompt: str, result_path: Path) -> Any:
+                command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
+                command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
+                child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=AFFOTECH_CHILD_PROJECT_DIR)
+                assert child.stdin is not None
+                child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
+                return child
+            process = watcher.launch_next(launch)
+            print(f"CODEX_STARTED pid={process.pid}")
+            return
     except KeyboardInterrupt:
-        emit = print
-        emit("STATE=STOPPED")
+        print("STATE=STOPPED")
     finally:
         bridge.close()
 
