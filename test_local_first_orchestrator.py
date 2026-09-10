@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from local_orchestrator_watcher import LocalFirstOrchestrator, atomic_write, parse_orchestrator_result
+from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestrator,
+                                        ResultSubmissionError, atomic_write,
+                                        parse_orchestrator_result)
 
 
 def envelope(task, action="EXECUTE", prompt="next task"):
@@ -92,3 +94,118 @@ def test_atomic_write_and_github_free_evidence(tmp_path):
     watcher.accept_architect_response(envelope("task-1", action="STOP"))
     assert "relay" not in json.dumps(watcher.state).lower()
 
+
+class FakeComposer:
+    last = None
+
+    def is_visible(self, **_):
+        return True
+
+    def is_editable(self, **_):
+        return True
+
+
+class FakeKeyboard:
+    def __init__(self, page):
+        self.page = page
+
+    def press(self, key):
+        assert key == "ControlOrMeta+A"
+        self.page.content = ""
+
+    def insert_text(self, value):
+        self.page.content = value
+
+
+class FakeButton:
+    def __init__(self, page):
+        self.page = page
+        self.last = self
+
+    def is_visible(self, **_):
+        return True
+
+    def is_enabled(self, **_):
+        return True
+
+    def click(self, **_):
+        self.page.sent.append(self.page.content)
+        self.page.content = ""
+
+
+class FakeComposerPage:
+    def __init__(self, *, available=True, focus=True):
+        self.available = available
+        self.focus = focus
+        self.content = ""
+        self.sent = []
+        self.keyboard = FakeKeyboard(self)
+
+    def get_by_role(self, role, **_):
+        if role == "textbox":
+            if not self.available:
+                return FakeUnavailable()
+            composer = FakeComposer()
+            composer.last = composer
+            return composer
+        return FakeButton(self)
+
+    def evaluate(self, script):
+        if "document.activeElement === e" in script:
+            return self.focus
+        if "return !e ||" in script:
+            return self.content == ""
+        return self.content
+
+
+class FakeUnavailable:
+    def __init__(self):
+        self.last = self
+
+    def is_visible(self, **_):
+        raise RuntimeError("missing composer")
+
+    def is_editable(self, **_):
+        raise RuntimeError("missing composer")
+
+
+def test_current_composer_receives_exact_text_and_is_confirmed():
+    page = FakeComposerPage()
+    result = "line 1\nline 2\n<ORCHESTRATOR_RESULT>"
+    ArchitectPlaywright(page).submit_result_bounded(result, timeout=1)
+    assert page.sent == [result]
+
+
+def test_unavailable_composer_fails_without_executor_rerun():
+    page = FakeComposerPage(available=False)
+    with pytest.raises(ResultSubmissionError) as error:
+        ArchitectPlaywright(page).submit_result_bounded("same result", timeout=0.1)
+    assert error.value.code == "ARCHITECT_COMPOSER_UNAVAILABLE"
+    assert page.sent == []
+
+
+def test_population_timeout_preserves_result_ready_payload_for_identical_retry(tmp_path):
+    watcher = ready(tmp_path)
+    payload = Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8")
+    page = FakeComposerPage(focus=False)
+    with pytest.raises(ResultSubmissionError):
+        ArchitectPlaywright(page).submit_result_bounded(payload, timeout=1)
+    assert LocalFirstOrchestrator(str(tmp_path), watcher.state_dir).state["state"] == "RESULT_READY"
+    assert Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8") == payload
+    retry = FakeComposerPage()
+    ArchitectPlaywright(retry).submit_result_bounded(payload, timeout=1)
+    assert retry.sent == [payload]
+
+
+def test_next_prompt_persisted_and_launches_exactly_one_codex_child(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["state"] = "ARCHITECT_RUNNING"
+    watcher.accept_architect_response(envelope("task-1", prompt="next"))
+    launches = []
+
+    class Process:
+        pid = 4321
+
+    watcher.launch_next(lambda prompt, path: (launches.append(prompt) or Process()))
+    assert launches == ["next"]
+    assert watcher.launch_next(lambda *_: (_ for _ in ()).throw(AssertionError("duplicate launch"))) is None

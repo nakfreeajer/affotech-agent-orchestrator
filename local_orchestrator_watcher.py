@@ -1194,11 +1194,25 @@ class ArchitectPlaywright:
         # keyboard route after explicit focus; this updates the same editor
         # state as user typing/pasting and handles multiline Markdown.
         try:
-            composer.click(timeout=1000)
-            composer.press("ControlOrMeta+A", timeout=1000)
+            evaluate = getattr(self.page, "evaluate", None)
+            if evaluate is None:
+                raise RuntimeError("COMPOSER_DOM_FOCUS_UNAVAILABLE")
+            focused = evaluate("""
+            () => {
+              const nodes = [...document.querySelectorAll('[role="textbox"], textarea, [contenteditable="true"]')];
+              const visible = nodes.filter((e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+              const e = visible[visible.length - 1];
+              if (!e) return false;
+              e.focus({preventScroll: true});
+              return document.activeElement === e;
+            }
+            """)
+            if focused is not True:
+                raise RuntimeError("COMPOSER_DOM_FOCUS_REJECTED")
             keyboard = getattr(self.page, "keyboard", None)
             if keyboard is None:
                 raise RuntimeError("KEYBOARD_INPUT_UNAVAILABLE")
+            keyboard.press("ControlOrMeta+A")
             keyboard.insert_text(result)
         except Exception as error:
             code = "ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
