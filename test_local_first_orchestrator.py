@@ -405,6 +405,51 @@ def test_resident_executor_poll_has_no_wall_clock_timeout():
     assert "timeout" not in inspect.signature(LocalFirstOrchestrator.wait_for_executor).parameters
 
 
+def test_idle_remains_resident_and_detects_later_local_work(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.save()
+    polls = []
+
+    def poll(_delay):
+        polls.append(1)
+        if len(polls) == 2:
+            atomic_write(watcher.state_path, json.dumps({"state": "NEXT_PROMPT_READY", "nextPromptPath": "future.txt"}).encode())
+
+    monkeypatch.setattr(watcher_module.time, "sleep", poll)
+    assert watcher.wait_for_idle(poll_interval=999999) == "NEXT_PROMPT_READY"
+    assert len(polls) == 2
+    assert watcher.state.get("codexLaunchCount", 0) == 0
+    assert watcher.state.get("architectContactCount", 0) == 0
+
+
+def test_idle_does_not_resurrect_superseded_task(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "IDLE", "taskId": None, "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96", "supersededTaskIds": ["000001"]})
+    watcher.save()
+
+    def stop(_delay):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(watcher_module.time, "sleep", stop)
+    with pytest.raises(KeyboardInterrupt):
+        watcher.wait_for_idle()
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state["supersededTaskIds"] == ["000001"]
+
+
+def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys):
+    class IdleWatcher:
+        def __init__(self, *_args, **_kwargs):
+            self.state = {"state": "IDLE"}
+
+        def wait_for_idle(self, _interval):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", IdleWatcher)
+    watcher_module.main()
+    assert "STATE=STOPPED" in capsys.readouterr().out
+
+
 def test_architect_executor_prompt_resolves_explicit_worktree(tmp_path):
     worktree = tmp_path / "affotech-worktree"
     worktree.mkdir()

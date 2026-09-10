@@ -1947,6 +1947,13 @@ class LocalFirstOrchestrator:
                 return state
         return self.state.get("state", "IDLE")
 
+    def wait_for_idle(self, poll_interval: float = 2.0) -> str:
+        """Remain resident in normal IDLE until local state requests work."""
+        while self.state.get("state") == "IDLE":
+            time.sleep(poll_interval)
+            self.state = self._load_state()
+        return self.state.get("state", "IDLE")
+
     def mark_executor_started(self, task_id: str, pid: int, result_path: str | os.PathLike[str]) -> None:
         self.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": str(self.project_dir), "executorResultPath": str(result_path)})
         self.save()
@@ -2048,10 +2055,8 @@ def main() -> None:
         while True:
             state = watcher.state.get("state", "IDLE")
             if state == "IDLE":
-                if watcher.state.get("lastCompletedTaskId") == "PUB-aa3b4121887c4047b3c056bcccaa6a96":
-                    print("STATE=IDLE")
-                    return
-                watcher.recover_5c()
+                print("STATE=IDLE")
+                watcher.wait_for_idle(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
                 continue
             if state == "EXECUTOR_RUNNING":
                 state = watcher.wait_for_executor()
