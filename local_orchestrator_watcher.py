@@ -1951,6 +1951,32 @@ class LocalFirstOrchestrator:
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
 
+    def request_format_recovery(self, bridge: Any) -> None:
+        """Request one machine-readable envelope without replaying the result."""
+        if int(self.state.get("formatRecoveryCount", 0)) >= 1:
+            self.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
+            self.save()
+            return
+        task_id = str(self.state["taskId"])
+        message = "\n".join([
+            f"Your previous response for task {task_id} was received successfully but did not contain a valid ORCHESTRATOR_RESULT envelope.",
+            "Do not redo the underlying task.",
+            "Do not request the Executor report again.",
+            "Return only the machine-readable envelope for your already-completed decision:",
+            "<ORCHESTRATOR_RESULT>",
+            "classification=ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT",
+            "action=EXECUTE|HUMAN_REQUIRED|STOP",
+            f"taskId={task_id}",
+            "promptBegin <complete next Executor prompt only when action=EXECUTE>",
+            "promptEnd",
+            "</ORCHESTRATOR_RESULT>",
+        ])
+        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
+        sender(message)
+        baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
+        self.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": task_id, "architectBaseline": baseline})
+        self.save()
+
     def accept_architect_response(self, response: str) -> dict[str, str]:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         if fingerprint == self.state.get("architectResultFingerprint"):
@@ -2011,7 +2037,17 @@ def main() -> None:
                 bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                 time.sleep(1.0)
                 continue
-            decision = watcher.accept_architect_response(observed["text"])
+            try:
+                decision = watcher.accept_architect_response(observed["text"])
+            except ValueError:
+                if int(watcher.state.get("formatRecoveryCount", 0)) >= 1:
+                    watcher.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
+                    watcher.save()
+                    print(f"STATE={watcher.state['state']}")
+                    return
+                watcher.request_format_recovery(bridge)
+                baseline = watcher.state.get("architectBaseline")
+                continue
             if decision.get("action") != "EXECUTE":
                 print(f"STATE={watcher.state['state']}")
                 return

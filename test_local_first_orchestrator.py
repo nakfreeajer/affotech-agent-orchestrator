@@ -87,6 +87,43 @@ def test_malformed_or_wrong_task_envelope_launches_nothing(tmp_path):
         parse_orchestrator_result(envelope("other"), "task-1")
 
 
+class RecoveryBridge:
+    def __init__(self):
+        self.messages = []
+
+    def submit_result_bounded(self, value):
+        self.messages.append(value)
+
+    def assistant_baseline(self):
+        return {"count": 2, "text_hash": "baseline", "entries": []}
+
+
+def test_invalid_architect_envelope_gets_one_same_task_format_recovery(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["state"] = "ARCHITECT_RUNNING"
+    bridge = RecoveryBridge()
+    watcher.request_format_recovery(bridge)
+    assert len(bridge.messages) == 1
+    assert "taskId=task-1" in bridge.messages[0]
+    assert bridge.messages[0] != "executor report"
+    assert watcher.state["formatRecoveryCount"] == 1
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+
+
+def test_format_recovery_is_not_repeated_and_falls_back_to_human(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1})
+    bridge = RecoveryBridge()
+    watcher.request_format_recovery(bridge)
+    assert bridge.messages == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+
+
+def test_format_recovery_response_uses_strict_same_task_parser():
+    parsed = parse_orchestrator_result(envelope("task-1", prompt="next"), "task-1")
+    assert parsed == {"classification": "ACCEPTED", "action": "EXECUTE", "taskId": "task-1", "prompt": "next"}
+
+
 def test_atomic_write_and_github_free_evidence(tmp_path):
     path = tmp_path / "work" / "state.json"
     atomic_write(path, b"{}")
