@@ -1237,6 +1237,7 @@ class ArchitectPlaywright:
                 raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED")
             if normalize_prompt(observed) != normalize_prompt(result):
                 raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", "CONTENT_MISMATCH")
+        assistant_count_before = self.assistant_count()
 
         try:
             send = self.page.get_by_role("button", name=re.compile(r"^\s*send(?:\s+prompt)?\s*$", re.I)).last
@@ -1252,8 +1253,33 @@ class ArchitectPlaywright:
         if not enabled:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
         try:
-            send.click(timeout=1000)
+            native = evaluate("""
+            () => {
+              const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+              const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+              const send = buttons.find(e => /send(?: prompt)?/i.test(e.getAttribute('aria-label') || e.innerText || ''));
+              if (!send) return {ok: false, reason: 'missing'};
+              if (send.disabled || send.getAttribute('aria-disabled') === 'true') {
+                return {ok: false, reason: 'disabled', disabled: !!send.disabled, ariaDisabled: send.getAttribute('aria-disabled')};
+              }
+              if (send.form && typeof send.form.requestSubmit === 'function') {
+                send.form.requestSubmit(send);
+                return {ok: true, method: 'form.requestSubmit'};
+              }
+              if (typeof send.click === 'function') {
+                send.click();
+                return {ok: true, method: 'dom.click'};
+              }
+              return {ok: false, reason: 'unsubmittable'};
+            }
+            """)
+            if not isinstance(native, dict) or native.get("reason") == "disabled":
+                raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
+            if native.get("ok") is not True:
+                raise RuntimeError("ARCHITECT_SEND_NATIVE_SUBMIT_UNAVAILABLE")
         except Exception as error:
+            if isinstance(error, ResultSubmissionError):
+                raise
             raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(error).__name__) from error
 
         # A bounded acknowledgement is the first observable post-send state:
@@ -1264,13 +1290,18 @@ class ArchitectPlaywright:
             try:
                 if evaluate is None:
                     return
-                empty = evaluate("""() => {
+                transition = evaluate("""() => {
                     const nodes = [...document.querySelectorAll('[role="textbox"], textarea, [contenteditable="true"]')];
                     const visible = nodes.filter((e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length));
                     const e = visible[visible.length - 1];
-                    return !e || String(e.value ?? e.innerText ?? e.textContent ?? '').trim() === '';
+                    const composerEmpty = !e || String(e.value ?? e.innerText ?? e.textContent ?? '').trim() === '';
+                    const generationVisible = [...document.querySelectorAll('button,[role="button"]')]
+                      .filter((button) => !!(button.offsetWidth || button.offsetHeight || button.getClientRects().length))
+                      .some((button) => /stop(?: generating)?/i.test(button.innerText || button.getAttribute('aria-label') || ''));
+                    const assistantCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+                    return {composerEmpty, generationVisible, assistantCount};
                 }""")
-                if empty:
+                if isinstance(transition, dict) and (transition.get("composerEmpty") or transition.get("generationVisible") or int(transition.get("assistantCount", 0)) > assistant_count_before):
                     return
             except Exception as error:
                 last_error = error

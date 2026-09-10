@@ -126,7 +126,7 @@ class FakeButton:
         return True
 
     def is_enabled(self, **_):
-        return True
+        return self.page.logical_enabled
 
     def click(self, **_):
         self.page.sent.append(self.page.content)
@@ -134,11 +134,15 @@ class FakeButton:
 
 
 class FakeComposerPage:
-    def __init__(self, *, available=True, focus=True):
+    def __init__(self, *, available=True, focus=True, native_method="dom.click", transition=True, logical_enabled=True):
         self.available = available
         self.focus = focus
+        self.native_method = native_method
+        self.transition = transition
+        self.logical_enabled = logical_enabled
         self.content = ""
         self.sent = []
+        self.native_submissions = 0
         self.keyboard = FakeKeyboard(self)
 
     def get_by_role(self, role, **_):
@@ -150,11 +154,29 @@ class FakeComposerPage:
             return composer
         return FakeButton(self)
 
+    def locator(self, selector):
+        class Count:
+            def __init__(self, page):
+                self.page = page
+
+            def count(self):
+                return 0
+
+        return Count(self)
+
     def evaluate(self, script):
         if "document.activeElement === e" in script:
             return self.focus
-        if "return !e ||" in script:
-            return self.content == ""
+        if "send.form.requestSubmit" in script:
+            self.native_submissions += 1
+            if self.logical_enabled and self.native_method in {"form.requestSubmit", "dom.click"}:
+                if self.transition:
+                    self.sent.append(self.content)
+                    self.content = ""
+                return {"ok": True, "method": self.native_method}
+            return {"ok": False, "reason": "disabled"}
+        if "const composerEmpty" in script:
+            return {"composerEmpty": self.content == "", "generationVisible": False, "assistantCount": 0}
         return self.content
 
 
@@ -176,6 +198,28 @@ def test_current_composer_receives_exact_text_and_is_confirmed():
     assert page.sent == [result]
 
 
+def test_form_request_submit_is_preferred_when_available():
+    page = FakeComposerPage(native_method="form.requestSubmit")
+    ArchitectPlaywright(page).submit_result_bounded("form result", timeout=1)
+    assert page.native_submissions == 1
+    assert page.sent == ["form result"]
+
+
+def test_direct_dom_click_is_used_when_request_submit_is_unavailable():
+    page = FakeComposerPage(native_method="dom.click")
+    ArchitectPlaywright(page).submit_result_bounded("dom result", timeout=1)
+    assert page.native_submissions == 1
+    assert page.sent == ["dom result"]
+
+
+def test_disabled_send_is_never_forced():
+    page = FakeComposerPage(logical_enabled=False)
+    with pytest.raises(ResultSubmissionError) as error:
+        ArchitectPlaywright(page).submit_result_bounded("blocked", timeout=1)
+    assert error.value.code == "ARCHITECT_SEND_CONTROL_DISABLED"
+    assert page.native_submissions == 0
+
+
 def test_unavailable_composer_fails_without_executor_rerun():
     page = FakeComposerPage(available=False)
     with pytest.raises(ResultSubmissionError) as error:
@@ -195,6 +239,18 @@ def test_population_timeout_preserves_result_ready_payload_for_identical_retry(t
     retry = FakeComposerPage()
     ArchitectPlaywright(retry).submit_result_bounded(payload, timeout=1)
     assert retry.sent == [payload]
+
+
+def test_native_submit_without_transition_preserves_payload(tmp_path):
+    watcher = ready(tmp_path)
+    payload = Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8")
+    page = FakeComposerPage(transition=False)
+    with pytest.raises(ResultSubmissionError) as error:
+        ArchitectPlaywright(page).submit_result_bounded(payload, timeout=1)
+    assert error.value.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT"
+    assert page.native_submissions == 1
+    assert LocalFirstOrchestrator(str(tmp_path), watcher.state_dir).state["state"] == "RESULT_READY"
+    assert Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8") == payload
 
 
 def test_next_prompt_persisted_and_launches_exactly_one_codex_child(tmp_path):
