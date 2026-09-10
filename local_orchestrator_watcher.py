@@ -1194,7 +1194,6 @@ class ArchitectPlaywright:
         # keyboard route after explicit focus; this updates the same editor
         # state as user typing/pasting and handles multiline Markdown.
         try:
-            composer.scroll_into_view_if_needed(timeout=1000)
             composer.focus(timeout=1000)
             composer.press("ControlOrMeta+A", timeout=1000)
             keyboard = getattr(self.page, "keyboard", None)
@@ -1229,7 +1228,6 @@ class ArchitectPlaywright:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE", type(error).__name__) from error
         if not enabled:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
-        send.scroll_into_view_if_needed(timeout=1000)
         try:
             send.click(timeout=1000)
             self.last_send_method = "playwright.click"
