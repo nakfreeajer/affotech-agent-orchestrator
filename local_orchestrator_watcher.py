@@ -1922,6 +1922,10 @@ class LocalFirstOrchestrator:
     def reconcile_executor(self) -> str:
         if self.state.get("state") != "EXECUTOR_RUNNING":
             return self.state.get("state", "IDLE")
+        pending_prompt = self.state.get("nextPromptPath")
+        if isinstance(pending_prompt, str) and Path(pending_prompt).is_file():
+            target = resolve_executor_worktree(Path(pending_prompt).read_text(encoding="utf-8"), self.project_dir)
+            self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
         pid = self.state.get("codexPid")
         if LocalWatcher.process_alive(pid):
             return "EXECUTOR_RUNNING"

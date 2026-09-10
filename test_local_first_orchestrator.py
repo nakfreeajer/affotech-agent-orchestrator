@@ -451,3 +451,16 @@ def test_dead_pid_with_no_result_is_crashed_and_never_relaunched(tmp_path, monke
     assert watcher.state["state"] != "EXECUTOR_RUNNING"
     assert calls == [1111]
     assert watcher.launch_next(lambda *_: (_ for _ in ()).throw(AssertionError("must not relaunch"))) is None
+
+
+def test_restart_reconciliation_persists_pending_worktree_before_pid_decision(tmp_path, monkeypatch):
+    worktree = tmp_path / "affotech-worktree"
+    worktree.mkdir()
+    prompt = tmp_path / "next.txt"
+    prompt.write_text(f"WORKTREE\n{worktree}\nnext", encoding="utf-8")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 2222, "taskId": "000001", "nextPromptPath": str(prompt), "executorResultPath": str(tmp_path / "missing"), "targetProject": str(tmp_path)})
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    assert watcher.reconcile_executor() == "EXECUTOR_CRASHED"
+    assert watcher.state["targetProject"] == str(worktree)
+    assert watcher.state["targetWorktree"] == str(worktree)
