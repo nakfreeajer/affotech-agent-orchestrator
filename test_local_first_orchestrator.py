@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestrator,
+                                        LocalWatcher,
                                         ResultSubmissionError, atomic_write,
                                         parse_orchestrator_result)
 import local_orchestrator_watcher as watcher_module
@@ -387,3 +388,18 @@ def test_stopped_malformed_architect_response_is_safe_without_resend(monkeypatch
     assert observed["state"] == "BLOCKED"
     with pytest.raises(ValueError):
         parse_orchestrator_result(observed["text"], "task-1")
+
+
+def test_executor_running_poll_is_resident_and_advances_on_exit(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    report = tmp_path / "report.txt"
+    report.write_text("completed", encoding="utf-8")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 1234, "taskId": "task-1", "executorResultPath": str(report)})
+    alive = iter([True, True, False])
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: next(alive)))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    assert watcher.wait_for_executor(poll_interval=999999) == "RESULT_READY"
+
+
+def test_resident_executor_poll_has_no_wall_clock_timeout():
+    assert "timeout" not in inspect.signature(LocalFirstOrchestrator.wait_for_executor).parameters

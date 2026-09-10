@@ -1920,6 +1920,16 @@ class LocalFirstOrchestrator:
         self.save()
         return self.state["state"]
 
+    def wait_for_executor(self, poll_interval: float = 2.0) -> str:
+        """Remain resident while the independently launched Executor runs."""
+        while self.state.get("state") == "EXECUTOR_RUNNING":
+            state = self.reconcile_executor()
+            if state == "EXECUTOR_RUNNING":
+                time.sleep(poll_interval)
+            else:
+                return state
+        return self.state.get("state", "IDLE")
+
     def mark_executor_started(self, task_id: str, pid: int, result_path: str | os.PathLike[str]) -> None:
         self.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": str(self.project_dir), "executorResultPath": str(result_path)})
         self.save()
@@ -2008,64 +2018,87 @@ class LocalFirstOrchestrator:
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     watcher = LocalFirstOrchestrator(project, os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR"))
-    if watcher.state.get("state") == "IDLE" and watcher.state.get("lastCompletedTaskId") != "PUB-aa3b4121887c4047b3c056bcccaa6a96":
-        watcher.recover_5c()
-    if watcher.state.get("state") not in {"RESULT_READY", "ARCHITECT_RUNNING"}:
-        print(f"STATE={watcher.state.get('state')}")
-        return
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
-    bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
-    watcher.state["architectConversationId"] = conversation_id
-    watcher.save()
     try:
-        if watcher.state.get("state") == "RESULT_READY":
-            watcher.deliver_result(bridge)
-        baseline = watcher.state.get("architectBaseline")
-        if not isinstance(baseline, dict):
-            entries = bridge._assistant_entries()
-            prior = entries[:-1] if entries else []
-            snapshot = json.dumps(prior, ensure_ascii=False, separators=(",", ":"))
-            baseline = {"count": len(prior), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": prior}
         while True:
-            try:
-                observed = bridge.wait_for_new_response(baseline, poll_interval=5.0)
-            except Exception:
-                watcher.state["state"] = "ARCHITECT_RUNNING"
-                watcher.save()
-                bridge.close()
-                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
-                time.sleep(1.0)
-                continue
-            try:
-                decision = watcher.accept_architect_response(observed["text"])
-            except ValueError:
-                if int(watcher.state.get("formatRecoveryCount", 0)) >= 1:
-                    watcher.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
-                    watcher.save()
-                    print(f"STATE={watcher.state['state']}")
+            state = watcher.state.get("state", "IDLE")
+            if state == "IDLE":
+                if watcher.state.get("lastCompletedTaskId") == "PUB-aa3b4121887c4047b3c056bcccaa6a96":
+                    print("STATE=IDLE")
                     return
-                watcher.request_format_recovery(bridge)
-                baseline = watcher.state.get("architectBaseline")
+                watcher.recover_5c()
                 continue
-            if decision.get("action") != "EXECUTE":
-                print(f"STATE={watcher.state['state']}")
+            if state == "EXECUTOR_RUNNING":
+                state = watcher.wait_for_executor()
+                if state == "EXECUTOR_RUNNING":
+                    continue
+                if state == "EXECUTOR_CRASHED":
+                    watcher.state["state"] = "HUMAN_REQUIRED"
+                    watcher.save()
+                    print("STATE=HUMAN_REQUIRED")
+                    return
+                continue
+            if state == "NEXT_PROMPT_READY":
+                runner = CodexRunner(project, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
+                def launch(prompt: str, result_path: Path) -> Any:
+                    command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
+                    command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
+                    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=AFFOTECH_CHILD_PROJECT_DIR)
+                    assert child.stdin is not None
+                    child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
+                    return child
+                process = watcher.launch_next(launch)
+                print(f"CODEX_STARTED pid={process.pid}")
+                continue
+            if state == "HUMAN_REQUIRED":
+                print("STATE=HUMAN_REQUIRED")
                 return
-            runner = CodexRunner(project, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
-            def launch(prompt: str, result_path: Path) -> Any:
-                command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
-                command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
-                child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=AFFOTECH_CHILD_PROJECT_DIR)
-                assert child.stdin is not None
-                child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
-                return child
-            process = watcher.launch_next(launch)
-            print(f"CODEX_STARTED pid={process.pid}")
-            return
+            if state not in {"RESULT_READY", "ARCHITECT_RUNNING"}:
+                print(f"STATE={state}")
+                return
+
+            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            watcher.state["architectConversationId"] = conversation_id
+            watcher.save()
+            try:
+                if watcher.state.get("state") == "RESULT_READY":
+                    watcher.deliver_result(bridge)
+                baseline = watcher.state.get("architectBaseline")
+                if not isinstance(baseline, dict):
+                    entries = bridge._assistant_entries()
+                    prior = entries[:-1] if entries else []
+                    snapshot = json.dumps(prior, ensure_ascii=False, separators=(",", ":"))
+                    baseline = {"count": len(prior), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": prior}
+                while True:
+                    try:
+                        observed = bridge.wait_for_new_response(baseline, poll_interval=5.0)
+                    except Exception:
+                        watcher.state["state"] = "ARCHITECT_RUNNING"
+                        watcher.save()
+                        bridge.close()
+                        bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                        time.sleep(1.0)
+                        continue
+                    try:
+                        decision = watcher.accept_architect_response(observed["text"])
+                    except ValueError:
+                        if int(watcher.state.get("formatRecoveryCount", 0)) >= 1:
+                            watcher.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
+                            watcher.save()
+                            print(f"STATE={watcher.state['state']}")
+                            return
+                        watcher.request_format_recovery(bridge)
+                        baseline = watcher.state.get("architectBaseline")
+                        continue
+                    if decision.get("action") != "EXECUTE":
+                        print(f"STATE={watcher.state['state']}")
+                        return
+                    break
+            finally:
+                bridge.close()
     except KeyboardInterrupt:
         print("STATE=STOPPED")
-    finally:
-        bridge.close()
 
 
 if __name__ == "__main__":
