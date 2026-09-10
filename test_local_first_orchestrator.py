@@ -9,7 +9,7 @@ import pytest
 from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestrator,
                                         LocalWatcher,
                                         ResultSubmissionError, atomic_write,
-                                        parse_orchestrator_result)
+                                        parse_orchestrator_result, resolve_executor_worktree)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -403,3 +403,51 @@ def test_executor_running_poll_is_resident_and_advances_on_exit(tmp_path, monkey
 
 def test_resident_executor_poll_has_no_wall_clock_timeout():
     assert "timeout" not in inspect.signature(LocalFirstOrchestrator.wait_for_executor).parameters
+
+
+def test_architect_executor_prompt_resolves_explicit_worktree(tmp_path):
+    worktree = tmp_path / "affotech-worktree"
+    worktree.mkdir()
+    prompt = f"ROLE\nExecutor\nWORKTREE\n{worktree}\nGOAL\nPreserve"
+    assert resolve_executor_worktree(prompt, tmp_path) == str(worktree)
+    watcher = ready(tmp_path)
+    watcher.state["state"] = "ARCHITECT_RUNNING"
+    watcher.accept_architect_response(envelope("task-1", prompt=prompt))
+    assert watcher.state["targetProject"] == str(worktree)
+    assert watcher.state["targetRepo"] == str(worktree)
+    assert watcher.state["targetWorktree"] == str(worktree)
+
+
+def test_missing_or_invalid_executor_worktree_fails_closed(tmp_path):
+    with pytest.raises(RuntimeError, match="EXECUTOR_WORKTREE_MISSING"):
+        resolve_executor_worktree("ROLE\nExecutor")
+    with pytest.raises(RuntimeError, match="EXECUTOR_WORKTREE_INVALID"):
+        resolve_executor_worktree("WORKTREE\nC:\\does-not-exist", tmp_path)
+
+
+def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):
+    worktree = tmp_path / "affotech-worktree"
+    worktree.mkdir()
+    watcher = ready(tmp_path)
+    watcher.state["state"] = "ARCHITECT_RUNNING"
+    watcher.accept_architect_response(envelope("task-1", prompt=f"WORKTREE\n{worktree}\nnext"))
+
+    class Process:
+        pid = 9876
+
+    observed = []
+    watcher.launch_next(lambda prompt, path: (observed.append((prompt, path, watcher.state["targetWorktree"])) or Process()))
+    assert observed[0][2] == str(worktree)
+    assert watcher.state["codexPid"] == 9876
+    assert watcher.state["targetWorktree"] == str(worktree)
+
+
+def test_dead_pid_with_no_result_is_crashed_and_never_relaunched(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 1111, "taskId": "task-1", "executorResultPath": str(tmp_path / "missing")})
+    calls = []
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda pid: calls.append(pid) or False))
+    assert watcher.reconcile_executor() == "EXECUTOR_CRASHED"
+    assert watcher.state["state"] != "EXECUTOR_RUNNING"
+    assert calls == [1111]
+    assert watcher.launch_next(lambda *_: (_ for _ in ()).throw(AssertionError("must not relaunch"))) is None

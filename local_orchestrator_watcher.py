@@ -1815,6 +1815,7 @@ class LocalWatcher:
 
 
 ORCHESTRATOR_STATES = {"IDLE", "EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY", "HUMAN_REQUIRED", "EXECUTOR_CRASHED"}
+EXECUTOR_WORKTREE_RE = re.compile(r"(?im)^\s*WORKTREE\s*\r?\n\s*(.+?)\s*$")
 ORCHESTRATOR_RESULT_RE = re.compile(
     r"<ORCHESTRATOR_RESULT>\s*"
     r"classification=(ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT)\s*"
@@ -1859,6 +1860,18 @@ def repository_evidence(repo: str | os.PathLike[str]) -> dict[str, str]:
             return "UNAVAILABLE"
     status = git("status", "--porcelain")
     return {"head": git("rev-parse", "HEAD"), "statusPorcelain": status, "changedFileSummary": status}
+
+
+def resolve_executor_worktree(prompt: str, fallback_project: str | os.PathLike[str] | None = None) -> str:
+    """Resolve an explicit Executor WORKTREE and fail closed if it is invalid."""
+    match = EXECUTOR_WORKTREE_RE.search(prompt)
+    candidate = match.group(1).strip().strip("`") if match else (str(fallback_project) if fallback_project is not None else None)
+    if not candidate:
+        raise RuntimeError("EXECUTOR_WORKTREE_MISSING")
+    path = Path(candidate)
+    if not path.is_dir():
+        raise RuntimeError(f"EXECUTOR_WORKTREE_INVALID:{candidate}")
+    return str(path)
 
 
 class LocalFirstOrchestrator:
@@ -1992,16 +2005,19 @@ class LocalFirstOrchestrator:
         if fingerprint == self.state.get("architectResultFingerprint"):
             return {"action": "DUPLICATE"}
         decision = parse_orchestrator_result(response, str(self.state["taskId"]))
-        self.state["architectResultFingerprint"] = fingerprint
         if decision["action"] == "EXECUTE":
+            target = resolve_executor_worktree(decision["prompt"], self.project_dir)
+            self.state["architectResultFingerprint"] = fingerprint
             sequence = int(self.state.get("taskSequence", 0)) + 1
             next_id = f"{sequence:06d}"
             path = self.prompts_dir / f"{next_id}.txt"
             atomic_write(path, decision["prompt"].encode("utf-8"))
-            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id})
+            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target, "targetRepo": target, "targetWorktree": target})
         elif decision["action"] == "HUMAN_REQUIRED":
+            self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None})
         else:
+            self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "IDLE", "nextPromptPath": None})
         self.save()
         return decision
@@ -2010,7 +2026,11 @@ class LocalFirstOrchestrator:
         if self.state.get("state") != "NEXT_PROMPT_READY":
             return None
         prompt_path = Path(self.state["nextPromptPath"])
-        process = launcher(prompt_path.read_text(encoding="utf-8"), self._result_path(str(self.state["nextTaskId"])))
+        prompt = prompt_path.read_text(encoding="utf-8")
+        target = resolve_executor_worktree(prompt, self.project_dir)
+        self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
+        self.save()
+        process = launcher(prompt, self._result_path(str(self.state["nextTaskId"])))
         self.mark_executor_started(str(self.state["nextTaskId"]), int(process.pid), self._result_path(str(self.state["nextTaskId"])))
         return process
 
@@ -2044,7 +2064,8 @@ def main() -> None:
                 def launch(prompt: str, result_path: Path) -> Any:
                     command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
                     command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
-                    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=AFFOTECH_CHILD_PROJECT_DIR)
+                    target = watcher.state["targetWorktree"]
+                    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=None, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
                     assert child.stdin is not None
                     child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
                     return child
