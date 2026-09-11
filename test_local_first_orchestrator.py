@@ -442,7 +442,7 @@ def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys):
         def __init__(self, *_args, **_kwargs):
             self.state = {"state": "IDLE"}
 
-        def wait_for_idle(self, _interval):
+        def intake_inbox(self, _launcher):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", IdleWatcher)
@@ -509,3 +509,60 @@ def test_restart_reconciliation_persists_pending_worktree_before_pid_decision(tm
     assert watcher.reconcile_executor() == "EXECUTOR_CRASHED"
     assert watcher.state["targetProject"] == str(worktree)
     assert watcher.state["targetWorktree"] == str(worktree)
+
+
+def inbox_watcher(tmp_path, prompt):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.inbox_dir.mkdir(parents=True)
+    source = watcher.inbox_dir / "000002.txt"
+    source.write_text(prompt, encoding="utf-8")
+    return watcher, source
+
+
+def test_idle_valid_inbox_launches_once_and_persists_target(tmp_path):
+    worktree = tmp_path / "affotech-worktree"
+    worktree.mkdir()
+    watcher, source = inbox_watcher(tmp_path, f"PROJECT\naffotech-system-v2-hybrid\nWORKTREE\n{worktree}\nGOAL\nnext")
+
+    class Process:
+        pid = 3001
+
+    launches = []
+    assert watcher.intake_inbox(lambda prompt, result: (launches.append((prompt, result)), Process())[1])
+    assert len(launches) == 1
+    assert watcher.state["state"] == "EXECUTOR_RUNNING"
+    assert watcher.state["targetWorktree"] == str(worktree)
+    assert Path(watcher.state["nextPromptPath"]).read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+    assert watcher.state["consumedInboxItems"]["000002"]["status"] == "LAUNCH_AUTHORIZED"
+
+
+def test_consumed_inbox_item_cannot_relaunch_after_restart_or_poll(tmp_path):
+    watcher, _ = inbox_watcher(tmp_path, "next")
+
+    class Process:
+        pid = 3002
+
+    launches = []
+    watcher.intake_inbox(lambda *_: (launches.append(1) or Process()))
+    assert len(launches) == 1
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.intake_inbox(lambda *_: (launches.append(1) or Process())) is False
+    assert len(launches) == 1
+
+
+def test_malformed_or_missing_target_inbox_fails_closed(tmp_path):
+    for prompt in ("", "WORKTREE\nC:\\missing-affotech-target"):
+        watcher, _ = inbox_watcher(tmp_path / str(len(prompt)), prompt)
+        launches = []
+        assert watcher.intake_inbox(lambda *_: launches.append(1))
+        assert watcher.state["state"] == "HUMAN_REQUIRED"
+        assert launches == []
+
+
+def test_non_idle_state_does_not_consume_inbox_work(tmp_path):
+    watcher, source = inbox_watcher(tmp_path, "next")
+    watcher.state["state"] = "EXECUTOR_RUNNING"
+    watcher.save()
+    assert watcher.intake_inbox(lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) is False
+    assert "000002" not in watcher.state.get("consumedInboxItems", {})
+    assert source.exists()

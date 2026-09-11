@@ -1880,6 +1880,7 @@ class LocalFirstOrchestrator:
         self.project_dir = Path(project_dir)
         self.state_dir = Path(state_dir or self.project_dir / ".agent-work" / "orchestrator")
         self.results_dir, self.prompts_dir, self.logs_dir = (self.state_dir / name for name in ("results", "prompts", "logs"))
+        self.inbox_dir = self.state_dir / "inbox"
         self.state_path = self.state_dir / "state.json"
         self.process_factory = process_factory
         self.state = self._load_state()
@@ -1898,6 +1899,42 @@ class LocalFirstOrchestrator:
 
     def _result_path(self, task_id: str) -> Path:
         return self.results_dir / f"{task_id}.txt"
+
+    def intake_inbox(self, launcher: Callable[[str, Path], Any]) -> bool:
+        """Consume and launch one approved local prompt while IDLE."""
+        if self.state.get("state") != "IDLE":
+            return False
+        consumed = self.state.setdefault("consumedInboxItems", {})
+        failures = self.state.setdefault("inboxFailures", {})
+        for source in sorted(self.inbox_dir.glob("*.txt")):
+            identity = source.stem
+            if identity in consumed or identity in failures:
+                continue
+            try:
+                prompt = source.read_text(encoding="utf-8")
+                if not prompt.strip():
+                    raise RuntimeError("INBOX_PROMPT_EMPTY")
+                target = resolve_executor_worktree(prompt, self.project_dir)
+                canonical = self.prompts_dir / f"{identity}.txt"
+                if canonical.exists():
+                    raise RuntimeError("INBOX_IDENTITY_ALREADY_CANONICAL")
+                atomic_write(canonical, prompt.encode("utf-8"))
+                consumed[identity] = {"source": str(source), "canonicalPrompt": str(canonical), "status": "LAUNCH_AUTHORIZED"}
+                self.state.update({"state": "NEXT_PROMPT_READY", "taskId": identity, "nextTaskId": identity, "nextPromptPath": str(canonical), "targetProject": target, "targetRepo": target, "targetWorktree": target})
+                self.save()
+                try:
+                    self.launch_next(launcher)
+                except Exception as error:
+                    consumed[identity].update({"status": "LAUNCH_FAILED", "error": type(error).__name__})
+                    self.state.update({"state": "HUMAN_REQUIRED", "inboxFailure": "INBOX_LAUNCH_FAILED"})
+                    self.save()
+                return True
+            except (OSError, UnicodeError, RuntimeError) as error:
+                failures[identity] = {"source": str(source), "error": str(error)}
+                self.state.update({"state": "HUMAN_REQUIRED", "inboxFailure": str(error)})
+                self.save()
+                return True
+        return False
 
     def recover_5c(self, legacy_path: str | os.PathLike[str] = r"C:\Users\nitro\AppData\Local\Temp\codex-last-message-h_2bryhl.txt") -> bool:
         source = Path(legacy_path)
@@ -2046,17 +2083,36 @@ class LocalFirstOrchestrator:
         return process
 
 
+def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> Callable[[str, Path], Any]:
+    """Build the existing visible Codex launch surface for one owned child."""
+    def launch(prompt: str, result_path: Path) -> Any:
+        target = watcher.state["targetWorktree"]
+        runner = CodexRunner(project, child_project_dir=target, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
+        command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
+        command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
+        child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=None, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        assert child.stdin is not None
+        child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
+        return child
+
+    return launch
+
+
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     watcher = LocalFirstOrchestrator(project, os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR"))
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+    launch = visible_executor_launcher(project, watcher)
     try:
         while True:
             state = watcher.state.get("state", "IDLE")
             if state == "IDLE":
                 print("STATE=IDLE")
-                watcher.wait_for_idle(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                if watcher.intake_inbox(launch):
+                    continue
+                time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                watcher.state = watcher._load_state()
                 continue
             if state == "EXECUTOR_RUNNING":
                 state = watcher.wait_for_executor()
@@ -2069,15 +2125,6 @@ def main() -> None:
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
-                runner = CodexRunner(project, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
-                def launch(prompt: str, result_path: Path) -> Any:
-                    command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
-                    command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
-                    target = watcher.state["targetWorktree"]
-                    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=None, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-                    assert child.stdin is not None
-                    child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
-                    return child
                 process = watcher.launch_next(launch)
                 print(f"CODEX_STARTED pid={process.pid}")
                 continue
