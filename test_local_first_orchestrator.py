@@ -83,6 +83,13 @@ def recovery_fixture(tmp_path):
     return watcher, base, worktree
 
 
+def postlaunch_recovery_fixture(tmp_path):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    watcher.state.update({"executorLaunchState": "POSTLAUNCH_NO_RESULT", "automaticRetryAuthorized": False})
+    watcher.save()
+    return watcher, base, worktree
+
+
 def test_alive_recovery_never_contacts_architect(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": __import__("os").getpid()})
@@ -812,6 +819,64 @@ def test_postlaunch_no_result_never_automatically_relaunches(tmp_path, monkeypat
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     assert restarted.recover_prelaunch_incomplete(lambda *_: launches.append(2)) is None
     assert launches == []
+
+
+def test_human_postlaunch_retry_requires_exact_authorization(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    monkeypatch.delenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", raising=False)
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is None
+    assert launches == []
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", "different-task")
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(2)) is None
+    assert watcher.state["humanRecoveryAuthorizationError"] == "HUMAN_RECOVERY_TASK_MISMATCH"
+    assert launches == []
+
+
+def test_exact_human_postlaunch_retry_is_consumed_and_launches_once(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    process = type("Process", (), {"pid": 4406})()
+    assert watcher.authorize_postlaunch_retry(lambda *_: (launches.append(1), process)[1]) is process
+    assert launches == [1]
+    assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == task_id
+    assert watcher.state["executorLaunchState"] == "LAUNCHED"
+    assert watcher.state["automaticRetryAuthorized"] is False
+
+
+def test_failed_human_postlaunch_retry_cannot_reuse_authorization(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    def fail_launch(*_args):
+        launches.append(1)
+        raise RuntimeError("writer conflict")
+    assert watcher.authorize_postlaunch_retry(fail_launch) is None
+    assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert launches == [1]
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(2)) is None
+    assert launches == [1]
+
+
+def test_human_postlaunch_retry_session_preflight_is_required(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: (_ for _ in ()).throw(RuntimeError("EXECUTOR_SESSION_NOT_FOUND")))
+    launches = []
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is None
+    assert watcher.state["humanRecoveryAuthorizationError"] == "EXECUTOR_SESSION_NOT_FOUND"
+    assert launches == []
+    assert watcher.state.get("humanRecoveryAuthorizationConsumed") is not True
 
 
 def test_active_writer_failure_is_classified_without_retry(tmp_path, monkeypatch):

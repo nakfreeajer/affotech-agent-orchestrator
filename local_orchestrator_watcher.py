@@ -2251,6 +2251,46 @@ class LocalFirstOrchestrator:
             self.save()
             return None
 
+    def authorize_postlaunch_retry(self, launcher: Callable[[str, Path], Any]) -> Any | None:
+        """Perform one explicit human-authorized retry of a post-launch failure."""
+        task_id = str(self.state.get("taskId") or "")
+        supplied = os.environ.get("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY")
+        if self.state.get("state") != "HUMAN_REQUIRED" or self.state.get("executorLaunchState") != "POSTLAUNCH_NO_RESULT":
+            return None
+        if not supplied:
+            return None
+        if supplied != task_id:
+            self.state["humanRecoveryAuthorizationError"] = "HUMAN_RECOVERY_TASK_MISMATCH"
+            self.save()
+            return None
+        if self.state.get("humanRecoveryAuthorizationConsumed"):
+            self.state["humanRecoveryAuthorizationError"] = "HUMAN_RECOVERY_AUTHORIZATION_CONSUMED"
+            self.save()
+            return None
+        prompt_path = self.state.get("nextPromptPath")
+        if not isinstance(prompt_path, str) or not Path(prompt_path).is_file():
+            self.state.update({"humanRecoveryAuthorizationError": "RECOVERY_PROMPT_MISSING", "automaticRetryAuthorized": False})
+            self.save()
+            return None
+        try:
+            prompt = Path(prompt_path).read_text(encoding="utf-8")
+            owned = self._validate_prelaunch_recovery(task_id, prompt)
+            if owned is None:
+                raise RuntimeError("PRELAUNCH_WORKTREE_NOT_OWNED")
+            verify_executor_session(str(self.state.get("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)))
+            self.state.update({"humanRecoveryAuthorizationConsumed": True, "humanRecoveryAuthorizedTaskId": task_id, "automaticRetryAuthorized": False, "state": "NEXT_PROMPT_READY", "nextTaskId": task_id, "targetProject": str(owned), "targetRepo": str(owned), "targetWorktree": str(owned)})
+            self.save()
+            try:
+                return self.launch_next(launcher)
+            except Exception as error:
+                self.state.update({"state": "HUMAN_REQUIRED", "executorLaunchState": "POSTLAUNCH_NO_RESULT", "humanRecoveryAuthorizationError": f"HUMAN_RECOVERY_LAUNCH_FAILED:{type(error).__name__}"})
+                self.save()
+                return None
+        except (OSError, UnicodeError, RuntimeError) as error:
+            self.state.update({"state": "HUMAN_REQUIRED", "automaticRetryAuthorized": False, "humanRecoveryAuthorizationError": str(error)})
+            self.save()
+            return None
+
     def request_architect_bootstrap(self, bridge: Any) -> bool:
         """Ask Architect once to evaluate current project state and choose the next action."""
         source_fingerprint = self.state.get("continuationSourceFingerprint")
@@ -2644,6 +2684,10 @@ def main() -> None:
                 continue
             if state == "HUMAN_REQUIRED":
                 recovered = watcher.recover_prelaunch_incomplete(launch)
+                if recovered is not None:
+                    print(f"CODEX_STARTED pid={recovered.pid}")
+                    continue
+                recovered = watcher.authorize_postlaunch_retry(launch)
                 if recovered is not None:
                     print(f"CODEX_STARTED pid={recovered.pid}")
                     continue
