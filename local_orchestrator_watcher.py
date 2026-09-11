@@ -1391,6 +1391,40 @@ class LocalWatcher:
         """Return whether an independently launched executor is still alive."""
         if not isinstance(pid, int) or pid <= 0:
             return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            ERROR_INVALID_PARAMETER = 87
+            ERROR_NOT_FOUND = 1168
+            STILL_ACTIVE = 259
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                error = ctypes.get_last_error()
+                if error in (ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND):
+                    return False
+                if error == ERROR_ACCESS_DENIED:
+                    return True
+                # Any other uncertain result fails safe.
+                return True
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return True
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except PermissionError:
@@ -1969,12 +2003,13 @@ class LocalFirstOrchestrator:
         self.save()
         return decision["action"]
 
-    def request_architect_bootstrap(self, bridge: Any) -> None:
+    def request_architect_bootstrap(self, bridge: Any) -> bool:
         """Ask Architect once to evaluate current project state and choose the next action."""
-        if int(self.state.get("architectBootstrapCount", 0)) >= 1:
-            self.state["state"] = "HUMAN_REQUIRED"
+        source_fingerprint = self.state.get("continuationSourceFingerprint")
+        if source_fingerprint and source_fingerprint == self.state.get("lastContinuationSourceFingerprint"):
+            self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
             self.save()
-            return
+            return False
         message = "\n".join([
             "Review the current authoritative project state after the completed work.",
             "You are the project Architect.",
@@ -1992,11 +2027,29 @@ class LocalFirstOrchestrator:
             "promptEnd",
             "</ORCHESTRATOR_RESULT>",
         ])
-        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
-        sender(message)
-        baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectBootstrapCount": 1, "architectBootstrapAwaiting": True, "architectBaseline": baseline})
+        if not isinstance(source_fingerprint, str) or not source_fingerprint:
+            source_fingerprint = "UNSPECIFIED"
+        self.state.update({"lastContinuationSourceFingerprint": source_fingerprint, "architectBootstrapCount": int(self.state.get("architectBootstrapCount", 0)) + 1, "architectBootstrapAwaiting": True, "architectSendState": "PENDING", "state": "IDLE"})
         self.save()
+        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
+        try:
+            sender(message)
+        except Exception as error:
+            ambiguous = isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT"
+            if not ambiguous:
+                self.state.pop("lastContinuationSourceFingerprint", None)
+                self.state["architectSendState"] = "FAILED"
+            else:
+                self.state["architectSendState"] = "AMBIGUOUS"
+            self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
+            self.save()
+            raise
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED"})
+        self.save()
+        if hasattr(bridge, "assistant_baseline"):
+            self.state["architectBaseline"] = bridge.assistant_baseline()
+            self.save()
+        return True
 
     def inspect_idle_architect(self, bridge: Any, launcher: Callable[[str, Path], Any]) -> str:
         """Inspect the configured Architect conversation while IDLE."""
@@ -2011,8 +2064,10 @@ class LocalFirstOrchestrator:
                 return self.consume_idle_architect_response(response, launcher)
             except ValueError:
                 pass
-        self.request_architect_bootstrap(bridge)
-        return "ARCHITECT_RUNNING"
+        self.state["continuationSourceFingerprint"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        if self.request_architect_bootstrap(bridge):
+            return "ARCHITECT_RUNNING"
+        return self.state.get("state", "IDLE")
 
     def recover_5c(self, legacy_path: str | os.PathLike[str] = r"C:\Users\nitro\AppData\Local\Temp\codex-last-message-h_2bryhl.txt") -> bool:
         source = Path(legacy_path)

@@ -635,7 +635,8 @@ def test_malformed_idle_architect_response_bootstraps_once_without_result_replay
         assert forbidden.lower() not in bridge.messages[0].lower()
     assert "Return STOP only if there is genuinely no further currently authorized project work." in bridge.messages[0]
     watcher.request_architect_bootstrap(bridge)
-    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state["architectSendState"] == "CONFIRMED"
     assert len(bridge.messages) == 1
 
 

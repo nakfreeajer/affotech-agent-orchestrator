@@ -26,6 +26,14 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
             if self.kind == "send": return send
             return False
         def is_editable(self, **kwargs): return editable
+        def focus(self, **kwargs):
+            if self.kind == "composer":
+                page.focused = True
+        def inner_text(self, **kwargs):
+            if self.kind == "composer":
+                return page.value
+            return ""
+        def count(self): return 0
         def fill(self, value, **kwargs):
             if not composer: raise RuntimeError("missing composer")
             page.value = value
@@ -47,11 +55,15 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
             self.focused = False
             self.composer_locator = Locator("composer")
             self.send_locator = Locator("send")
-            self.keyboard = type("Keyboard", (), {"insert_text": lambda _, value: setattr(self, "value", value)})()
+            self.keyboard = type("Keyboard", (), {"insert_text": lambda _, value: setattr(page, "value", value)})()
         def get_by_role(self, role, **kwargs):
             if role == "textbox": return self.composer_locator
             if role == "button": return self.send_locator
             raise AssertionError(role)
+        def locator(self, selector):
+            if selector == '[data-message-author-role="assistant"]':
+                return Locator("assistant")
+            raise AssertionError(selector)
         def evaluate(self, script):
             if "return null" in script: return self.value
             if "trim() === ''" in script: return not self.value
@@ -87,8 +99,7 @@ def test_result_submission_classifies_post_populate_failures():
 def test_result_submission_distinguishes_composer_input_rejection():
     from local_orchestrator_watcher import ArchitectPlaywright
     page = _submission_page()
-    original = page.evaluate
-    page.evaluate = lambda script: "wrong content" if "return null" in script else original(script)
+    page.composer_locator.inner_text = lambda **_: "wrong content"
     try:
         ArchitectPlaywright(page).submit_result_bounded("captured result", timeout=1)
     except ResultSubmissionError as error:
