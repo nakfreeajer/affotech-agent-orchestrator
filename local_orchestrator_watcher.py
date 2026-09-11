@@ -1925,6 +1925,7 @@ class LocalFirstOrchestrator:
         self.inbox_dir = self.state_dir / "inbox"
         self.state_path = self.state_dir / "state.json"
         self.process_factory = process_factory
+        self._live_bottom_recovery_attempted: set[str] = set()
         self.state = self._load_state()
 
     def _load_state(self) -> dict[str, Any]:
@@ -2097,12 +2098,27 @@ class LocalFirstOrchestrator:
                     print("IDLE_GATE=valid_envelope_processed")
                     print("IDLE_DIAGNOSTIC latestResponseFound=True latestResponseId=%s latestResponseFingerprint=%s latestResponseHasEnvelope=True generationVisible=False architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=%s continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (response_id, response_fingerprint, self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), response_consumed, self.state.get("state")))
                     return result
-                if attempt or response_fingerprint == self.state.get("architectLiveBottomFingerprint"):
+                baseline_entries = self.state.get("architectBaseline", {}).get("entries", [])
+                baseline_response, baseline_id = latest_substantive(baseline_entries if isinstance(baseline_entries, list) else [])
+                baseline_fingerprint = hashlib.sha256(baseline_response.encode("utf-8")).hexdigest() if baseline_response else None
+                baseline_is_new = bool(baseline_fingerprint and baseline_fingerprint != response_fingerprint and baseline_fingerprint not in consumed and baseline_fingerprint != self.state.get("lastContinuationSourceFingerprint"))
+                if baseline_is_new:
+                    self.state.pop("architectLiveBottomFingerprint", None)
+                    self.state["continuationSourceFingerprint"] = baseline_fingerprint
+                    self.save()
+                    print("IDLE_RECOVERY_SOURCE=persisted_baseline")
+                    sent = self.request_architect_bootstrap(bridge)
+                    if sent:
+                        return "ARCHITECT_RUNNING"
+                    return self.state.get("state", "IDLE")
+                if attempt or response_fingerprint in self._live_bottom_recovery_attempted:
                     print("IDLE_GATE=response_already_consumed")
                     return result
-                self.state["architectLiveBottomFingerprint"] = response_fingerprint
+                self._live_bottom_recovery_attempted.add(response_fingerprint)
+                self.state.pop("architectLiveBottomFingerprint", None)
                 self.save()
                 try:
+                    print("IDLE_RECOVERY_SOURCE=live_bottom_restore")
                     bridge.restore_live_bottom()
                     response, response_id = latest_substantive(bridge._assistant_entries())
                 except Exception:

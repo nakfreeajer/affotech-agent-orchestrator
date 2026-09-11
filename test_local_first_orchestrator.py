@@ -855,3 +855,69 @@ def test_live_generation_does_not_trigger_virtualized_bottom_recovery(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
     assert bridge.restores == 0
+
+
+def test_stuck_production_state_uses_baseline_only_for_reconfirmation(tmp_path):
+    old = envelope("old-stop", action="STOP")
+    new = "So there is no Curator handoff remaining. We can proceed directly to the bounded 5D Executor milestone."
+    old_fp = hashlib.sha256(old.encode()).hexdigest()
+
+    class Bridge:
+        def __init__(self): self.restores = 0; self.sent = []
+        def generation_visible(self): return False
+        def _assistant_entries(self): return [{"id": "old", "text": old}]
+        def restore_live_bottom(self): self.restores += 1
+        def submit_result_bounded(self, message): self.sent.append(message)
+
+    bridge = Bridge()
+    launches = []
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "state": "IDLE",
+        "architectContactCount": 0,
+        "architectBootstrapAwaiting": False,
+        "architectBootstrapCount": 1,
+        "architectSendState": "CONFIRMED",
+        "architectResultFingerprint": old_fp,
+        "architectLiveBottomFingerprint": old_fp,
+        "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
+        "consumedArchitectResponses": {old_fp: {"action": "STOP", "classification": "ACCEPTED", "taskId": "old-stop"}},
+        "architectBaseline": {"entries": [{"id": "old", "text": old}, {"id": "new", "text": new}]},
+        "taskId": None,
+    })
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "ARCHITECT_RUNNING"
+    assert bridge.restores == 0 and len(bridge.sent) == 1 and launches == []
+    assert watcher.state["continuationSourceFingerprint"] == hashlib.sha256(new.encode()).hexdigest()
+    assert watcher.state["architectContactCount"] == 1
+    assert "architectLiveBottomFingerprint" not in watcher.state
+    watcher.state["state"] = "IDLE"
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "DUPLICATE"
+    assert watcher.state["state"] == "IDLE"
+    assert len(bridge.sent) == 1
+
+
+def test_historical_baseline_execute_is_never_launched(tmp_path):
+    old = envelope("old-stop", action="STOP")
+    historical_execute = envelope("historical-execute", prompt=f"WORKTREE\n{tmp_path}\nold task")
+    old_fp = hashlib.sha256(old.encode()).hexdigest()
+
+    class Bridge:
+        def __init__(self): self.sent = []
+        def generation_visible(self): return False
+        def _assistant_entries(self): return [{"id": "old", "text": old}]
+        def submit_result_bounded(self, message): self.sent.append(message)
+
+    bridge = Bridge()
+    launches = []
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "state": "IDLE",
+        "consumedArchitectResponses": {old_fp: {"action": "STOP"}},
+        "architectResultFingerprint": old_fp,
+        "architectBaseline": {"entries": [{"id": "historical", "text": historical_execute}]},
+    })
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "ARCHITECT_RUNNING"
+    assert len(bridge.sent) == 1 and launches == []
