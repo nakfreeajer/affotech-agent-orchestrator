@@ -1936,6 +1936,79 @@ class LocalFirstOrchestrator:
                 return True
         return False
 
+    def _architect_response_task_id(self, response: str) -> str | None:
+        candidate = response.rstrip()
+        if candidate.endswith(COMPLETE):
+            candidate = candidate[: -len(COMPLETE)].rstrip()
+        match = ORCHESTRATOR_RESULT_RE.search(candidate)
+        return match.group(3).strip() if match else None
+
+    def consume_idle_architect_response(self, response: str, launcher: Callable[[str, Path], Any]) -> str:
+        """Consume one valid Architect envelope without requiring an inbox file."""
+        fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        task_id = self._architect_response_task_id(response)
+        consumed = self.state.setdefault("consumedArchitectResponses", {})
+        if fingerprint in consumed or (task_id and any(item.get("taskId") == task_id for item in consumed.values())):
+            return "DUPLICATE"
+        if not task_id:
+            raise ValueError("ARCHITECT_ENVELOPE_INVALID")
+        decision = parse_orchestrator_result(response, task_id)
+        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"]}
+        if decision["action"] == "EXECUTE":
+            target = resolve_executor_worktree(decision["prompt"], self.project_dir)
+            canonical = self.prompts_dir / f"{task_id}.txt"
+            if canonical.exists():
+                raise RuntimeError("ARCHITECT_TASK_ALREADY_CANONICAL")
+            atomic_write(canonical, decision["prompt"].encode("utf-8"))
+            self.state.update({"state": "NEXT_PROMPT_READY", "taskId": task_id, "nextTaskId": task_id, "nextPromptPath": str(canonical), "targetProject": target, "targetRepo": target, "targetWorktree": target, "architectResultFingerprint": fingerprint})
+            self.save()
+            self.launch_next(launcher)
+            return "EXECUTE"
+        self.state["architectResultFingerprint"] = fingerprint
+        self.state["state"] = "HUMAN_REQUIRED" if decision["action"] == "HUMAN_REQUIRED" else "IDLE"
+        self.save()
+        return decision["action"]
+
+    def request_architect_bootstrap(self, bridge: Any) -> None:
+        """Ask Architect once for its current approved action, never replaying 5C."""
+        if int(self.state.get("architectBootstrapCount", 0)) >= 1:
+            self.state["state"] = "HUMAN_REQUIRED"
+            self.save()
+            return
+        message = "\n".join([
+            "Return the current already-approved next action using only the canonical machine envelope below.",
+            "Do not redesign the milestone or create a new task merely because Orchestrator is asking.",
+            "If an already-approved next Executor action exists, return it; otherwise return action=STOP or HUMAN_REQUIRED as appropriate.",
+            "<ORCHESTRATOR_RESULT>",
+            "classification=ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT",
+            "action=EXECUTE|HUMAN_REQUIRED|STOP",
+            "taskId=<task id>",
+            "promptBegin <complete Executor prompt only when action=EXECUTE>",
+            "promptEnd",
+            "</ORCHESTRATOR_RESULT>",
+        ])
+        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
+        sender(message)
+        baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectBootstrapCount": 1, "architectBootstrapAwaiting": True, "architectBaseline": baseline})
+        self.save()
+
+    def inspect_idle_architect(self, bridge: Any, launcher: Callable[[str, Path], Any]) -> str:
+        """Inspect the configured Architect conversation while IDLE."""
+        if bridge.generation_visible():
+            self.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": bridge.assistant_baseline()})
+            self.save()
+            return "ARCHITECT_RUNNING"
+        entries = bridge._assistant_entries()
+        response = entries[-1].get("text", "") if entries else ""
+        if response:
+            try:
+                return self.consume_idle_architect_response(response, launcher)
+            except ValueError:
+                pass
+        self.request_architect_bootstrap(bridge)
+        return "ARCHITECT_RUNNING"
+
     def recover_5c(self, legacy_path: str | os.PathLike[str] = r"C:\Users\nitro\AppData\Local\Temp\codex-last-message-h_2bryhl.txt") -> bool:
         source = Path(legacy_path)
         if not source.is_file() or not source.read_text(encoding="utf-8", errors="replace").strip():
@@ -2111,8 +2184,16 @@ def main() -> None:
                 print("STATE=IDLE")
                 if watcher.intake_inbox(launch):
                     continue
-                time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
-                watcher.state = watcher._load_state()
+                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                watcher.state["architectConversationId"] = conversation_id
+                watcher.save()
+                try:
+                    watcher.inspect_idle_architect(bridge, launch)
+                finally:
+                    bridge.close()
+                if watcher.state.get("state") == "IDLE":
+                    time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                    watcher.state = watcher._load_state()
                 continue
             if state == "EXECUTOR_RUNNING":
                 state = watcher.wait_for_executor()
@@ -2158,7 +2239,12 @@ def main() -> None:
                         time.sleep(1.0)
                         continue
                     try:
-                        decision = watcher.accept_architect_response(observed["text"])
+                        if watcher.state.get("architectBootstrapAwaiting"):
+                            decision = watcher.consume_idle_architect_response(observed["text"], launch)
+                            watcher.state["architectBootstrapAwaiting"] = False
+                            watcher.save()
+                        else:
+                            decision = watcher.accept_architect_response(observed["text"])
                     except ValueError:
                         if int(watcher.state.get("formatRecoveryCount", 0)) >= 1:
                             watcher.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
@@ -2168,7 +2254,9 @@ def main() -> None:
                         watcher.request_format_recovery(bridge)
                         baseline = watcher.state.get("architectBaseline")
                         continue
-                    if decision.get("action") != "EXECUTE":
+                    if decision == "EXECUTE":
+                        break
+                    if not isinstance(decision, dict) or decision.get("action") != "EXECUTE":
                         print(f"STATE={watcher.state['state']}")
                         return
                     break

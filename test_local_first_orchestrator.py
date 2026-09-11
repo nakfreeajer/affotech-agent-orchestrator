@@ -566,3 +566,83 @@ def test_non_idle_state_does_not_consume_inbox_work(tmp_path):
     assert watcher.intake_inbox(lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) is False
     assert "000002" not in watcher.state.get("consumedInboxItems", {})
     assert source.exists()
+
+
+class IdleArchitectBridge:
+    def __init__(self, response):
+        self.response = response
+        self.messages = []
+
+    def generation_visible(self):
+        return False
+
+    def _assistant_entries(self):
+        return [{"id": "architect-1", "text": self.response}]
+
+    def assistant_baseline(self):
+        return {"count": 1, "text_hash": "architect-baseline", "entries": self._assistant_entries()}
+
+    def submit_result_bounded(self, message):
+        self.messages.append(message)
+
+
+def test_idle_consumes_latest_architect_execute_without_inbox(tmp_path):
+    worktree = tmp_path / "affotech-worktree"
+    worktree.mkdir()
+    response = envelope("architect-task-1", prompt=f"WORKTREE\n{worktree}\nnext")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    bridge = IdleArchitectBridge(response)
+
+    class Process:
+        pid = 4001
+
+    launches = []
+    assert watcher.inspect_idle_architect(bridge, lambda prompt, result: (launches.append((prompt, result)), Process())[1]) == "EXECUTE"
+    assert not watcher.inbox_dir.exists()
+    assert watcher.state["state"] == "EXECUTOR_RUNNING"
+    assert watcher.state["targetWorktree"] == str(worktree)
+    assert len(launches) == 1
+
+
+def test_consumed_architect_response_cannot_relaunch_after_restart_or_poll(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    bridge = IdleArchitectBridge(envelope("architect-task-1", prompt="next"))
+    watcher.inspect_idle_architect(bridge, lambda *_: type("Process", (), {"pid": 4002})())
+    watcher.state["state"] = "IDLE"
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    launches = []
+    assert restarted.inspect_idle_architect(bridge, lambda *_: launches.append(1)) == "DUPLICATE"
+    assert launches == []
+
+
+def test_valid_architect_stop_or_human_required_launches_nothing(tmp_path):
+    for action, expected in (("STOP", "STOP"), ("HUMAN_REQUIRED", "HUMAN_REQUIRED")):
+        watcher = LocalFirstOrchestrator(str(tmp_path / action), tmp_path / action / "work")
+        bridge = IdleArchitectBridge(envelope(f"architect-{action}", action=action))
+        launches = []
+        assert watcher.inspect_idle_architect(bridge, lambda *_: launches.append(1)) == expected
+        assert launches == []
+
+
+def test_malformed_idle_architect_response_bootstraps_once_without_result_replay(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    bridge = IdleArchitectBridge("ordinary Architect prose")
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert len(bridge.messages) == 1
+    assert "Executor report" not in bridge.messages[0]
+    watcher.request_architect_bootstrap(bridge)
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert len(bridge.messages) == 1
+
+
+def test_bootstrap_execute_response_uses_same_architect_task_once(tmp_path):
+    worktree = tmp_path / "affotech-worktree"
+    worktree.mkdir()
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "architectBootstrapAwaiting": True, "taskId": None})
+    response = envelope("architect-task-2", prompt=f"WORKTREE\n{worktree}\nnext")
+    launches = []
+    assert watcher.consume_idle_architect_response(response, lambda prompt, result: (launches.append(prompt), type("Process", (), {"pid": 4003})())[1]) == "EXECUTE"
+    assert watcher.state["taskId"] == "architect-task-2"
+    assert len(launches) == 1
