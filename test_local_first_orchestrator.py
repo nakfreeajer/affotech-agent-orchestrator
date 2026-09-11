@@ -12,7 +12,7 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         ResultSubmissionError, atomic_write,
                                         parse_orchestrator_result, resolve_executor_worktree,
                                         run_executor_state_once, visible_executor_launcher,
-                                        WatcherInstanceLock)
+                                        WatcherInstanceLock, handle_architect_value_error)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -226,6 +226,34 @@ def test_three_task_resident_lifecycle_does_not_leak_recovery_or_rerun(tmp_path)
             assert watcher.state["formatRecoveryCount"] == 0
             assert watcher.state["formatRecoveryExhausted"] is False
     assert len(bridge.messages) == 1
+
+
+def test_main_loop_value_error_normalizes_cross_task_recovery_first(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "task-B", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": "task-A", "formatRecoveryExhausted": True})
+    bridge = RecoveryBridge()
+    assert handle_architect_value_error(watcher, bridge) is True
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state["architectFormatRecoveryTaskId"] == "task-B"
+    assert watcher.state["formatRecoveryCount"] == 1
+    assert watcher.state["formatRecoveryExhausted"] is False
+
+
+def test_stale_format_human_required_reenters_architect_without_executor_launch(tmp_path, monkeypatch):
+    watcher = ready(tmp_path)
+    task_id = "task-000016"
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "taskId": task_id, "architectSendState": "CONFIRMED",
+        "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": "old-task",
+        "formatRecoveryExhausted": True, "humanRequiredReason": "",
+        "codexPid": None,
+    })
+    watcher.save()
+    assert watcher.recover_stale_format_human_required() is True
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state["formatRecoveryCount"] == 0
+    assert watcher.state["architectFormatRecoveryTaskId"] is None
+    assert watcher.state["executorResultPath"]
 
 
 def test_format_recovery_response_uses_strict_same_task_parser():

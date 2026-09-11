@@ -2744,6 +2744,24 @@ class LocalFirstOrchestrator:
         self.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": task_id, "architectBaseline": baseline})
         self.save()
 
+    def recover_stale_format_human_required(self) -> bool:
+        """Re-enter Architect observation only for the known cross-task stale gate."""
+        task_id = str(self.state.get("taskId") or "")
+        recovery_task = self.state.get("architectFormatRecoveryTaskId")
+        reason = self.state.get("humanRequiredReason")
+        result_path = self.state.get("executorResultPath")
+        result_ready = isinstance(result_path, str) and Path(result_path).is_file() and Path(result_path).read_text(encoding="utf-8", errors="replace").strip()
+        if (self.state.get("state") != "HUMAN_REQUIRED" or not self.state.get("formatRecoveryExhausted")
+                or recovery_task in (None, "", task_id) or reason not in (None, "") or not result_ready):
+            return False
+        pid = self.state.get("codexPid")
+        if pid and LocalWatcher.process_alive(int(pid)):
+            return False
+        self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
+        self.state["state"] = "ARCHITECT_RUNNING" if self.state.get("architectSendState") == "CONFIRMED" else "RESULT_READY"
+        self.save()
+        return True
+
     def accept_architect_response(self, response: str) -> dict[str, str]:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         if fingerprint == self.state.get("architectResultFingerprint"):
@@ -2846,6 +2864,12 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
     return watcher.state.get("state", "IDLE")
 
 
+def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -> bool:
+    """Apply task-scoped format recovery from the resident main-loop path."""
+    watcher.request_format_recovery(bridge)
+    return watcher.state.get("state") == "ARCHITECT_RUNNING"
+
+
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     state_dir = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR") or (Path(project) / ".agent-work" / "orchestrator"))
@@ -2941,12 +2965,9 @@ def main() -> None:
                         else:
                             decision = watcher.accept_architect_response(observed["text"])
                     except ValueError:
-                        if int(watcher.state.get("formatRecoveryCount", 0)) >= 1:
-                            watcher.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
-                            watcher.save()
+                        if not handle_architect_value_error(watcher, bridge):
                             print(f"STATE={watcher.state['state']}")
                             return
-                        watcher.request_format_recovery(bridge)
                         baseline = watcher.state.get("architectBaseline")
                         continue
                     if decision == "EXECUTE":
