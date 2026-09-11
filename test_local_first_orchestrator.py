@@ -471,6 +471,93 @@ def test_missing_or_invalid_executor_worktree_fails_closed(tmp_path):
         resolve_executor_worktree("WORKTREE\nC:\\does-not-exist", tmp_path)
 
 
+def test_report_worktree_label_is_not_machine_routing_authority():
+    prompt = "RETURN\nReport:\nsourceBase\nworktree\nfilesChanged\nmatchingRouteOrBoundary"
+    with pytest.raises(RuntimeError, match="EXECUTOR_WORKTREE_MISSING") as error:
+        resolve_executor_worktree(prompt)
+    assert "filesChanged" not in str(error.value)
+
+
+def test_absolute_machine_worktree_path_resolves_with_following_prompt_text(tmp_path):
+    worktree = tmp_path / "valid-worktree"
+    worktree.mkdir()
+    prompt = f"WORKTREE\n{worktree}\nGOAL\ncontinue"
+    assert resolve_executor_worktree(prompt) == str(worktree)
+
+
+def test_prelaunch_failure_does_not_terminally_consume_architect_execute(tmp_path, monkeypatch):
+    worktree = tmp_path / "valid-worktree"
+    worktree.mkdir()
+    response = envelope("prelaunch-task", prompt=f"WORKTREE\n{worktree}\nnext")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    calls = []
+
+    def fail_once(_prompt, _fallback):
+        calls.append("failed")
+        raise RuntimeError("PRELAUNCH_TEST_FAILURE")
+
+    monkeypatch.setattr(watcher_module, "resolve_executor_worktree", fail_once)
+    with pytest.raises(RuntimeError, match="PRELAUNCH_TEST_FAILURE"):
+        watcher.consume_idle_architect_response(response, lambda *_: calls.append("launched"))
+    fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    assert calls == ["failed"]
+    assert fingerprint not in watcher.state.get("consumedArchitectResponses", {})
+
+    monkeypatch.setattr(watcher_module, "resolve_executor_worktree", resolve_executor_worktree)
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    launches = []
+    process = type("Process", (), {"pid": 4101})()
+    assert restarted.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
+    assert launches == [1]
+    assert restarted.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
+
+
+def test_current_prelaunch_incomplete_execute_recovers_same_response_once(tmp_path):
+    task_id = "PUB-7c6f3f3c8b9b46f88b8e2c3d91d7a5e2"
+    worktree = tmp_path / "managed-worktree"
+    worktree.mkdir()
+    response = envelope(task_id, prompt=f"WORKTREE\n{worktree}\nnext bounded task")
+    fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "state": "IDLE",
+        "taskId": task_id,
+        "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
+        "codexPid": None,
+        "executorResultPath": None,
+        "consumedArchitectResponses": {
+            fingerprint: {"taskId": task_id, "action": "EXECUTE", "state": "RECEIVED"}
+        },
+    })
+    watcher.save()
+    launches = []
+    process = type("Process", (), {"pid": 4102})()
+    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
+    assert watcher.state["prelaunchRecoveryState"] == "PRELAUNCH_INCOMPLETE"
+    assert launches == [1]
+    assert watcher.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
+
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.consume_idle_architect_response(response, lambda *_: launches.append(2)) == "DUPLICATE"
+    assert launches == [1]
+    assert restarted.state["lastCompletedTaskId"] == "PUB-aa3b4121887c4047b3c056bcccaa6a96"
+
+
+def test_fresh_execute_is_consumed_only_after_child_launch(tmp_path):
+    worktree = tmp_path / "managed-worktree"
+    worktree.mkdir()
+    response = envelope("normal-task", prompt=f"WORKTREE\n{worktree}\nnext")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    launches = []
+    process = type("Process", (), {"pid": 4103})()
+    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
+    fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    assert launches == [1]
+    assert watcher.state["consumedArchitectResponses"][fingerprint] == {
+        "taskId": "normal-task", "classification": "ACCEPTED", "action": "EXECUTE", "state": "LAUNCHED"
+    }
+
+
 def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):
     worktree = tmp_path / "affotech-worktree"
     worktree.mkdir()

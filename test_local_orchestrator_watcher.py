@@ -1298,7 +1298,7 @@ def test_newer_relay_publication_remains_observable_after_old_retirement(tmp_pat
     assert restarted.state["relay_execution_retired"] is True
 
 
-def test_long_generation_in_progress_is_not_forwarded_and_unchanged_stays_idle():
+def test_long_generation_in_progress_is_not_forwarded_and_unchanged_stays_idle(monkeypatch):
     from local_orchestrator_watcher import ArchitectPlaywright
     long_text = "L" * 14000
     class Page:
@@ -1306,15 +1306,31 @@ def test_long_generation_in_progress_is_not_forwarded_and_unchanged_stays_idle()
             self.generation = iter(generation)
             updated = long_text + "update" if changed else long_text
             self.snapshots = iter([[{"id": "long", "text": long_text}], [{"id": "long", "text": updated}], [{"id": "long", "text": updated}]])
+            self.last_snapshot = [{"id": "long", "text": long_text}]
         def evaluate(self, script):
-            if 'data-message-author-role="assistant"' in script: return next(self.snapshots)
+            if 'data-message-author-role="assistant"' in script:
+                try:
+                    self.last_snapshot = next(self.snapshots)
+                except StopIteration:
+                    pass
+                return self.last_snapshot
             return next(self.generation)
         def locator(self, selector): raise AssertionError("long-response polling must remain atomic")
     bridge = ArchitectPlaywright(Page([True, False]))
     baseline = bridge.assistant_baseline()
-    assert bridge.wait_for_new_response(baseline, timeout=1)["state"] == "BLOCKED"
+    assert bridge.wait_for_new_response(baseline, poll_interval=1)["state"] == "BLOCKED"
     unchanged = ArchitectPlaywright(Page([False], changed=False))
-    assert unchanged.wait_for_new_response(unchanged.assistant_baseline(), timeout=0.01)["state"] == "NOT_YET"
+    unchanged_baseline = unchanged.assistant_baseline()
+    class StopAfterFirstPassivePoll(Exception):
+        pass
+    monkeypatch.setattr("local_orchestrator_watcher.time.sleep", lambda _delay: (_ for _ in ()).throw(StopAfterFirstPassivePoll()))
+    try:
+        unchanged.wait_for_new_response(unchanged_baseline, poll_interval=0.01)
+    except StopAfterFirstPassivePoll:
+        pass
+    else:
+        raise AssertionError("unchanged polling unexpectedly returned")
+    assert unchanged.last_state == "NOT_YET"
 
 
 def test_one_long_prompt_is_one_forward_and_no_duplicate_startup_poll_launch(tmp_path):

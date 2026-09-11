@@ -1857,7 +1857,7 @@ class LocalWatcher:
 
 
 ORCHESTRATOR_STATES = {"IDLE", "EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY", "HUMAN_REQUIRED", "EXECUTOR_CRASHED"}
-EXECUTOR_WORKTREE_RE = re.compile(r"(?im)^\s*WORKTREE\s*\r?\n\s*(.+?)\s*$")
+EXECUTOR_WORKTREE_RE = re.compile(r"(?im)^[ \t]*WORKTREE[ \t]*\r?\n[ \t]*(?P<path>(?:[A-Za-z]:[\\/]|/)[^\r\n]+)[ \t]*(?=\r?$|\r?\n)")
 ORCHESTRATOR_RESULT_RE = re.compile(
     r"<ORCHESTRATOR_RESULT>\s*"
     r"classification=(ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT)\s*"
@@ -1907,10 +1907,12 @@ def repository_evidence(repo: str | os.PathLike[str]) -> dict[str, str]:
 def resolve_executor_worktree(prompt: str, fallback_project: str | os.PathLike[str] | None = None) -> str:
     """Resolve an explicit Executor WORKTREE and fail closed if it is invalid."""
     match = EXECUTOR_WORKTREE_RE.search(prompt)
-    candidate = match.group(1).strip().strip("`") if match else (str(fallback_project) if fallback_project is not None else None)
+    candidate = match.group("path").strip().strip("`") if match else (str(fallback_project) if fallback_project is not None else None)
     if not candidate:
         raise RuntimeError("EXECUTOR_WORKTREE_MISSING")
     path = Path(candidate)
+    if not path.is_absolute():
+        raise RuntimeError("EXECUTOR_WORKTREE_NOT_ABSOLUTE")
     if not path.is_dir():
         raise RuntimeError(f"EXECUTOR_WORKTREE_INVALID:{candidate}")
     return str(path)
@@ -1927,6 +1929,12 @@ class LocalFirstOrchestrator:
         self.process_factory = process_factory
         self._live_bottom_recovery_attempted: set[str] = set()
         self.state = self._load_state()
+
+    def _configured_fallback_project(self) -> Path | None:
+        """Use a caller-provided project root, never this Orchestrator source root."""
+        if self.project_dir.resolve() == Path(__file__).resolve().parent:
+            return None
+        return self.project_dir
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -1991,26 +1999,45 @@ class LocalFirstOrchestrator:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         task_id = self._architect_response_task_id(response)
         consumed = self.state.setdefault("consumedArchitectResponses", {})
-        if fingerprint in consumed or (task_id and any(item.get("taskId") == task_id for item in consumed.values())):
-            return "DUPLICATE"
+        existing_fingerprint = fingerprint if fingerprint in consumed else next((key for key, item in consumed.items() if task_id and item.get("taskId") == task_id), None)
+        if existing_fingerprint:
+            existing = consumed.get(existing_fingerprint, {})
+            recoverable = existing.get("action") == "EXECUTE" and task_id and self._prelaunch_incomplete(task_id)
+            if not recoverable:
+                return "DUPLICATE"
+            consumed.pop(existing_fingerprint, None)
+            self.state["prelaunchRecoveryState"] = "PRELAUNCH_INCOMPLETE"
+            self.save()
         if not task_id:
             raise ValueError("ARCHITECT_ENVELOPE_INVALID")
         decision = parse_orchestrator_result(response, task_id)
-        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"]}
         if decision["action"] == "EXECUTE":
-            target = resolve_executor_worktree(decision["prompt"], self.project_dir)
+            target = resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
             canonical = self.prompts_dir / f"{task_id}.txt"
-            if canonical.exists():
+            if canonical.exists() and not (self.state.get("state") == "NEXT_PROMPT_READY" and self.state.get("nextTaskId") == task_id):
                 raise RuntimeError("ARCHITECT_TASK_ALREADY_CANONICAL")
-            atomic_write(canonical, decision["prompt"].encode("utf-8"))
+            if not canonical.exists():
+                atomic_write(canonical, decision["prompt"].encode("utf-8"))
             self.state.update({"state": "NEXT_PROMPT_READY", "taskId": task_id, "nextTaskId": task_id, "nextPromptPath": str(canonical), "targetProject": target, "targetRepo": target, "targetWorktree": target, "architectResultFingerprint": fingerprint})
             self.save()
             self.launch_next(launcher)
+            consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "LAUNCHED"}
+            self.save()
             return "EXECUTE"
+        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED"}
         self.state["architectResultFingerprint"] = fingerprint
         self.state["state"] = "HUMAN_REQUIRED" if decision["action"] == "HUMAN_REQUIRED" else "IDLE"
         self.save()
         return decision["action"]
+
+    def _prelaunch_incomplete(self, task_id: str) -> bool:
+        """Recognize an EXECUTE transaction that never reached a child or result."""
+        if task_id == self.state.get("lastCompletedTaskId"):
+            return False
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        result_path = self.state.get("executorResultPath")
+        result_exists = isinstance(result_path, str) and Path(result_path).is_file()
+        return not active_pid and not result_exists
 
     def request_architect_bootstrap(self, bridge: Any) -> bool:
         """Ask Architect once to evaluate current project state and choose the next action."""
@@ -2255,7 +2282,7 @@ class LocalFirstOrchestrator:
             return {"action": "DUPLICATE"}
         decision = parse_orchestrator_result(response, str(self.state["taskId"]))
         if decision["action"] == "EXECUTE":
-            target = resolve_executor_worktree(decision["prompt"], self.project_dir)
+            target = resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
             self.state["architectResultFingerprint"] = fingerprint
             sequence = int(self.state.get("taskSequence", 0)) + 1
             next_id = f"{sequence:06d}"
@@ -2276,7 +2303,7 @@ class LocalFirstOrchestrator:
             return None
         prompt_path = Path(self.state["nextPromptPath"])
         prompt = prompt_path.read_text(encoding="utf-8")
-        target = resolve_executor_worktree(prompt, self.project_dir)
+        target = resolve_executor_worktree(prompt, self._configured_fallback_project())
         self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
         self.save()
         process = launcher(prompt, self._result_path(str(self.state["nextTaskId"])))
