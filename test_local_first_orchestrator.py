@@ -1176,6 +1176,33 @@ def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeyp
     assert next_worktree != watcher.project_dir
 
 
+def test_post_result_execute_inherits_project_context_without_routing_lines(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskSequence": 4})
+    prompt = "Review current project state and perform the next bounded milestone."
+    response = envelope(task_id, prompt=prompt)
+    assert watcher.accept_architect_response(response)["action"] == "EXECUTE"
+    next_id = watcher.state["nextTaskId"]
+    owned = Path(watcher.state["targetWorktree"])
+    assert next_id == "000005"
+    assert owned.is_dir() and owned != base and owned != watcher.project_dir
+    assert Path(watcher.state["nextPromptPath"]).read_text(encoding="utf-8") == prompt
+    assert watcher.state["taskWorktrees"][next_id]["branch"] == "hybrid-v2"
+    assert watcher.state["taskWorktrees"][next_id]["baseCommit"] == subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+
+
+def test_post_result_execute_without_project_context_fails_before_prompt_commit(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "completed-without-context", "taskSequence": 1})
+    response = envelope("completed-without-context", prompt="next bounded action")
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        watcher.accept_architect_response(response)
+    assert not (watcher.prompts_dir / "000002.txt").exists()
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state.get("architectResultFingerprint") in (None, "")
+
+
 def test_watcher_instance_lock_is_single_owner_and_releases(tmp_path):
     state_dir = tmp_path / "state"
     first = WatcherInstanceLock(state_dir)

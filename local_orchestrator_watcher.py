@@ -2069,23 +2069,33 @@ class LocalFirstOrchestrator:
         key = re.split(r"[/\\]", value.rstrip("/\\"))[-1]
         return key[:-4] if key.lower().endswith(".git") else key
 
-    def _project_spec(self, prompt: str) -> dict[str, Any] | None:
+    def _project_spec(self, prompt: str, context_task_id: str | None = None) -> dict[str, Any] | None:
         project_match = PROJECT_RE.search(prompt)
-        if not project_match:
-            return None
-        requested_repository = project_match.group(1).strip().strip("`")
         config = self._project_config()
         projects = config["projects"]
-        key = self._repository_key(requested_repository)
+        if project_match:
+            requested_repository = project_match.group(1).strip().strip("`")
+            key = self._repository_key(requested_repository)
+        else:
+            record = self.state.get("taskWorktrees", {}).get(context_task_id or "")
+            key = str(record.get("project", "")) if isinstance(record, dict) else ""
+            if not key:
+                if context_task_id:
+                    raise RuntimeError("EXECUTOR_PROJECT_CONTEXT_MISSING")
+                return None
         spec = projects.get(key)
         if not isinstance(spec, dict):
-            raise RuntimeError(f"PROJECT_CONFIG_UNKNOWN:{requested_repository}")
+            if project_match:
+                raise RuntimeError(f"PROJECT_CONFIG_UNKNOWN:{requested_repository}")
+            raise RuntimeError("EXECUTOR_PROJECT_CONTEXT_MISSING")
         configured_repository = str(spec.get("repository", ""))
         if self._repository_key(configured_repository) != key:
             raise RuntimeError("PROJECT_CONFIG_REPOSITORY_MISMATCH")
         branch_match = BRANCH_RE.search(prompt)
         requested_branch = branch_match.group(1).strip() if branch_match else None
-        return {**spec, "key": key, "repository": configured_repository, "branch": requested_branch or spec.get("defaultBranch")}
+        record = self.state.get("taskWorktrees", {}).get(context_task_id or "")
+        inherited_branch = record.get("branch") if isinstance(record, dict) else None
+        return {**spec, "key": key, "repository": configured_repository, "branch": requested_branch or inherited_branch or spec.get("defaultBranch")}
 
     @staticmethod
     def _git(repo: Path, *args: str) -> str:
@@ -2094,8 +2104,8 @@ class LocalFirstOrchestrator:
         except (OSError, subprocess.CalledProcessError) as error:
             raise RuntimeError(f"GIT_COMMAND_FAILED:{' '.join(args)}") from error
 
-    def _owned_task_worktree(self, task_id: str, prompt: str) -> Path | None:
-        spec = self._project_spec(prompt)
+    def _owned_task_worktree(self, task_id: str, prompt: str, context_task_id: str | None = None) -> Path | None:
+        spec = self._project_spec(prompt, context_task_id)
         if spec is None:
             return None
         base = Path(str(spec.get("baseRepo", ""))).resolve()
@@ -2683,10 +2693,14 @@ class LocalFirstOrchestrator:
             sequence = int(self.state.get("taskSequence", 0)) + 1
             next_id = f"{sequence:06d}"
             path = self.prompts_dir / f"{next_id}.txt"
-            atomic_write(path, decision["prompt"].encode("utf-8"))
-            target = self._owned_task_worktree(next_id, decision["prompt"])
+            target = self._owned_task_worktree(next_id, decision["prompt"], context_task_id=str(self.state.get("taskId") or ""))
             if target is None:
-                raise RuntimeError("EXECUTOR_PROJECT_REQUIRED")
+                raise RuntimeError("EXECUTOR_PROJECT_CONTEXT_MISSING")
+            prompt_bytes = decision["prompt"].encode("utf-8")
+            if path.exists() and path.read_bytes() != prompt_bytes:
+                raise RuntimeError("EXECUTOR_PROMPT_EVIDENCE_MISMATCH")
+            if not path.exists():
+                atomic_write(path, prompt_bytes)
             self.state["architectResultFingerprint"] = fingerprint
             target_text = str(target)
             self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target_text, "targetRepo": target_text, "targetWorktree": target_text})
