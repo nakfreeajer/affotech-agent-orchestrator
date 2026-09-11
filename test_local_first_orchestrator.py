@@ -207,6 +207,27 @@ def test_successful_executor_result_clears_stale_failure_state(tmp_path):
     assert watcher.state["executorCrash"] is None
 
 
+def test_three_task_resident_lifecycle_does_not_leak_recovery_or_rerun(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    bridge = RecoveryBridge()
+    for task_id in ("task-A", "task-B", "task-C"):
+        report = tmp_path / f"{task_id}.txt"
+        report.write_text(f"{task_id} complete", encoding="utf-8")
+        watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "codexPid": None})
+        assert watcher.mark_executor_exit(0, report) == "RESULT_READY"
+        assert watcher.state["lastCompletedTaskId"] == task_id
+        assert watcher.state["executorProcessState"] == "COMPLETED_WITH_RESULT"
+        if task_id == "task-B":
+            watcher.state["state"] = "ARCHITECT_RUNNING"
+            watcher.request_format_recovery(bridge)
+            assert watcher.state["architectFormatRecoveryTaskId"] == task_id
+            assert watcher.accept_architect_response(envelope(task_id, action="STOP"))["action"] == "STOP"
+        elif task_id == "task-C":
+            assert watcher.state["formatRecoveryCount"] == 0
+            assert watcher.state["formatRecoveryExhausted"] is False
+    assert len(bridge.messages) == 1
+
+
 def test_format_recovery_response_uses_strict_same_task_parser():
     parsed = parse_orchestrator_result(envelope("task-1", prompt="next"), "task-1")
     assert parsed == {"classification": "ACCEPTED", "action": "EXECUTE", "taskId": "task-1", "prompt": "next"}
