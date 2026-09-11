@@ -125,12 +125,14 @@ def test_send_failure_keeps_same_result_ready(tmp_path):
 
 
 def test_final_envelope_persists_exact_prompt_and_duplicate_is_ignored(tmp_path):
-    watcher = ready(tmp_path)
+    watcher, base, _ = recovery_fixture(tmp_path)
     watcher.state["state"] = "ARCHITECT_RUNNING"
-    response = envelope("task-1", prompt="line 1\r\nline 2")
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    prompt = configured_project_prompt(base, head).replace("bounded task in owned-task", "line 1\r\nline 2")
+    response = envelope("recovery-safety-task", prompt=prompt)
     decision = watcher.accept_architect_response(response)
     assert decision["action"] == "EXECUTE"
-    assert Path(watcher.state["nextPromptPath"]).read_text(encoding="utf-8") == "line 1\nline 2"
+    assert "line 1\nline 2" in Path(watcher.state["nextPromptPath"]).read_text(encoding="utf-8")
     assert watcher.accept_architect_response(response)["action"] == "DUPLICATE"
 
 
@@ -380,16 +382,17 @@ def test_native_submit_without_transition_preserves_payload(tmp_path):
 
 
 def test_next_prompt_persisted_and_launches_exactly_one_codex_child(tmp_path):
-    watcher = ready(tmp_path)
+    watcher, base, _ = recovery_fixture(tmp_path)
     watcher.state["state"] = "ARCHITECT_RUNNING"
-    watcher.accept_architect_response(envelope("task-1", prompt="next"))
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    watcher.accept_architect_response(envelope("recovery-safety-task", prompt=configured_project_prompt(base, head)))
     launches = []
 
     class Process:
         pid = 4321
 
     watcher.launch_next(lambda prompt, path: (launches.append(prompt) or Process()))
-    assert launches == ["next"]
+    assert len(launches) == 1
     assert watcher.launch_next(lambda *_: (_ for _ in ()).throw(AssertionError("duplicate launch"))) is None
 
 
@@ -513,16 +516,15 @@ def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys):
 
 
 def test_architect_executor_prompt_resolves_explicit_worktree(tmp_path):
-    worktree = tmp_path / "affotech-worktree"
-    worktree.mkdir()
-    prompt = f"ROLE\nExecutor\nWORKTREE\n{worktree}\nGOAL\nPreserve"
-    assert resolve_executor_worktree(prompt, tmp_path) == str(worktree)
-    watcher = ready(tmp_path)
+    watcher, base, _ = recovery_fixture(tmp_path)
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    prompt = configured_project_prompt(base, head)
     watcher.state["state"] = "ARCHITECT_RUNNING"
-    watcher.accept_architect_response(envelope("task-1", prompt=prompt))
-    assert watcher.state["targetProject"] == str(worktree)
-    assert watcher.state["targetRepo"] == str(worktree)
-    assert watcher.state["targetWorktree"] == str(worktree)
+    watcher.accept_architect_response(envelope("recovery-safety-task", prompt=prompt))
+    owned = Path(watcher.state["targetWorktree"])
+    assert owned.is_dir()
+    assert owned != base
+    assert owned == Path(watcher.state["taskWorktrees"][watcher.state["nextTaskId"]]["worktreePath"])
 
 
 def test_missing_or_invalid_executor_worktree_fails_closed(tmp_path):
@@ -1054,14 +1056,17 @@ def test_authorized_child_failure_is_postlaunch_active_writer_without_retry(tmp_
 def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeypatch):
     watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
     task_id = watcher.state["taskId"]
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
     watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 4415})
     watcher.save()
     monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
     monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
     process = type("Process", (), {"pid": 4416, "poll": lambda self: 0})()
     launches = []
+    child_cwds = []
     def launch(_prompt, result):
         launches.append(1)
+        child_cwds.append(watcher.state["targetWorktree"])
         Path(result).parent.mkdir(parents=True, exist_ok=True)
         Path(result).write_text("completed report", encoding="utf-8")
         return process
@@ -1075,9 +1080,17 @@ def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeyp
     watcher.deliver_result(Bridge())
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
     assert messages
-    assert watcher.accept_architect_response(envelope(task_id, action="STOP"))["action"] == "STOP"
-    assert watcher.state["state"] == "IDLE"
-    assert launches == [1]
+    next_prompt = configured_project_prompt(base, head, "next-bounded-task")
+    assert watcher.accept_architect_response(envelope(task_id, prompt=next_prompt))["action"] == "EXECUTE"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    next_worktree = Path(watcher.state["targetWorktree"])
+    assert next_worktree.is_dir()
+    assert watcher.launch_next(launch) is process
+    assert run_executor_state_once(watcher, launch) == "RESULT_READY"
+    assert len(launches) == 2
+    assert Path(child_cwds[1]) == next_worktree
+    assert next_worktree != base
+    assert next_worktree != watcher.project_dir
 
 
 def test_watcher_instance_lock_is_single_owner_and_releases(tmp_path):
@@ -1095,21 +1108,21 @@ def test_watcher_instance_lock_is_single_owner_and_releases(tmp_path):
     second.release()
 
 
-def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):
-    worktree = tmp_path / "affotech-worktree"
-    worktree.mkdir()
-    watcher = ready(tmp_path)
+def test_launch_next_uses_owned_worktree_and_records_owned_pid(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
     watcher.state["state"] = "ARCHITECT_RUNNING"
-    watcher.accept_architect_response(envelope("task-1", prompt=f"WORKTREE\n{worktree}\nnext"))
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    watcher.accept_architect_response(envelope("recovery-safety-task", prompt=configured_project_prompt(base, head)))
 
     class Process:
         pid = 9876
 
     observed = []
     watcher.launch_next(lambda prompt, path: (observed.append((prompt, path, watcher.state["targetWorktree"])) or Process()))
-    assert observed[0][2] == str(worktree)
+    owned = watcher.state["targetWorktree"]
+    assert observed[0][2] == owned
     assert watcher.state["codexPid"] == 9876
-    assert watcher.state["targetWorktree"] == str(worktree)
+    assert watcher.state["targetWorktree"] == owned
 
 
 def test_dead_pid_with_no_result_is_crashed_and_never_relaunched(tmp_path, monkeypatch):

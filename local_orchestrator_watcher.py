@@ -2620,13 +2620,16 @@ class LocalFirstOrchestrator:
             return {"action": "DUPLICATE"}
         decision = parse_orchestrator_result(response, str(self.state["taskId"]))
         if decision["action"] == "EXECUTE":
-            target = resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
-            self.state["architectResultFingerprint"] = fingerprint
             sequence = int(self.state.get("taskSequence", 0)) + 1
             next_id = f"{sequence:06d}"
             path = self.prompts_dir / f"{next_id}.txt"
             atomic_write(path, decision["prompt"].encode("utf-8"))
-            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target, "targetRepo": target, "targetWorktree": target})
+            target = self._owned_task_worktree(next_id, decision["prompt"])
+            if target is None:
+                raise RuntimeError("EXECUTOR_PROJECT_REQUIRED")
+            self.state["architectResultFingerprint"] = fingerprint
+            target_text = str(target)
+            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target_text, "targetRepo": target_text, "targetWorktree": target_text})
         elif decision["action"] == "HUMAN_REQUIRED":
             self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None})
