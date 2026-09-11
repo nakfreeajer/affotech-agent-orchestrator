@@ -761,6 +761,31 @@ def test_visible_launcher_uses_fresh_task_execution_and_owned_cwd(tmp_path, monk
     assert observed["prompt"] == b"unchanged prompt"
 
 
+def test_known_persistent_executor_session_passes_read_only_preflight():
+    assert watcher_module.verify_executor_session(watcher_module.AFFOTECH_EXECUTOR_SESSION_ID)
+
+
+def test_missing_executor_session_fails_before_resume_or_child_creation(tmp_path, monkeypatch):
+    owned = tmp_path / "owned-worktree"
+    owned.mkdir()
+    watcher = LocalFirstOrchestrator(str(tmp_path / "orchestrator"), tmp_path / "orchestrator" / "state")
+    watcher.state["targetWorktree"] = str(owned)
+    watcher.state["executorSessionId"] = watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: (_ for _ in ()).throw(RuntimeError("EXECUTOR_SESSION_NOT_FOUND")))
+    monkeypatch.setattr(watcher_module.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create child")))
+    with pytest.raises(RuntimeError, match="EXECUTOR_SESSION_NOT_FOUND"):
+        visible_executor_launcher(str(tmp_path), watcher)("prompt", tmp_path / "result.txt")
+
+
+def test_configured_executor_session_identity_mismatch_fails_closed(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.state["targetWorktree"] = str(tmp_path)
+    watcher.state["executorSessionId"] = "different-session"
+    monkeypatch.setattr(watcher_module.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create child")))
+    with pytest.raises(RuntimeError, match="EXECUTOR_SESSION_IDENTITY_MISMATCH"):
+        visible_executor_launcher(str(tmp_path), watcher)("prompt", tmp_path / "result.txt")
+
+
 def test_dead_child_without_result_persists_crash_diagnostics(tmp_path, monkeypatch, capsys):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
     result_path = tmp_path / "missing-result.txt"

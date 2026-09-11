@@ -47,6 +47,24 @@ class ResultSubmissionError(RuntimeError):
         super().__init__(f"{code}{':' + detail if detail else ''}")
 
 
+def verify_executor_session(session_id: str) -> bool:
+    """Verify a persistent Codex session from Codex's read-only local index."""
+    authority_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    index_path = authority_root / "session_index.jsonl"
+    try:
+        records = index_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("EXECUTOR_SESSION_AUTHORITY_UNAVAILABLE") from error
+    for line in records:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and record.get("id") == session_id:
+            return True
+    raise RuntimeError("EXECUTOR_SESSION_NOT_FOUND")
+
+
 def documentation_requirement(accepted_record: dict[str, Any]) -> tuple[bool, str | None]:
     """Evaluate structured accepted-state fields only; prose is never inspected."""
     if accepted_record.get("classification") != "ACCEPTED" and accepted_record.get("accepted") is not True:
@@ -714,6 +732,7 @@ class CodexRunner:
         except FileNotFoundError:
             pass
         if self.session_id:
+            verify_executor_session(self.session_id)
             args = ["exec", "resume", self.session_id, "-o", last_message_path, "-"]
         else:
             args = ["exec", "--ephemeral", "--sandbox", "read-only", "-C", self.project_dir, "-o", last_message_path, "-"]
@@ -2513,10 +2532,12 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
     """Build the existing visible Codex launch surface for one owned child."""
     def launch(prompt: str, result_path: Path) -> Any:
         target = watcher.state["targetWorktree"]
+        configured_session = watcher.state.get("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
+        if configured_session != AFFOTECH_EXECUTOR_SESSION_ID:
+            raise RuntimeError("EXECUTOR_SESSION_IDENTITY_MISMATCH")
+        verify_executor_session(AFFOTECH_EXECUTOR_SESSION_ID)
         runner = CodexRunner(project, child_project_dir=target, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
-        if not runner.session_id:
-            raise RuntimeError("EXECUTOR_SESSION_ID_MISSING")
-        watcher.state.update({"executorSessionId": runner.session_id, "executorSessionMode": "PERSISTENT"})
+        watcher.state.update({"executorSessionId": AFFOTECH_EXECUTOR_SESSION_ID, "executorSessionMode": "PERSISTENT"})
         watcher.save()
         command_args = ["exec", "resume", runner.session_id, "-o", str(result_path), "-"]
         command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
