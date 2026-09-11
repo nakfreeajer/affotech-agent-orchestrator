@@ -1343,7 +1343,7 @@ class LocalWatcher:
         root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
         self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
-        self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
+        self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=None)
         if durable_decision_reader is not None:
             self.durable_decision_reader = durable_decision_reader
         else:
@@ -2028,7 +2028,7 @@ class LocalFirstOrchestrator:
         if existing:
             if Path(str(existing.get("worktreePath", ""))).resolve() != path or existing.get("baseRepo") != str(base):
                 raise RuntimeError("EXECUTOR_WORKTREE_OWNERSHIP_MISMATCH")
-            if not path.is_dir() or self._git(path, "rev-parse", "--show-toplevel") != str(path):
+            if not path.is_dir() or Path(self._git(path, "rev-parse", "--show-toplevel")).resolve() != path:
                 raise RuntimeError("EXECUTOR_WORKTREE_INVALID")
             if self._git(path, "rev-parse", "HEAD") != base_commit:
                 raise RuntimeError("EXECUTOR_WORKTREE_SOURCE_MISMATCH")
@@ -2111,7 +2111,7 @@ class LocalFirstOrchestrator:
         existing_fingerprint = fingerprint if fingerprint in consumed else next((key for key, item in consumed.items() if task_id and item.get("taskId") == task_id), None)
         if existing_fingerprint:
             existing = consumed.get(existing_fingerprint, {})
-            recoverable = existing.get("action") == "EXECUTE" and task_id and self._prelaunch_incomplete(task_id)
+            recoverable = existing.get("action") == "EXECUTE" and existing.get("state") != "LAUNCHED" and task_id and self._prelaunch_incomplete(task_id)
             if not recoverable:
                 return "DUPLICATE"
             consumed.pop(existing_fingerprint, None)
@@ -2145,9 +2145,45 @@ class LocalFirstOrchestrator:
         if task_id == self.state.get("lastCompletedTaskId"):
             return False
         active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        if active_pid:
+            try:
+                if LocalWatcher.process_alive(int(active_pid)):
+                    return False
+            except (TypeError, ValueError):
+                return False
         result_path = self.state.get("executorResultPath")
         result_exists = isinstance(result_path, str) and Path(result_path).is_file()
-        return not active_pid and not result_exists
+        return not result_exists
+
+    def recover_prelaunch_incomplete(self, launcher: Callable[[str, Path], Any]) -> Any | None:
+        """Recover one safely verified EXECUTE that died before producing a result."""
+        task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
+        if not task_id or not self._prelaunch_incomplete(task_id):
+            return None
+        prompt_path = self.state.get("nextPromptPath")
+        if not isinstance(prompt_path, str) or not Path(prompt_path).is_file():
+            self.state["prelaunchRecoveryError"] = "PRELAUNCH_PROMPT_MISSING"
+            self.save()
+            return None
+        try:
+            prompt = Path(prompt_path).read_text(encoding="utf-8")
+            owned = self._owned_task_worktree(task_id, prompt)
+            if owned is None:
+                raise RuntimeError("PRELAUNCH_WORKTREE_NOT_OWNED")
+            self.state.update({"state": "NEXT_PROMPT_READY", "taskId": task_id, "nextTaskId": task_id, "targetProject": str(owned), "targetRepo": str(owned), "targetWorktree": str(owned), "prelaunchRecoveryState": "PRELAUNCH_INCOMPLETE"})
+            self.save()
+            process = self.launch_next(launcher)
+            fingerprint = self.state.get("architectResultFingerprint")
+            consumed = self.state.get("consumedArchitectResponses", {})
+            if isinstance(fingerprint, str) and isinstance(consumed.get(fingerprint), dict):
+                consumed[fingerprint]["state"] = "LAUNCHED"
+            self.state["prelaunchRecoveryState"] = "RECOVERED_AND_LAUNCHED"
+            self.save()
+            return process
+        except (OSError, UnicodeError, RuntimeError) as error:
+            self.state.update({"state": "HUMAN_REQUIRED", "prelaunchRecoveryError": str(error)})
+            self.save()
+            return None
 
     def request_architect_bootstrap(self, bridge: Any) -> bool:
         """Ask Architect once to evaluate current project state and choose the next action."""
@@ -2310,7 +2346,19 @@ class LocalFirstOrchestrator:
         if isinstance(path, str) and Path(path).is_file() and Path(path).read_text(encoding="utf-8", errors="replace").strip():
             self.state["state"] = "RESULT_READY"
         else:
-            self.state["state"] = "EXECUTOR_CRASHED"
+            result_exists = bool(isinstance(path, str) and Path(path).is_file())
+            self.state.update({
+                "state": "EXECUTOR_CRASHED",
+                "executorProcessState": "EXITED_WITHOUT_RESULT",
+                "executorCrash": {
+                    "taskId": self.state.get("taskId"),
+                    "pid": pid,
+                    "targetWorktree": self.state.get("targetWorktree"),
+                    "resultPath": path,
+                    "resultExists": result_exists,
+                },
+            })
+            print("EXECUTOR_PROCESS_STATE=EXITED_WITHOUT_RESULT taskId=%s pid=%s targetWorktree=%s resultPath=%s resultExists=%s" % (self.state.get("taskId"), pid, self.state.get("targetWorktree"), path, result_exists))
         self.save()
         return self.state["state"]
 
@@ -2430,8 +2478,8 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
     """Build the existing visible Codex launch surface for one owned child."""
     def launch(prompt: str, result_path: Path) -> Any:
         target = watcher.state["targetWorktree"]
-        runner = CodexRunner(project, child_project_dir=target, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
-        command_args = (["exec", "resume", runner.session_id, "-o", str(result_path), "-"] if runner.session_id else ["exec", "--ephemeral", "--sandbox", "read-only", "-C", project, "-o", str(result_path), "-"])
+        runner = CodexRunner(project, child_project_dir=target, session_id=None)
+        command_args = ["exec", "--ephemeral", "--sandbox", "workspace-write", "-C", target, "-o", str(result_path), "-"]
         command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
         child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=None, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
         assert child.stdin is not None
@@ -2477,9 +2525,13 @@ def main() -> None:
                 if state == "EXECUTOR_RUNNING":
                     continue
                 if state == "EXECUTOR_CRASHED":
+                    recovered = watcher.recover_prelaunch_incomplete(launch)
+                    if recovered is not None:
+                        print(f"CODEX_STARTED pid={recovered.pid}")
+                        continue
                     watcher.state["state"] = "HUMAN_REQUIRED"
                     watcher.save()
-                    print("STATE=HUMAN_REQUIRED")
+                    print("STATE=HUMAN_REQUIRED reason=EXECUTOR_EXITED_WITHOUT_RESULT")
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
@@ -2487,6 +2539,10 @@ def main() -> None:
                 print(f"CODEX_STARTED pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
+                recovered = watcher.recover_prelaunch_incomplete(launch)
+                if recovered is not None:
+                    print(f"CODEX_STARTED pid={recovered.pid}")
+                    continue
                 print("STATE=HUMAN_REQUIRED")
                 return
             if state not in {"RESULT_READY", "ARCHITECT_RUNNING"}:

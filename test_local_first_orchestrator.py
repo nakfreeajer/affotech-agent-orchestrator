@@ -10,7 +10,8 @@ import pytest
 from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestrator,
                                         LocalWatcher,
                                         ResultSubmissionError, atomic_write,
-                                        parse_orchestrator_result, resolve_executor_worktree)
+                                        parse_orchestrator_result, resolve_executor_worktree,
+                                        visible_executor_launcher)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -698,6 +699,86 @@ def test_worktree_path_owned_by_another_task_is_not_reused(tmp_path):
     response = envelope("conflict-task", prompt=configured_project_prompt(base, head, "conflict-task"))
     with pytest.raises(RuntimeError, match="EXECUTOR_WORKTREE_OWNERSHIP_CONFLICT"):
         watcher.consume_idle_architect_response(response, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch")))
+
+
+def test_visible_launcher_uses_fresh_task_execution_and_owned_cwd(tmp_path, monkeypatch):
+    owned = tmp_path / "owned-worktree"
+    owned.mkdir()
+    watcher = LocalFirstOrchestrator(str(tmp_path / "orchestrator"), tmp_path / "orchestrator" / "state")
+    watcher.state.update({"targetWorktree": str(owned), "taskId": "fresh-task"})
+    observed = {}
+
+    class Stdin:
+        def write(self, value): observed["prompt"] = value
+        def close(self): pass
+
+    class Child:
+        pid = 4401
+        stdin = Stdin()
+
+    class FreshRunner:
+        launcher = ["codex"]
+        executable = "codex"
+        session_id = None
+        def __init__(self, *_args, **_kwargs): pass
+        def assemble_prompt(self, prompt): return prompt
+
+    def fake_popen(command, **kwargs):
+        observed.update({"command": command, "cwd": kwargs["cwd"]})
+        return Child()
+
+    monkeypatch.setattr(watcher_module, "CodexRunner", FreshRunner)
+    monkeypatch.setattr(watcher_module.subprocess, "Popen", fake_popen)
+    result_path = tmp_path / "result.txt"
+    child = visible_executor_launcher(str(tmp_path), watcher)("unchanged prompt", result_path)
+    assert child.pid == 4401
+    assert "resume" not in observed["command"]
+    assert observed["command"][0:3] == ["codex", "exec", "--ephemeral"]
+    assert "workspace-write" in observed["command"]
+    assert observed["command"][observed["command"].index("-C") + 1] == str(owned)
+    assert observed["cwd"] == str(owned)
+    assert observed["prompt"] == b"unchanged prompt"
+
+
+def test_dead_child_without_result_persists_crash_diagnostics(tmp_path, monkeypatch, capsys):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    result_path = tmp_path / "missing-result.txt"
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "crashed-task", "codexPid": 4402, "targetWorktree": str(tmp_path / "owned"), "executorResultPath": str(result_path)})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    assert watcher.reconcile_executor() == "EXECUTOR_CRASHED"
+    assert watcher.state["executorProcessState"] == "EXITED_WITHOUT_RESULT"
+    assert watcher.state["executorCrash"] == {"taskId": "crashed-task", "pid": 4402, "targetWorktree": str(tmp_path / "owned"), "resultPath": str(result_path), "resultExists": False}
+    assert "EXITED_WITHOUT_RESULT" in capsys.readouterr().out
+
+
+def test_prelaunch_recovery_reuses_owned_worktree_without_new_architect_decision(tmp_path, monkeypatch):
+    base, config, head = configured_git_project(tmp_path)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    task_id = "recovery-task"
+    response = envelope(task_id, prompt=configured_project_prompt(base, head, task_id))
+    fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    worktree = watcher._owned_task_worktree(task_id, configured_project_prompt(base, head, task_id))
+    prompt_path = watcher.prompts_dir / f"{task_id}.txt"
+    atomic_write(prompt_path, configured_project_prompt(base, head, task_id).encode("utf-8"))
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "taskId": task_id, "nextTaskId": task_id,
+        "nextPromptPath": str(prompt_path), "targetWorktree": str(worktree),
+        "codexPid": 12724, "executorResultPath": str(tmp_path / "missing-result"),
+        "lastCompletedTaskId": "completed-task", "architectResultFingerprint": fingerprint,
+        "consumedArchitectResponses": {fingerprint: {"taskId": task_id, "action": "EXECUTE", "state": "RECEIVED"}},
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    process = type("Process", (), {"pid": 4403})()
+    assert watcher.recover_prelaunch_incomplete(lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1]) is process
+    assert launches == [str(worktree)]
+    assert watcher.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
+    assert watcher.state["taskWorktrees"][task_id]["worktreePath"] == str(worktree)
+    assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
 
 
 def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):
