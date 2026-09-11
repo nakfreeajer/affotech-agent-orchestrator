@@ -1159,6 +1159,11 @@ class ArchitectPlaywright:
         text = messages.nth(count - 1).inner_text() if count else ""
         return {"count": count, "text_hash": hashlib.sha256(text.encode()).hexdigest()}
 
+    def latest_user_message(self) -> str | None:
+        messages = self.page.locator('[data-message-author-role="user"]')
+        count = messages.count()
+        return messages.nth(count - 1).inner_text() if count else None
+
     def submit_user_and_confirm(self, message: str, timeout: float = 15.0) -> bool:
         baseline = self.user_baseline()
         self.submit_result(message)
@@ -1235,14 +1240,30 @@ class ArchitectPlaywright:
         composer.fill(result)
         composer.press("Enter")
 
+    def _live_composer(self) -> Any:
+        """Resolve the current editor, never reusing a locator across rerenders."""
+        locator = getattr(self.page, "locator", None)
+        if locator is not None:
+            candidate = locator("#prompt-textarea")
+            candidate = getattr(candidate, "last", candidate)
+            try:
+                if candidate.count() > 0:
+                    return candidate
+            except Exception:
+                pass
+        return self.page.get_by_role("textbox").last
+
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         """Submit a result with explicit, bounded stages and typed failures."""
         deadline = time.monotonic() + timeout
         last_error = None
-        composer = None
+        try:
+            self.restore_live_bottom(delay=0)
+        except Exception:
+            pass
         while time.monotonic() < deadline:
             try:
-                composer = self.page.get_by_role("textbox").last
+                composer = self._live_composer()
                 visible = getattr(composer, "is_visible", lambda **_: True)(timeout=1000)
                 editable = getattr(composer, "is_editable", lambda **_: True)(timeout=1000)
                 if visible and editable:
@@ -1259,6 +1280,7 @@ class ArchitectPlaywright:
         # keyboard route after explicit focus; this updates the same editor
         # state as user typing/pasting and handles multiline Markdown.
         try:
+            composer = self._live_composer()
             composer.focus(timeout=1000)
             composer.press("ControlOrMeta+A", timeout=1000)
             keyboard = getattr(self.page, "keyboard", None)
@@ -1270,6 +1292,7 @@ class ArchitectPlaywright:
             raise ResultSubmissionError(code, type(error).__name__) from error
 
         try:
+            composer = self._live_composer()
             observed = composer.inner_text(timeout=1000)
         except Exception as error:
             code = "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
@@ -1304,6 +1327,7 @@ class ArchitectPlaywright:
             # already confirmed active composer; transition confirmation below
             # remains the delivery authority.
             try:
+                composer = self._live_composer()
                 composer.focus(timeout=1000)
                 composer.press("Enter", timeout=1000)
                 self.last_send_method = "playwright.composer.press(Enter)"
@@ -1316,7 +1340,7 @@ class ArchitectPlaywright:
         ack_deadline = min(deadline, time.monotonic() + 5.0)
         while time.monotonic() < ack_deadline:
             try:
-                composer_empty = not composer.inner_text(timeout=1000).strip()
+                composer_empty = not self._live_composer().inner_text(timeout=1000).strip()
                 stop = self.page.get_by_role("button", name=re.compile(r"stop(?: generating)?", re.I)).last
                 generation_visible = stop.count() > 0 and stop.is_visible(timeout=1000)
                 assistant_started = self.assistant_count() > assistant_count_before
@@ -2582,10 +2606,46 @@ class LocalFirstOrchestrator:
         instruction = ("Verify the completed Executor report below, classify it, decide the next bounded action, "
                        "and finish with exactly one <ORCHESTRATOR_RESULT> envelope using taskId=" + task_id + ".\n"
                        "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
-        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
-        sender(instruction + report)
+        payload = instruction + report
+        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        prior_hash = self.state.get("architectDeliveryPayloadHash")
+        delivery_state = self.state.get("architectSendState")
+        if prior_hash == payload_hash and delivery_state in {"PENDING", "AMBIGUOUS"}:
+            observed = None
+            probe = getattr(bridge, "latest_user_message", None)
+            if callable(probe):
+                observed = probe()
+            if observed is None:
+                self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_DELIVERY_AMBIGUOUS"})
+                self.save()
+                raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
+            if observed == payload:
+                baseline = self.state.get("architectDeliveryBaseline")
+                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None, "architectBaseline": baseline})
+                self.save()
+                return
+            self.state["architectSendState"] = "FAILED"
         baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None, "architectBaseline": baseline})
+        self.state.update({
+            "architectDeliveryTaskId": task_id,
+            "architectDeliveryPayloadHash": payload_hash,
+            "architectDeliveryBaseline": baseline,
+            "architectSendState": "PENDING",
+            "architectSendError": None,
+            "state": "RESULT_READY",
+        })
+        self.save()
+        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
+        try:
+            sender(payload)
+        except Exception as error:
+            code = getattr(error, "code", None) or type(error).__name__
+            ambiguous = code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT" or bool(getattr(bridge, "last_send_method", None))
+            failure_class = "ARCHITECT_DELIVERY_AMBIGUOUS" if ambiguous else "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+            self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS" if ambiguous else "FAILED", "architectSendError": code, "architectDeliveryFailureClass": failure_class})
+            self.save()
+            raise
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
 
     def request_format_recovery(self, bridge: Any) -> None:
@@ -2773,7 +2833,11 @@ def main() -> None:
             watcher.save()
             try:
                 if watcher.state.get("state") == "RESULT_READY":
-                    watcher.deliver_result(bridge)
+                    try:
+                        watcher.deliver_result(bridge)
+                    except ResultSubmissionError as error:
+                        print(f"STATE=RESULT_READY reason={getattr(error, 'code', type(error).__name__)}")
+                        return
                 baseline = watcher.state.get("architectBaseline")
                 if not isinstance(baseline, dict):
                     entries = bridge._assistant_entries()

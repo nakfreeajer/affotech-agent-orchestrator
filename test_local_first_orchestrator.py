@@ -321,11 +321,94 @@ class FakeUnavailable:
         raise RuntimeError("missing composer")
 
 
+class ReplacingComposerPage(FakeComposerPage):
+    def __init__(self):
+        super().__init__()
+        self.composer_calls = 0
+
+    def get_by_role(self, role, **kwargs):
+        if role == "textbox":
+            self.composer_calls += 1
+            if self.composer_calls == 1:
+                stale = FakeComposer(self)
+                stale.focus = lambda **_: (_ for _ in ()).throw(TimeoutError("detached"))
+                return stale
+        return super().get_by_role(role, **kwargs)
+
+
 def test_current_composer_receives_exact_text_and_is_confirmed():
     page = FakeComposerPage()
     result = "line 1\nline 2\n<ORCHESTRATOR_RESULT>"
     ArchitectPlaywright(page).submit_result_bounded(result, timeout=1)
     assert page.sent == [result]
+
+
+def test_stale_composer_is_reacquired_before_focus_and_send():
+    page = ReplacingComposerPage()
+    result = "reacquired payload"
+    ArchitectPlaywright(page).submit_result_bounded(result, timeout=1)
+    assert page.sent == [result]
+    assert page.composer_calls >= 3
+
+
+def test_result_delivery_pre_send_failure_is_persisted_and_restart_retries_without_executor(tmp_path):
+    watcher = ready(tmp_path)
+    payload = Path(watcher.state["executorResultPath"]).read_bytes()
+    class FailedBridge:
+        def assistant_baseline(self): return {"count": 2, "entries": []}
+        def submit_result_bounded(self, _message):
+            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", "TimeoutError")
+    with pytest.raises(ResultSubmissionError):
+        watcher.deliver_result(FailedBridge())
+    assert watcher.state["state"] == "RESULT_READY"
+    assert watcher.state["architectDeliveryFailureClass"] == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+    assert Path(watcher.state["executorResultPath"]).read_bytes() == payload
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    sends = []
+    class HealthyBridge:
+        def assistant_baseline(self): return {"count": 3, "entries": []}
+        def submit_result_bounded(self, message): sends.append(message)
+    restarted.deliver_result(HealthyBridge())
+    assert len(sends) == 1
+    assert not restarted.state.get("executorLaunchCount", 0)
+
+
+def test_ambiguous_result_delivery_does_not_duplicate_on_restart(tmp_path):
+    watcher = ready(tmp_path)
+    sent = []
+    class AmbiguousBridge:
+        def assistant_baseline(self): return {"count": 4, "entries": ["baseline"]}
+        def submit_result_bounded(self, message):
+            sent.append(message)
+            raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+    with pytest.raises(ResultSubmissionError):
+        watcher.deliver_result(AmbiguousBridge())
+    payload = sent[0]
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    class PresentBridge:
+        def latest_user_message(self): return payload
+        def assistant_baseline(self): return {"count": 9, "entries": ["new"]}
+        def submit_result_bounded(self, _message): raise AssertionError("duplicate delivery")
+    restarted.deliver_result(PresentBridge())
+    assert restarted.state["state"] == "ARCHITECT_RUNNING"
+    assert sent == [payload]
+
+
+def test_ambiguous_result_delivery_retries_once_when_exact_payload_absent(tmp_path):
+    watcher = ready(tmp_path)
+    class AmbiguousBridge:
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+        def submit_result_bounded(self, _message): raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+    with pytest.raises(ResultSubmissionError):
+        watcher.deliver_result(AmbiguousBridge())
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    sends = []
+    class AbsentBridge:
+        def latest_user_message(self): return "different payload"
+        def assistant_baseline(self): return {"count": 2, "entries": []}
+        def submit_result_bounded(self, message): sends.append(message)
+    restarted.deliver_result(AbsentBridge())
+    assert len(sends) == 1
 
 
 def test_normal_playwright_click_sends_exact_text():
