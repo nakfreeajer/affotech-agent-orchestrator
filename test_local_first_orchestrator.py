@@ -631,6 +631,9 @@ def test_malformed_idle_architect_response_bootstraps_once_without_result_replay
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
     assert len(bridge.messages) == 1
     assert "Executor report" not in bridge.messages[0]
+    for forbidden in ("AFFOTECH", "OCR", "Procurement", "5C", "5D"):
+        assert forbidden.lower() not in bridge.messages[0].lower()
+    assert "Return STOP only if there is genuinely no further currently authorized project work." in bridge.messages[0]
     watcher.request_architect_bootstrap(bridge)
     assert watcher.state["state"] == "HUMAN_REQUIRED"
     assert len(bridge.messages) == 1

@@ -1970,15 +1970,20 @@ class LocalFirstOrchestrator:
         return decision["action"]
 
     def request_architect_bootstrap(self, bridge: Any) -> None:
-        """Ask Architect once for its current approved action, never replaying 5C."""
+        """Ask Architect once to evaluate current project state and choose the next action."""
         if int(self.state.get("architectBootstrapCount", 0)) >= 1:
             self.state["state"] = "HUMAN_REQUIRED"
             self.save()
             return
         message = "\n".join([
-            "Return the current already-approved next action using only the canonical machine envelope below.",
-            "Do not redesign the milestone or create a new task merely because Orchestrator is asking.",
-            "If an already-approved next Executor action exists, return it; otherwise return action=STOP or HUMAN_REQUIRED as appropriate.",
+            "Review the current authoritative project state after the completed work.",
+            "You are the project Architect.",
+            "Decide the next bounded action according to the project's existing governance, roadmap, accepted milestones, documentation, and current authoritative state.",
+            "Do not repeat already accepted work.",
+            "Do not invent work outside the established project direction.",
+            "If an Executor or Documentation Curator action is appropriate, return the complete next instruction using the canonical ORCHESTRATOR_RESULT envelope.",
+            "If genuine human authority is required, return HUMAN_REQUIRED.",
+            "Return STOP only if there is genuinely no further currently authorized project work.",
             "<ORCHESTRATOR_RESULT>",
             "classification=ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT",
             "action=EXECUTE|HUMAN_REQUIRED|STOP",
