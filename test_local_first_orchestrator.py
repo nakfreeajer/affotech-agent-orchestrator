@@ -75,7 +75,7 @@ def recovery_fixture(tmp_path):
     watcher.state.update({
         "state": "HUMAN_REQUIRED", "taskId": task_id, "nextTaskId": task_id,
         "nextPromptPath": str(prompt_path), "targetWorktree": str(worktree),
-        "codexPid": 12724, "executorResultPath": str(tmp_path / "missing-result"),
+        "codexPid": None, "executorResultPath": str(tmp_path / "missing-result"),
         "lastCompletedTaskId": "completed-task", "architectResultFingerprint": fingerprint,
         "consumedArchitectResponses": {fingerprint: {"taskId": task_id, "action": "EXECUTE", "state": "RECEIVED"}},
     })
@@ -759,6 +759,7 @@ def test_visible_launcher_uses_fresh_task_execution_and_owned_cwd(tmp_path, monk
     assert "--ephemeral" not in observed["command"]
     assert observed["cwd"] == str(owned)
     assert observed["prompt"] == b"unchanged prompt"
+    assert Path(watcher.state["stderrLogPath"]).is_file()
 
 
 def test_known_persistent_executor_session_passes_read_only_preflight():
@@ -794,8 +795,41 @@ def test_dead_child_without_result_persists_crash_diagnostics(tmp_path, monkeypa
     monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
     assert watcher.reconcile_executor() == "EXECUTOR_CRASHED"
     assert watcher.state["executorProcessState"] == "EXITED_WITHOUT_RESULT"
-    assert watcher.state["executorCrash"] == {"taskId": "crashed-task", "pid": 4402, "targetWorktree": str(tmp_path / "owned"), "resultPath": str(result_path), "resultExists": False}
+    assert watcher.state["executorCrash"] == {"taskId": "crashed-task", "pid": 4402, "targetWorktree": str(tmp_path / "owned"), "resultPath": str(result_path), "resultExists": False, "exitCode": None, "stderrLogPath": None, "stderrSummary": ""}
     assert "EXITED_WITHOUT_RESULT" in capsys.readouterr().out
+
+
+def test_postlaunch_no_result_never_automatically_relaunches(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "postlaunch-task", "codexPid": 4404, "executorLaunchState": "LAUNCHED", "prelaunchRecoveryState": "RECOVERED_AND_LAUNCHED", "executorResultPath": str(tmp_path / "missing-result"), "targetWorktree": str(tmp_path / "owned")})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["executorLaunchState"] == "POSTLAUNCH_NO_RESULT"
+    assert watcher.state["automaticRetryAuthorized"] is False
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.recover_prelaunch_incomplete(lambda *_: launches.append(2)) is None
+    assert launches == []
+
+
+def test_active_writer_failure_is_classified_without_retry(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    stderr_path = watcher.state_dir / "executor-logs" / "task-attempt-1.stderr.txt"
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.write_text("thread 019f842e already has an active writer\n", encoding="utf-8")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "writer-task", "codexPid": 4405, "executorResultPath": str(tmp_path / "missing-result"), "stderrLogPath": str(stderr_path), "targetWorktree": str(tmp_path / "owned")})
+    watcher.save()
+    class Process:
+        def poll(self): return 23
+    watcher._active_process = Process()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    assert watcher.reconcile_executor() == "EXECUTOR_CRASHED"
+    assert watcher.state["executorFailureClass"] == "EXECUTOR_SESSION_ACTIVE_WRITER"
+    assert watcher.state["executorExitCode"] == 23
+    assert watcher.state["executorCrash"]["stderrLogPath"] == str(stderr_path)
+    assert watcher.state["automaticRetryAuthorized"] is False
 
 
 def test_prelaunch_recovery_reuses_owned_worktree_without_new_architect_decision(tmp_path, monkeypatch):
@@ -812,7 +846,7 @@ def test_prelaunch_recovery_reuses_owned_worktree_without_new_architect_decision
     watcher.state.update({
         "state": "HUMAN_REQUIRED", "taskId": task_id, "nextTaskId": task_id,
         "nextPromptPath": str(prompt_path), "targetWorktree": str(worktree),
-        "codexPid": 12724, "executorResultPath": str(tmp_path / "missing-result"),
+        "codexPid": None, "executorResultPath": str(tmp_path / "missing-result"),
         "lastCompletedTaskId": "completed-task", "architectResultFingerprint": fingerprint,
         "consumedArchitectResponses": {fingerprint: {"taskId": task_id, "action": "EXECUTE", "state": "RECEIVED"}},
     })
@@ -890,6 +924,7 @@ def test_existing_nonempty_result_blocks_recovery(tmp_path, monkeypatch):
 
 def test_live_owned_child_blocks_recovery(tmp_path, monkeypatch):
     watcher, base, worktree = recovery_fixture(tmp_path)
+    watcher.state["codexPid"] = 4405
     monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
     launches = []
     assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None

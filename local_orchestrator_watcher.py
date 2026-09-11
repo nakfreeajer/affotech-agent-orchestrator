@@ -2167,6 +2167,8 @@ class LocalFirstOrchestrator:
         """Recognize an EXECUTE transaction that never reached a child or result."""
         if task_id == self.state.get("lastCompletedTaskId"):
             return False
+        if self.state.get("executorLaunchState") in {"LAUNCHED", "POSTLAUNCH_NO_RESULT"} or self.state.get("prelaunchRecoveryState") == "RECOVERED_AND_LAUNCHED":
+            return False
         active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
         if active_pid:
             try:
@@ -2213,6 +2215,16 @@ class LocalFirstOrchestrator:
         """Recover one safely verified EXECUTE that died before producing a result."""
         task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
         if not task_id or task_id == self.state.get("lastCompletedTaskId"):
+            return None
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        if active_pid:
+            if LocalWatcher.process_alive(int(active_pid)):
+                self.state.update({"state": "HUMAN_REQUIRED", "prelaunchRecoveryError": "RECOVERY_CHILD_STILL_ALIVE", "automaticRetryAuthorized": False})
+                self.save()
+                return None
+            self.state.update({"state": "HUMAN_REQUIRED", "executorLaunchState": "POSTLAUNCH_NO_RESULT", "automaticRetryAuthorized": False})
+            self.save()
+            print("EXECUTOR_RETRY_BLOCKED reason=POSTLAUNCH_NO_RESULT taskId=%s" % task_id)
             return None
         prompt_path = self.state.get("nextPromptPath")
         if not isinstance(prompt_path, str) or not Path(prompt_path).is_file():
@@ -2401,18 +2413,38 @@ class LocalFirstOrchestrator:
             self.state["state"] = "RESULT_READY"
         else:
             result_exists = bool(isinstance(path, str) and Path(path).is_file())
+            process = getattr(self, "_active_process", None)
+            exit_code = None
+            if process is not None:
+                try:
+                    exit_code = process.poll()
+                except (OSError, AttributeError):
+                    pass
+            stderr_path = self.state.get("stderrLogPath")
+            stderr_summary = ""
+            if isinstance(stderr_path, str) and Path(stderr_path).is_file():
+                stderr_summary = Path(stderr_path).read_text(encoding="utf-8", errors="replace").strip()[:500]
+            failure_class = "EXECUTOR_SESSION_ACTIVE_WRITER" if "already has an active writer" in stderr_summary else "POSTLAUNCH_NO_RESULT"
             self.state.update({
                 "state": "EXECUTOR_CRASHED",
+                "executorLaunchState": "POSTLAUNCH_NO_RESULT",
+                "automaticRetryAuthorized": False,
                 "executorProcessState": "EXITED_WITHOUT_RESULT",
+                "executorFailureClass": failure_class,
+                "executorExitCode": exit_code,
+                "stderrSummary": stderr_summary,
                 "executorCrash": {
                     "taskId": self.state.get("taskId"),
                     "pid": pid,
                     "targetWorktree": self.state.get("targetWorktree"),
                     "resultPath": path,
                     "resultExists": result_exists,
+                    "exitCode": exit_code,
+                    "stderrLogPath": stderr_path,
+                    "stderrSummary": stderr_summary,
                 },
             })
-            print("EXECUTOR_PROCESS_STATE=EXITED_WITHOUT_RESULT taskId=%s pid=%s targetWorktree=%s resultPath=%s resultExists=%s" % (self.state.get("taskId"), pid, self.state.get("targetWorktree"), path, result_exists))
+            print("EXECUTOR_PROCESS_STATE=EXITED_WITHOUT_RESULT taskId=%s pid=%s exitCode=%s stderrLogPath=%s stderrSummary=%s" % (self.state.get("taskId"), pid, exit_code, stderr_path, stderr_summary))
         self.save()
         return self.state["state"]
 
@@ -2435,7 +2467,10 @@ class LocalFirstOrchestrator:
 
     def mark_executor_started(self, task_id: str, pid: int, result_path: str | os.PathLike[str]) -> None:
         target = self.state.get("targetWorktree") or self.state.get("targetProject")
-        self.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": target, "executorResultPath": str(result_path)})
+        attempt = int(self.state.get("executorAttemptNumber", 0)) + 1
+        log_path = self.state.get("stderrLogPath") or str(self.state_dir / "executor-logs" / f"{task_id}-attempt-{attempt}.stderr.txt")
+        self.state.update({"state": "EXECUTOR_RUNNING", "executorLaunchState": "LAUNCHED", "automaticRetryAuthorized": False, "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "executorAttemptNumber": attempt, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": target, "executorResultPath": str(result_path), "stderrLogPath": str(log_path)})
+        self._active_process = getattr(self, "_active_process", None)
         self.save()
 
     def mark_executor_exit(self, exit_code: int, result_path: str | os.PathLike[str]) -> str:
@@ -2524,6 +2559,7 @@ class LocalFirstOrchestrator:
         self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
         self.save()
         process = launcher(prompt, self._result_path(str(self.state["nextTaskId"])))
+        self._active_process = process
         self.mark_executor_started(str(self.state["nextTaskId"]), int(process.pid), self._result_path(str(self.state["nextTaskId"])))
         return process
 
@@ -2538,10 +2574,18 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
         verify_executor_session(AFFOTECH_EXECUTOR_SESSION_ID)
         runner = CodexRunner(project, child_project_dir=target, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
         watcher.state.update({"executorSessionId": AFFOTECH_EXECUTOR_SESSION_ID, "executorSessionMode": "PERSISTENT"})
+        attempt = int(watcher.state.get("executorAttemptNumber", 0)) + 1
+        stderr_path = watcher.state_dir / "executor-logs" / f"{watcher.state.get('taskId', 'unknown')}-attempt-{attempt}.stderr.txt"
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        watcher.state.update({"stderrLogPath": str(stderr_path)})
         watcher.save()
         command_args = ["exec", "resume", runner.session_id, "-o", str(result_path), "-"]
         command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
-        child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=None, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        stderr_handle = stderr_path.open("w", encoding="utf-8", errors="replace")
+        try:
+            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=stderr_handle, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        finally:
+            stderr_handle.close()
         assert child.stdin is not None
         child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
         return child
