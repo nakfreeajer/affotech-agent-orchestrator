@@ -738,3 +738,42 @@ def test_stale_thinking_placeholder_does_not_block_substantive_continuation(tmp_
     watcher.save()
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
     assert len(sent) == 1
+
+
+def test_production_state_fixture_reaches_new_continuation_once(tmp_path):
+    substantive = "So there is no Curator handoff remaining. We can proceed directly to the bounded 5D Executor milestone."
+
+    class Page:
+        def evaluate(self, script):
+            if 'data-message-author-role="assistant"' in script:
+                return [
+                    {"id": "architect-response-new", "text": substantive},
+                    {"id": "request-placeholder-request-new-40", "text": "Thinking"},
+                ]
+            return False
+
+    bridge = ArchitectPlaywright(Page())
+    sent = []
+    bridge.submit_result_bounded = lambda message: sent.append(message)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "architectBootstrapAwaiting": False,
+        "architectBootstrapCount": 1,
+        "architectContactCount": 0,
+        "architectSendState": "CONFIRMED",
+        "architectResultFingerprint": "old-stop-fingerprint",
+        "consumedArchitectResponses": {"old-stop-fingerprint": {"action": "STOP", "classification": "ACCEPTED", "taskId": "NONE"}},
+        "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
+        "taskId": None,
+        "state": "IDLE",
+    })
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert len(sent) == 1
+    assert watcher.state["architectContactCount"] == 1
+    assert watcher.state["continuationSourceFingerprint"] == hashlib.sha256(substantive.encode()).hexdigest()
+    assert watcher.state["architectBootstrapCount"] == 2
+    watcher.state["state"] = "IDLE"
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert len(sent) == 1

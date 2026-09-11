@@ -1267,7 +1267,7 @@ class ArchitectPlaywright:
             return False
         try:
             return bool(evaluate("""
-            () => [...document.querySelectorAll('[data-testid="stop-button"], button[aria-label*="Stop"], [role="button"][aria-label*="Stop"]')]
+            () => [...document.querySelectorAll('[data-testid="stop-button"]')]
               .filter((button) => button.isConnected && !button.disabled)
               .some((button) => {
                 const style = getComputedStyle(button);
@@ -2052,7 +2052,7 @@ class LocalFirstOrchestrator:
             self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
             self.save()
             raise
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED"})
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectContactCount": int(self.state.get("architectContactCount", 0)) + 1})
         self.save()
         if hasattr(bridge, "assistant_baseline"):
             self.state["architectBaseline"] = bridge.assistant_baseline()
