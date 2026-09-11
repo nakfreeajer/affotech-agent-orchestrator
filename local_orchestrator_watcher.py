@@ -2870,6 +2870,13 @@ def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -
     return watcher.state.get("state") == "ARCHITECT_RUNNING"
 
 
+def run_human_required_startup_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any]) -> str:
+    """Run the production HUMAN_REQUIRED entry, including stale-format recovery."""
+    if watcher.recover_stale_format_human_required():
+        return watcher.state.get("state", "HUMAN_REQUIRED")
+    return run_executor_state_once(watcher, launch)
+
+
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     state_dir = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR") or (Path(project) / ".agent-work" / "orchestrator"))
@@ -2920,8 +2927,8 @@ def main() -> None:
                 print(f"CODEX_STARTED pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
-                state = run_executor_state_once(watcher, launch)
-                if state == "EXECUTOR_RUNNING":
+                state = run_human_required_startup_once(watcher, launch)
+                if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING"}:
                     continue
                 print("STATE=HUMAN_REQUIRED")
                 return

@@ -12,7 +12,8 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         ResultSubmissionError, atomic_write,
                                         parse_orchestrator_result, resolve_executor_worktree,
                                         run_executor_state_once, visible_executor_launcher,
-                                        WatcherInstanceLock, handle_architect_value_error)
+                                        WatcherInstanceLock, handle_architect_value_error,
+                                        run_human_required_startup_once)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -249,7 +250,7 @@ def test_stale_format_human_required_reenters_architect_without_executor_launch(
         "codexPid": None,
     })
     watcher.save()
-    assert watcher.recover_stale_format_human_required() is True
+    assert run_human_required_startup_once(watcher, lambda *_: (_ for _ in ()).throw(AssertionError("stale recovery must not launch executor"))) == "ARCHITECT_RUNNING"
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
     assert watcher.state["formatRecoveryCount"] == 0
     assert watcher.state["architectFormatRecoveryTaskId"] is None
@@ -266,7 +267,7 @@ def test_000016_startup_shape_consumes_existing_response_once(tmp_path):
     Path(watcher.state["executorResultPath"]).parent.mkdir(parents=True, exist_ok=True)
     Path(watcher.state["executorResultPath"]).write_text("000016 completed", encoding="utf-8")
     watcher.save()
-    assert watcher.recover_stale_format_human_required() is True
+    assert run_human_required_startup_once(watcher, lambda *_: (_ for _ in ()).throw(AssertionError("stale recovery must not launch executor"))) == "ARCHITECT_RUNNING"
     head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
     response = envelope("000016", prompt=configured_project_prompt(base, head, "next-000016"))
     launches = []
