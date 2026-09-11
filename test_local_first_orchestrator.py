@@ -777,3 +777,81 @@ def test_production_state_fixture_reaches_new_continuation_once(tmp_path):
     watcher.save()
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
     assert len(sent) == 1
+
+
+def test_consumed_response_recovers_newest_virtualized_architect_window(tmp_path):
+    old = envelope("old-stop", action="STOP")
+    new = "newest completed Architect response without an envelope"
+
+    class Bridge:
+        def __init__(self):
+            self.restores = 0
+            self.snapshots = 0
+            self.sent = []
+            self.live = False
+        def generation_visible(self): return False
+        def _assistant_entries(self):
+            self.snapshots += 1
+            return [{"id": "old", "text": old}] if not self.live else [{"id": "new", "text": new}]
+        def restore_live_bottom(self):
+            self.restores += 1
+            self.live = True
+            return {"before": 500, "after": 1000}
+        def submit_result_bounded(self, message): self.sent.append(message)
+
+    bridge = Bridge()
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    old_fp = hashlib.sha256(old.encode()).hexdigest()
+    watcher.state.update({
+        "state": "IDLE",
+        "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
+        "consumedArchitectResponses": {old_fp: {"action": "STOP", "classification": "ACCEPTED", "taskId": "old-stop"}},
+        "architectResultFingerprint": old_fp,
+    })
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert bridge.restores == 1 and bridge.snapshots == 2 and len(bridge.sent) == 1
+    assert watcher.state["continuationSourceFingerprint"] == hashlib.sha256(new.encode()).hexdigest()
+    assert watcher.state["architectContactCount"] == 1
+    watcher.state["state"] = "IDLE"
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert bridge.restores == 1 and len(bridge.sent) == 1
+
+
+def test_consumed_response_at_bottom_restores_once_and_restore_failure_is_safe(tmp_path):
+    old = envelope("old-stop", action="STOP")
+    old_fp = hashlib.sha256(old.encode()).hexdigest()
+
+    class Bridge:
+        def __init__(self, fail=False): self.restores = 0; self.fail = fail
+        def generation_visible(self): return False
+        def _assistant_entries(self): return [{"id": "old", "text": old}]
+        def restore_live_bottom(self):
+            self.restores += 1
+            if self.fail: raise RuntimeError("restore failed")
+            return {"before": 0, "after": 0}
+
+    for fail in (False, True):
+        bridge = Bridge(fail)
+        watcher = LocalFirstOrchestrator(str(tmp_path / str(fail)), tmp_path / ("work-" + str(fail)))
+        watcher.state.update({"state": "IDLE", "consumedArchitectResponses": {old_fp: {"action": "STOP"}}})
+        watcher.save()
+        assert watcher.inspect_idle_architect(bridge, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "DUPLICATE"
+        watcher.state["state"] = "IDLE"
+        watcher.save()
+        assert watcher.inspect_idle_architect(bridge, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "DUPLICATE"
+        assert bridge.restores == 1 and watcher.state["state"] == "IDLE"
+
+
+def test_live_generation_does_not_trigger_virtualized_bottom_recovery(tmp_path):
+    class Bridge:
+        restores = 0
+        def generation_visible(self): return True
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+        def restore_live_bottom(self): self.restores += 1
+
+    bridge = Bridge()
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert bridge.restores == 0

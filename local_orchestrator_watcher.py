@@ -2071,27 +2071,48 @@ class LocalFirstOrchestrator:
             print("IDLE_GATE=generation_visible")
             print("IDLE_DIAGNOSTIC latestResponseFound=False latestResponseId=None latestResponseFingerprint=None latestResponseHasEnvelope=False generationVisible=True architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=False continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), self.state.get("state")))
             return "ARCHITECT_RUNNING"
-        entries = bridge._assistant_entries()
-        substantive = [
-            entry for entry in entries
-            if not str(entry.get("id") or "").startswith("request-placeholder-")
-            and (entry.get("text") or "").strip().lower() != "thinking"
-        ]
-        response = substantive[-1].get("text", "") if substantive else ""
-        response_id = substantive[-1].get("id") if substantive else None
+        def latest_substantive(entries: list[dict[str, Any]]) -> tuple[str, str | None]:
+            substantive = [
+                entry for entry in entries
+                if not str(entry.get("id") or "").startswith("request-placeholder-")
+                and (entry.get("text") or "").strip().lower() != "thinking"
+            ]
+            if not substantive:
+                return "", None
+            return substantive[-1].get("text", ""), substantive[-1].get("id")
+
+        response, response_id = latest_substantive(bridge._assistant_entries())
         response_fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest() if response else None
         response_has_envelope = bool(self._architect_response_task_id(response)) if response else False
         consumed = self.state.setdefault("consumedArchitectResponses", {})
         response_consumed = bool(response_fingerprint and response_fingerprint in consumed)
         continuation_eligible = not response_has_envelope and not response_consumed and response_fingerprint != self.state.get("lastContinuationSourceFingerprint")
         if response:
-            try:
-                result = self.consume_idle_architect_response(response, launcher)
-                print("IDLE_GATE=response_already_consumed" if result == "DUPLICATE" else "IDLE_GATE=valid_envelope_processed")
-                print("IDLE_DIAGNOSTIC latestResponseFound=True latestResponseId=%s latestResponseFingerprint=%s latestResponseHasEnvelope=True generationVisible=False architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=%s continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (response_id, response_fingerprint, self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), response_consumed, self.state.get("state")))
-                return result
-            except ValueError:
-                pass
+            for attempt in range(2):
+                try:
+                    result = self.consume_idle_architect_response(response, launcher)
+                except ValueError:
+                    break
+                if result != "DUPLICATE":
+                    print("IDLE_GATE=valid_envelope_processed")
+                    print("IDLE_DIAGNOSTIC latestResponseFound=True latestResponseId=%s latestResponseFingerprint=%s latestResponseHasEnvelope=True generationVisible=False architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=%s continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (response_id, response_fingerprint, self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), response_consumed, self.state.get("state")))
+                    return result
+                if attempt or response_fingerprint == self.state.get("architectLiveBottomFingerprint"):
+                    print("IDLE_GATE=response_already_consumed")
+                    return result
+                self.state["architectLiveBottomFingerprint"] = response_fingerprint
+                self.save()
+                try:
+                    bridge.restore_live_bottom()
+                    response, response_id = latest_substantive(bridge._assistant_entries())
+                except Exception:
+                    self.save()
+                    print("IDLE_GATE=live_bottom_restore_failed")
+                    return "DUPLICATE"
+                response_fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest() if response else None
+                response_has_envelope = bool(self._architect_response_task_id(response)) if response else False
+                response_consumed = bool(response_fingerprint and response_fingerprint in consumed)
+                continuation_eligible = not response_has_envelope and not response_consumed and response_fingerprint != self.state.get("lastContinuationSourceFingerprint")
         self.state["continuationSourceFingerprint"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
         sent = self.request_architect_bootstrap(bridge)
         print("IDLE_DIAGNOSTIC latestResponseFound=%s latestResponseId=%s latestResponseFingerprint=%s latestResponseHasEnvelope=%s generationVisible=False architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=%s continuationEligible=%s requestArchitectBootstrapCalled=True requestArchitectBootstrapSent=%s resultingState=%s" % (bool(response), response_id, response_fingerprint, response_has_envelope, self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), response_consumed, continuation_eligible, sent, self.state.get("state")))
