@@ -1343,7 +1343,7 @@ class LocalWatcher:
         root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
         self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
-        self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=None)
+        self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
         if durable_decision_reader is not None:
             self.durable_decision_reader = durable_decision_reader
         else:
@@ -1932,6 +1932,8 @@ class LocalFirstOrchestrator:
         self.process_factory = process_factory
         self._live_bottom_recovery_attempted: set[str] = set()
         self.state = self._load_state()
+        self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
+        self.state.setdefault("executorSessionMode", "PERSISTENT")
 
     def _configured_fallback_project(self) -> Path | None:
         """Use a caller-provided project root, never this Orchestrator source root."""
@@ -2511,8 +2513,12 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
     """Build the existing visible Codex launch surface for one owned child."""
     def launch(prompt: str, result_path: Path) -> Any:
         target = watcher.state["targetWorktree"]
-        runner = CodexRunner(project, child_project_dir=target, session_id=None)
-        command_args = ["exec", "--ephemeral", "--sandbox", "workspace-write", "-C", target, "-o", str(result_path), "-"]
+        runner = CodexRunner(project, child_project_dir=target, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
+        if not runner.session_id:
+            raise RuntimeError("EXECUTOR_SESSION_ID_MISSING")
+        watcher.state.update({"executorSessionId": runner.session_id, "executorSessionMode": "PERSISTENT"})
+        watcher.save()
+        command_args = ["exec", "resume", runner.session_id, "-o", str(result_path), "-"]
         command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
         child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=None, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
         assert child.stdin is not None

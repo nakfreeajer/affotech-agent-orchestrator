@@ -742,7 +742,7 @@ def test_visible_launcher_uses_fresh_task_execution_and_owned_cwd(tmp_path, monk
     class FreshRunner:
         launcher = ["codex"]
         executable = "codex"
-        session_id = None
+        session_id = watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
         def __init__(self, *_args, **_kwargs): pass
         def assemble_prompt(self, prompt): return prompt
 
@@ -755,10 +755,8 @@ def test_visible_launcher_uses_fresh_task_execution_and_owned_cwd(tmp_path, monk
     result_path = tmp_path / "result.txt"
     child = visible_executor_launcher(str(tmp_path), watcher)("unchanged prompt", result_path)
     assert child.pid == 4401
-    assert "resume" not in observed["command"]
-    assert observed["command"][0:3] == ["codex", "exec", "--ephemeral"]
-    assert "workspace-write" in observed["command"]
-    assert observed["command"][observed["command"].index("-C") + 1] == str(owned)
+    assert observed["command"][0:4] == ["codex", "exec", "resume", watcher_module.AFFOTECH_EXECUTOR_SESSION_ID]
+    assert "--ephemeral" not in observed["command"]
     assert observed["cwd"] == str(owned)
     assert observed["prompt"] == b"unchanged prompt"
 
