@@ -11,7 +11,8 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         LocalWatcher,
                                         ResultSubmissionError, atomic_write,
                                         parse_orchestrator_result, resolve_executor_worktree,
-                                        visible_executor_launcher)
+                                        run_executor_state_once, visible_executor_launcher,
+                                        WatcherInstanceLock)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -995,6 +996,103 @@ def test_live_owned_child_blocks_recovery(tmp_path, monkeypatch):
     assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
     assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_CHILD_STILL_ALIVE"
     assert launches == []
+
+
+def test_production_state_cycle_dead_postlaunch_without_authorization_stops_safely(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 4410})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.delenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", raising=False)
+    launches = []
+    assert run_executor_state_once(watcher, lambda *_: launches.append(1)) == "STOP"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["executorLaunchState"] == "POSTLAUNCH_NO_RESULT"
+    assert watcher.state["automaticRetryAuthorized"] is False
+    assert launches == []
+
+
+def test_production_state_cycle_consumes_authorization_same_invocation(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 4411})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    process = type("Process", (), {"pid": 4412})()
+    assert run_executor_state_once(watcher, lambda *_: (launches.append(1), process)[1]) == "EXECUTOR_RUNNING"
+    assert watcher.state["state"] == "EXECUTOR_RUNNING"
+    assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
+    assert launches == [1]
+
+
+def test_authorized_child_failure_is_postlaunch_active_writer_without_retry(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 4413})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    process = type("Process", (), {"pid": 4414, "poll": lambda self: 17})()
+    launches = []
+    def launch(_prompt, _result):
+        launches.append(1)
+        log_path = watcher.state_dir / "executor-logs" / "retry.stderr.txt"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("thread 019f842e-98bc-7672-a619-51441d91be00 already has an active writer", encoding="utf-8")
+        watcher.state["stderrLogPath"] = str(log_path)
+        return process
+    assert run_executor_state_once(watcher, launch) == "EXECUTOR_RUNNING"
+    assert run_executor_state_once(watcher, launch) == "STOP"
+    assert watcher.state["executorFailureClass"] == "EXECUTOR_SESSION_ACTIVE_WRITER"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["automaticRetryAuthorized"] is False
+    assert launches == [1]
+
+
+def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeypatch):
+    watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": 4415})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    process = type("Process", (), {"pid": 4416, "poll": lambda self: 0})()
+    launches = []
+    def launch(_prompt, result):
+        launches.append(1)
+        Path(result).parent.mkdir(parents=True, exist_ok=True)
+        Path(result).write_text("completed report", encoding="utf-8")
+        return process
+    assert run_executor_state_once(watcher, launch) == "EXECUTOR_RUNNING"
+    assert run_executor_state_once(watcher, launch) == "RESULT_READY"
+    assert launches == [1]
+    messages = []
+    class Bridge:
+        def submit_result_bounded(self, message): messages.append(message)
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+    watcher.deliver_result(Bridge())
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert messages
+    assert watcher.accept_architect_response(envelope(task_id, action="STOP"))["action"] == "STOP"
+    assert watcher.state["state"] == "IDLE"
+    assert launches == [1]
+
+
+def test_watcher_instance_lock_is_single_owner_and_releases(tmp_path):
+    state_dir = tmp_path / "state"
+    first = WatcherInstanceLock(state_dir)
+    second = WatcherInstanceLock(state_dir)
+    first.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="ORCHESTRATOR_ALREADY_RUNNING"):
+            second.acquire()
+        assert not (state_dir / "state.json").exists()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
 
 
 def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):

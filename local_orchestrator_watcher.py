@@ -47,6 +47,54 @@ class ResultSubmissionError(RuntimeError):
         super().__init__(f"{code}{':' + detail if detail else ''}")
 
 
+class WatcherInstanceLock:
+    """Own one canonical watcher state directory for this process lifetime."""
+    def __init__(self, state_dir: str | os.PathLike[str]):
+        self.path = Path(state_dir) / "watcher-instance.lock"
+        self._handle = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        try:
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError) as error:
+            handle.close()
+            raise RuntimeError("ORCHESTRATOR_ALREADY_RUNNING") from error
+        self._handle = handle
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+
+    def __enter__(self) -> "WatcherInstanceLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.release()
+
+
 def verify_executor_session(session_id: str) -> bool:
     """Verify a persistent Codex session from Codex's read-only local index."""
     authority_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
@@ -2633,9 +2681,41 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
     return launch
 
 
+def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any]) -> str:
+    """Advance one executor/crash/human state cycle, including same-invocation authorization."""
+    state = watcher.state.get("state", "IDLE")
+    if state == "EXECUTOR_RUNNING":
+        state = watcher.wait_for_executor()
+        if state == "EXECUTOR_CRASHED":
+            watcher.state["state"] = "HUMAN_REQUIRED"
+            watcher.save()
+            print("STATE=HUMAN_REQUIRED reason=EXECUTOR_EXITED_WITHOUT_RESULT")
+        else:
+            return state
+    if watcher.state.get("state") == "HUMAN_REQUIRED":
+        recovered = watcher.recover_prelaunch_incomplete(launch)
+        if recovered is not None:
+            print(f"CODEX_STARTED pid={recovered.pid}")
+            return "EXECUTOR_RUNNING"
+        recovered = watcher.authorize_postlaunch_retry(launch)
+        if recovered is not None:
+            print(f"CODEX_STARTED pid={recovered.pid}")
+            return "EXECUTOR_RUNNING"
+        print("STATE=HUMAN_REQUIRED")
+        return "STOP"
+    return watcher.state.get("state", "IDLE")
+
+
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
-    watcher = LocalFirstOrchestrator(project, os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR"))
+    state_dir = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR") or (Path(project) / ".agent-work" / "orchestrator"))
+    instance_lock = WatcherInstanceLock(state_dir)
+    try:
+        instance_lock.acquire()
+    except RuntimeError as error:
+        print(str(error))
+        return
+    watcher = LocalFirstOrchestrator(project, state_dir)
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
     launch = visible_executor_launcher(project, watcher)
@@ -2665,17 +2745,10 @@ def main() -> None:
                     watcher.state = watcher._load_state()
                 continue
             if state == "EXECUTOR_RUNNING":
-                state = watcher.wait_for_executor()
+                state = run_executor_state_once(watcher, launch)
                 if state == "EXECUTOR_RUNNING":
                     continue
-                if state == "EXECUTOR_CRASHED":
-                    recovered = watcher.recover_prelaunch_incomplete(launch)
-                    if recovered is not None:
-                        print(f"CODEX_STARTED pid={recovered.pid}")
-                        continue
-                    watcher.state["state"] = "HUMAN_REQUIRED"
-                    watcher.save()
-                    print("STATE=HUMAN_REQUIRED reason=EXECUTOR_EXITED_WITHOUT_RESULT")
+                if state == "STOP":
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
@@ -2683,13 +2756,8 @@ def main() -> None:
                 print(f"CODEX_STARTED pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
-                recovered = watcher.recover_prelaunch_incomplete(launch)
-                if recovered is not None:
-                    print(f"CODEX_STARTED pid={recovered.pid}")
-                    continue
-                recovered = watcher.authorize_postlaunch_retry(launch)
-                if recovered is not None:
-                    print(f"CODEX_STARTED pid={recovered.pid}")
+                state = run_executor_state_once(watcher, launch)
+                if state == "EXECUTOR_RUNNING":
                     continue
                 print("STATE=HUMAN_REQUIRED")
                 return
@@ -2748,6 +2816,7 @@ def main() -> None:
     finally:
         if idle_bridge is not None:
             idle_bridge.close()
+        instance_lock.release()
 
 
 if __name__ == "__main__":
