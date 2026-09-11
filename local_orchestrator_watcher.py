@@ -1948,6 +1948,14 @@ class LocalFirstOrchestrator:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict) or not isinstance(value.get("projects"), dict):
                 raise RuntimeError("PROJECT_CONFIG_INVALID")
+            migrated = False
+            for spec in value["projects"].values():
+                if isinstance(spec, dict) and "branch" in spec:
+                    spec.setdefault("defaultBranch", spec["branch"])
+                    spec.pop("branch", None)
+                    migrated = True
+            if migrated:
+                atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
             return value
         base = Path(AFFOTECH_CHILD_PROJECT_DIR)
         if not base.is_dir():
@@ -1958,7 +1966,7 @@ class LocalFirstOrchestrator:
         repository = AFFOTECH_CHILD_REMOTE
         config = {"version": 1, "projects": {self._repository_key(repository): {
             "repository": repository,
-            "baseRepo": str(base), "branch": branch, "remote": "origin"
+            "baseRepo": str(base), "defaultBranch": branch, "remote": "origin"
         }}}
         atomic_write(path, (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8"))
         return config
@@ -1982,10 +1990,9 @@ class LocalFirstOrchestrator:
         configured_repository = str(spec.get("repository", ""))
         if self._repository_key(configured_repository) != key:
             raise RuntimeError("PROJECT_CONFIG_REPOSITORY_MISMATCH")
-        requested_branch = (BRANCH_RE.search(prompt).group(1).strip() if BRANCH_RE.search(prompt) else None)
-        if requested_branch and requested_branch != str(spec.get("branch", "")):
-            raise RuntimeError("EXECUTOR_BRANCH_AUTHORITY_MISMATCH")
-        return {**spec, "key": key, "repository": configured_repository, "branch": requested_branch or spec.get("branch")}
+        branch_match = BRANCH_RE.search(prompt)
+        requested_branch = branch_match.group(1).strip() if branch_match else None
+        return {**spec, "key": key, "repository": configured_repository, "branch": requested_branch or spec.get("defaultBranch")}
 
     @staticmethod
     def _git(repo: Path, *args: str) -> str:
@@ -2002,7 +2009,9 @@ class LocalFirstOrchestrator:
         if not base.is_dir() or self._repository_key(self._git(base, "config", "--get", f"remote.{spec.get('remote', 'origin')}.url")) != self._repository_key(str(spec["repository"])):
             raise RuntimeError("PROJECT_BASE_REPOSITORY_INVALID")
         remote = str(spec.get("remote", "origin"))
-        branch = str(spec["branch"])
+        branch = str(spec.get("branch") or "")
+        if not branch:
+            raise RuntimeError("EXECUTOR_BRANCH_MISSING")
         try:
             subprocess.run(["git", "-C", str(base), "fetch", "--quiet", remote, branch], check=True, capture_output=True, text=True)
         except (OSError, subprocess.CalledProcessError) as error:

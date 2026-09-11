@@ -649,6 +649,45 @@ def test_source_authority_advancement_fails_closed(tmp_path):
     assert not (watcher.state_dir / "worktrees" / "authority-task").exists()
 
 
+def test_explicit_architect_branch_ignores_incidental_base_checkout_branch(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    subprocess.run(["git", "-C", str(base), "checkout", "-b", "some-other-local-branch"], check=True, capture_output=True)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    response = envelope("explicit-branch-task", prompt=configured_project_prompt(base, head, "explicit-branch-task"))
+    process = type("Process", (), {"pid": 4301})()
+    assert watcher.consume_idle_architect_response(response, lambda *_: process) == "EXECUTE"
+    assert subprocess.check_output(["git", "-C", str(base), "branch", "--show-current"], text=True).strip() == "some-other-local-branch"
+    assert watcher.state["taskWorktrees"]["explicit-branch-task"]["branch"] == "hybrid-v2"
+
+
+def test_legacy_project_config_branch_is_migrated_without_blocking_explicit_branch(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    config["projects"]["sample-project"]["branch"] = "some-other-local-branch"
+    config["projects"]["sample-project"].pop("defaultBranch", None)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    response = envelope("legacy-config-task", prompt=configured_project_prompt(base, head, "legacy-config-task"))
+    process = type("Process", (), {"pid": 4302})()
+    assert watcher.consume_idle_architect_response(response, lambda *_: process) == "EXECUTE"
+    migrated = json.loads((watcher.state_dir / "project-config.json").read_text(encoding="utf-8"))
+    spec = migrated["projects"]["sample-project"]
+    assert "branch" not in spec and spec["defaultBranch"] == "some-other-local-branch"
+    assert watcher.state["taskWorktrees"]["legacy-config-task"]["branch"] == "hybrid-v2"
+
+
+def test_requested_remote_branch_must_exist(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    watcher = LocalFirstOrchestrator(str(tmp_path / "orchestrator"), tmp_path / "orchestrator" / "state")
+    write_project_config(watcher, config)
+    prompt = "repository=sample-project.git\nbranch=does-not-exist\nbounded task"
+    with pytest.raises(RuntimeError, match="EXECUTOR_SOURCE_FETCH_FAILED"):
+        watcher.consume_idle_architect_response(envelope("missing-branch-task", prompt=prompt), lambda *_: (_ for _ in ()).throw(AssertionError("must not launch")))
+    assert not (watcher.state_dir / "worktrees" / "missing-branch-task").exists()
+
+
 def test_worktree_path_owned_by_another_task_is_not_reused(tmp_path):
     base, config, head = configured_git_project(tmp_path)
     root = tmp_path / "orchestrator"
