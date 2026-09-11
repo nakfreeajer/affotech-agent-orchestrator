@@ -1,0 +1,1 @@
+{"case":"clean-restart","shutdownMarker":{"previousBootId":"boot-previous","clean":true},"expected":"RECOVERED_SAFE_TO_CONTINUE"}

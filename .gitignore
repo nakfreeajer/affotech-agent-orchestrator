@@ -1,0 +1,11 @@
+node_modules/
+.DS_Store
+
+# Local runtime, credentials/session-adjacent state, and generated artifacts.
+.agent-work/
+.codex-log/
+.codex-log-current/
+__pycache__/
+*.py[cod]
+orchestrator-state.json*
+local_orchestrator_watcher.py.before-win-pid-fix

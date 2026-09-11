@@ -1,0 +1,1 @@
+{"case":"stale-worker-fence","workerEpoch":1,"authoritativeEpoch":2,"expected":"CIRCUIT_OPEN"}
