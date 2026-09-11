@@ -30,6 +30,35 @@ def ready(tmp_path):
     return watcher
 
 
+def configured_git_project(tmp_path):
+    bare = tmp_path / "sample-project.git"
+    base = tmp_path / "base"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(bare), str(base)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(base), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(base), "config", "user.name", "Orchestrator Test"], check=True)
+    (base / "README.md").write_text("authority\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(base), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(base), "commit", "-m", "authority"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(base), "branch", "-M", "hybrid-v2"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(base), "push", "-u", "origin", "hybrid-v2"], check=True, capture_output=True)
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    return base, {"version": 1, "projects": {"sample-project": {
+        "repository": "sample-project.git", "baseRepo": str(base), "branch": "hybrid-v2", "remote": "origin"
+    }}}, head
+
+
+def configured_project_prompt(base, head, task_id="owned-task"):
+    return (f"repository=sample-project.git\nbranch=hybrid-v2\n"
+            f"currentBranchHeadAtArchitectDecision={head}\n"
+            f"bounded task in {task_id}")
+
+
+def write_project_config(watcher, config):
+    watcher.state_dir.mkdir(parents=True, exist_ok=True)
+    (watcher.state_dir / "project-config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 def test_alive_recovery_never_contacts_architect(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": __import__("os").getpid()})
@@ -556,6 +585,80 @@ def test_fresh_execute_is_consumed_only_after_child_launch(tmp_path):
     assert watcher.state["consumedArchitectResponses"][fingerprint] == {
         "taskId": "normal-task", "classification": "ACCEPTED", "action": "EXECUTE", "state": "LAUNCHED"
     }
+
+
+def test_project_execute_creates_owned_worktree_and_child_uses_it(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    watcher = LocalFirstOrchestrator(str(tmp_path / "orchestrator"), tmp_path / "orchestrator" / "state")
+    write_project_config(watcher, config)
+    task_id = "owned-task"
+    response = envelope(task_id, prompt=configured_project_prompt(base, head, task_id))
+    observed = []
+    process = type("Process", (), {"pid": 4201})()
+    assert watcher.consume_idle_architect_response(response, lambda prompt, result: (observed.append(watcher.state["targetWorktree"]), process)[1]) == "EXECUTE"
+    owned = Path(watcher.state["targetWorktree"])
+    assert owned.is_dir() and owned != base and owned != watcher.project_dir
+    assert observed == [str(owned)]
+    assert watcher.state["taskWorktrees"][task_id]["worktreePath"] == str(owned)
+    assert watcher.state["taskWorktrees"][task_id]["baseCommit"] == head
+    assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
+
+
+def test_owned_worktree_restart_recovery_and_duplicate_are_singleton(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    response = envelope("restart-task", prompt=configured_project_prompt(base, head, "restart-task"))
+    process = type("Process", (), {"pid": 4202})()
+    launches = []
+    watcher.consume_idle_architect_response(response, lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1])
+    owned = launches[0]
+    restarted = LocalFirstOrchestrator(str(root), root / "state")
+    assert restarted.state["taskWorktrees"]["restart-task"]["worktreePath"] == owned
+    assert restarted.consume_idle_architect_response(response, lambda *_: launches.append("duplicate")) == "DUPLICATE"
+    assert launches == [owned]
+    assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
+
+
+def test_prelaunch_incomplete_project_task_reuses_one_owned_worktree(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    task_id = "PUB-7c6f3f3c8b9b46f88b8e2c3d91d7a5e2"
+    response = envelope(task_id, prompt=configured_project_prompt(base, head, task_id))
+    fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    watcher.state.update({"state": "IDLE", "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96", "codexPid": None, "executorResultPath": None, "consumedArchitectResponses": {fingerprint: {"taskId": task_id, "action": "EXECUTE", "state": "RECEIVED"}}})
+    watcher.save()
+    launches = []
+    process = type("Process", (), {"pid": 4203})()
+    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1]) == "EXECUTE"
+    assert len(launches) == 1
+    assert watcher.state["prelaunchRecoveryState"] == "PRELAUNCH_INCOMPLETE"
+    assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
+
+
+def test_source_authority_advancement_fails_closed(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    watcher = LocalFirstOrchestrator(str(tmp_path / "orchestrator"), tmp_path / "orchestrator" / "state")
+    write_project_config(watcher, config)
+    response = envelope("authority-task", prompt=configured_project_prompt(base, "0" * 40, "authority-task"))
+    with pytest.raises(RuntimeError, match="EXECUTOR_SOURCE_AUTHORITY_ADVANCED"):
+        watcher.consume_idle_architect_response(response, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch")))
+    assert not (watcher.state_dir / "worktrees" / "authority-task").exists()
+
+
+def test_worktree_path_owned_by_another_task_is_not_reused(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    conflict = watcher.state_dir / "worktrees" / "conflict-task"
+    conflict.mkdir(parents=True)
+    response = envelope("conflict-task", prompt=configured_project_prompt(base, head, "conflict-task"))
+    with pytest.raises(RuntimeError, match="EXECUTOR_WORKTREE_OWNERSHIP_CONFLICT"):
+        watcher.consume_idle_architect_response(response, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch")))
 
 
 def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):

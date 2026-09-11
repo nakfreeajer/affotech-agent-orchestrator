@@ -1867,6 +1867,9 @@ ORCHESTRATOR_RESULT_RE = re.compile(
     r"</ORCHESTRATOR_RESULT>\s*$",
     re.S,
 )
+PROJECT_RE = re.compile(r"(?im)^\s*repository\s*=\s*(.+?)\s*$")
+BRANCH_RE = re.compile(r"(?im)^\s*branch\s*=\s*(.+?)\s*$")
+AUTHORITY_HEAD_RE = re.compile(r"(?im)^\s*currentBranchHeadAtArchitectDecision\s*=\s*([0-9a-f]{40})\s*$")
 
 
 def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
@@ -1935,6 +1938,103 @@ class LocalFirstOrchestrator:
         if self.project_dir.resolve() == Path(__file__).resolve().parent:
             return None
         return self.project_dir
+
+    def _project_config_path(self) -> Path:
+        return self.state_dir / "project-config.json"
+
+    def _project_config(self) -> dict[str, Any]:
+        path = self._project_config_path()
+        if path.exists():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or not isinstance(value.get("projects"), dict):
+                raise RuntimeError("PROJECT_CONFIG_INVALID")
+            return value
+        base = Path(AFFOTECH_CHILD_PROJECT_DIR)
+        if not base.is_dir():
+            raise RuntimeError("PROJECT_CONFIG_MISSING")
+        branch = self._git(base, "branch", "--show-current")
+        if not branch:
+            raise RuntimeError("PROJECT_CONFIG_BRANCH_MISSING")
+        repository = AFFOTECH_CHILD_REMOTE
+        config = {"version": 1, "projects": {self._repository_key(repository): {
+            "repository": repository,
+            "baseRepo": str(base), "branch": branch, "remote": "origin"
+        }}}
+        atomic_write(path, (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        return config
+
+    @staticmethod
+    def _repository_key(value: str) -> str:
+        key = re.split(r"[/\\]", value.rstrip("/\\"))[-1]
+        return key[:-4] if key.lower().endswith(".git") else key
+
+    def _project_spec(self, prompt: str) -> dict[str, Any] | None:
+        project_match = PROJECT_RE.search(prompt)
+        if not project_match:
+            return None
+        requested_repository = project_match.group(1).strip().strip("`")
+        config = self._project_config()
+        projects = config["projects"]
+        key = self._repository_key(requested_repository)
+        spec = projects.get(key)
+        if not isinstance(spec, dict):
+            raise RuntimeError(f"PROJECT_CONFIG_UNKNOWN:{requested_repository}")
+        configured_repository = str(spec.get("repository", ""))
+        if self._repository_key(configured_repository) != key:
+            raise RuntimeError("PROJECT_CONFIG_REPOSITORY_MISMATCH")
+        requested_branch = (BRANCH_RE.search(prompt).group(1).strip() if BRANCH_RE.search(prompt) else None)
+        if requested_branch and requested_branch != str(spec.get("branch", "")):
+            raise RuntimeError("EXECUTOR_BRANCH_AUTHORITY_MISMATCH")
+        return {**spec, "key": key, "repository": configured_repository, "branch": requested_branch or spec.get("branch")}
+
+    @staticmethod
+    def _git(repo: Path, *args: str) -> str:
+        try:
+            return subprocess.check_output(["git", "-C", str(repo), *args], text=True, encoding="utf-8", errors="strict").strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"GIT_COMMAND_FAILED:{' '.join(args)}") from error
+
+    def _owned_task_worktree(self, task_id: str, prompt: str) -> Path | None:
+        spec = self._project_spec(prompt)
+        if spec is None:
+            return None
+        base = Path(str(spec.get("baseRepo", ""))).resolve()
+        if not base.is_dir() or self._repository_key(self._git(base, "config", "--get", f"remote.{spec.get('remote', 'origin')}.url")) != self._repository_key(str(spec["repository"])):
+            raise RuntimeError("PROJECT_BASE_REPOSITORY_INVALID")
+        remote = str(spec.get("remote", "origin"))
+        branch = str(spec["branch"])
+        try:
+            subprocess.run(["git", "-C", str(base), "fetch", "--quiet", remote, branch], check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError("EXECUTOR_SOURCE_FETCH_FAILED") from error
+        remote_ref = f"refs/remotes/{remote}/{branch}"
+        base_commit = self._git(base, "rev-parse", remote_ref)
+        expected_head = AUTHORITY_HEAD_RE.search(prompt)
+        if expected_head and base_commit.lower() != expected_head.group(1).lower():
+            raise RuntimeError("EXECUTOR_SOURCE_AUTHORITY_ADVANCED")
+        root = (self.state_dir / "worktrees").resolve()
+        path = (root / task_id).resolve()
+        ownership = self.state.setdefault("taskWorktrees", {})
+        existing = ownership.get(task_id)
+        if existing:
+            if Path(str(existing.get("worktreePath", ""))).resolve() != path or existing.get("baseRepo") != str(base):
+                raise RuntimeError("EXECUTOR_WORKTREE_OWNERSHIP_MISMATCH")
+            if not path.is_dir() or self._git(path, "rev-parse", "--show-toplevel") != str(path):
+                raise RuntimeError("EXECUTOR_WORKTREE_INVALID")
+            if self._git(path, "rev-parse", "HEAD") != base_commit:
+                raise RuntimeError("EXECUTOR_WORKTREE_SOURCE_MISMATCH")
+            return path
+        if path.exists():
+            raise RuntimeError("EXECUTOR_WORKTREE_OWNERSHIP_CONFLICT")
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(["git", "-C", str(base), "worktree", "add", "--detach", str(path), base_commit], check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError("EXECUTOR_WORKTREE_CREATE_FAILED") from error
+        ownership[task_id] = {"taskId": task_id, "project": spec["key"], "baseRepo": str(base), "branch": branch, "baseCommit": base_commit, "worktreePath": str(path)}
+        self.state.update({"taskWorktree": ownership[task_id], "targetProject": str(path), "targetRepo": str(path), "targetWorktree": str(path)})
+        self.save()
+        return path
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -2012,7 +2112,8 @@ class LocalFirstOrchestrator:
             raise ValueError("ARCHITECT_ENVELOPE_INVALID")
         decision = parse_orchestrator_result(response, task_id)
         if decision["action"] == "EXECUTE":
-            target = resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
+            owned_worktree = self._owned_task_worktree(task_id, decision["prompt"])
+            target = str(owned_worktree) if owned_worktree else resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
             canonical = self.prompts_dir / f"{task_id}.txt"
             if canonical.exists() and not (self.state.get("state") == "NEXT_PROMPT_READY" and self.state.get("nextTaskId") == task_id):
                 raise RuntimeError("ARCHITECT_TASK_ALREADY_CANONICAL")
@@ -2189,7 +2290,9 @@ class LocalFirstOrchestrator:
             return self.state.get("state", "IDLE")
         pending_prompt = self.state.get("nextPromptPath")
         if isinstance(pending_prompt, str) and Path(pending_prompt).is_file():
-            target = resolve_executor_worktree(Path(pending_prompt).read_text(encoding="utf-8"), self.project_dir)
+            task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
+            owned = self.state.get("taskWorktrees", {}).get(task_id)
+            target = str(owned["worktreePath"]) if isinstance(owned, dict) and owned.get("worktreePath") else resolve_executor_worktree(Path(pending_prompt).read_text(encoding="utf-8"), self._configured_fallback_project())
             self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
         pid = self.state.get("codexPid")
         if LocalWatcher.process_alive(pid):
@@ -2220,7 +2323,8 @@ class LocalFirstOrchestrator:
         return self.state.get("state", "IDLE")
 
     def mark_executor_started(self, task_id: str, pid: int, result_path: str | os.PathLike[str]) -> None:
-        self.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": str(self.project_dir), "executorResultPath": str(result_path)})
+        target = self.state.get("targetWorktree") or self.state.get("targetProject")
+        self.state.update({"state": "EXECUTOR_RUNNING", "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": target, "executorResultPath": str(result_path)})
         self.save()
 
     def mark_executor_exit(self, exit_code: int, result_path: str | os.PathLike[str]) -> str:
@@ -2303,7 +2407,9 @@ class LocalFirstOrchestrator:
             return None
         prompt_path = Path(self.state["nextPromptPath"])
         prompt = prompt_path.read_text(encoding="utf-8")
-        target = resolve_executor_worktree(prompt, self._configured_fallback_project())
+        task_id = str(self.state.get("nextTaskId") or self.state.get("taskId") or "")
+        owned = self.state.get("taskWorktrees", {}).get(task_id)
+        target = str(owned["worktreePath"]) if isinstance(owned, dict) and owned.get("worktreePath") else resolve_executor_worktree(prompt, self._configured_fallback_project())
         self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
         self.save()
         process = launcher(prompt, self._result_path(str(self.state["nextTaskId"])))
