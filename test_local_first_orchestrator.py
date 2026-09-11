@@ -256,6 +256,26 @@ def test_stale_format_human_required_reenters_architect_without_executor_launch(
     assert watcher.state["executorResultPath"]
 
 
+def test_000016_startup_shape_consumes_existing_response_once(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "taskId": "000016", "architectSendState": "CONFIRMED",
+        "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
+        "formatRecoveryExhausted": True, "humanRequiredReason": "", "codexPid": None,
+    })
+    Path(watcher.state["executorResultPath"]).parent.mkdir(parents=True, exist_ok=True)
+    Path(watcher.state["executorResultPath"]).write_text("000016 completed", encoding="utf-8")
+    watcher.save()
+    assert watcher.recover_stale_format_human_required() is True
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    response = envelope("000016", prompt=configured_project_prompt(base, head, "next-000016"))
+    launches = []
+    process = type("Process", (), {"pid": 17016})()
+    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
+    assert launches == [1]
+    assert watcher.state["state"] == "EXECUTOR_RUNNING"
+
+
 def test_format_recovery_response_uses_strict_same_task_parser():
     parsed = parse_orchestrator_result(envelope("task-1", prompt="next"), "task-1")
     assert parsed == {"classification": "ACCEPTED", "action": "EXECUTE", "taskId": "task-1", "prompt": "next"}
