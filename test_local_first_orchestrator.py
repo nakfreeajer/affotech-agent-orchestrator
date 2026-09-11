@@ -60,6 +60,29 @@ def write_project_config(watcher, config):
     (watcher.state_dir / "project-config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def recovery_fixture(tmp_path):
+    base, config, head = configured_git_project(tmp_path)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    task_id = "recovery-safety-task"
+    prompt = configured_project_prompt(base, head, task_id)
+    response = envelope(task_id, prompt=prompt)
+    fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    worktree = watcher._owned_task_worktree(task_id, prompt)
+    prompt_path = watcher.prompts_dir / f"{task_id}.txt"
+    atomic_write(prompt_path, prompt.encode("utf-8"))
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "taskId": task_id, "nextTaskId": task_id,
+        "nextPromptPath": str(prompt_path), "targetWorktree": str(worktree),
+        "codexPid": 12724, "executorResultPath": str(tmp_path / "missing-result"),
+        "lastCompletedTaskId": "completed-task", "architectResultFingerprint": fingerprint,
+        "consumedArchitectResponses": {fingerprint: {"taskId": task_id, "action": "EXECUTE", "state": "RECEIVED"}},
+    })
+    watcher.save()
+    return watcher, base, worktree
+
+
 def test_alive_recovery_never_contacts_architect(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": __import__("os").getpid()})
@@ -779,6 +802,76 @@ def test_prelaunch_recovery_reuses_owned_worktree_without_new_architect_decision
     assert watcher.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
     assert watcher.state["taskWorktrees"][task_id]["worktreePath"] == str(worktree)
     assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
+
+
+def test_dirty_tracked_worktree_blocks_recovery_without_cleanup(tmp_path, monkeypatch):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    (worktree / "README.md").write_text("partial work\n", encoding="utf-8")
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_WORKTREE_DIRTY"
+    assert watcher.state["state"] == "HUMAN_REQUIRED" and launches == []
+    assert (worktree / "README.md").read_text(encoding="utf-8") == "partial work\n"
+
+
+def test_untracked_worktree_file_blocks_recovery_without_cleanup(tmp_path, monkeypatch):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    marker = worktree / "partial-untracked.txt"
+    marker.write_text("partial\n", encoding="utf-8")
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_WORKTREE_DIRTY"
+    assert marker.exists() and launches == []
+
+
+def test_changed_worktree_head_blocks_recovery(tmp_path, monkeypatch):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    subprocess.run(["git", "-C", str(worktree), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "config", "user.name", "Orchestrator Test"], check=True)
+    (worktree / "README.md").write_text("committed partial\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(worktree), "commit", "-m", "partial"], check=True, capture_output=True)
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_WORKTREE_HEAD_CHANGED"
+    assert launches == []
+
+
+def test_remote_advance_blocks_recovery(tmp_path, monkeypatch):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    (base / "README.md").write_text("remote advanced\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(base), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(base), "commit", "-m", "advance"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(base), "push", "origin", "hybrid-v2"], check=True, capture_output=True)
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_SOURCE_ADVANCED"
+    assert launches == []
+
+
+def test_existing_nonempty_result_blocks_recovery(tmp_path, monkeypatch):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    result_path = Path(watcher.state["executorResultPath"])
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text("terminal result\n", encoding="utf-8")
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_RESULT_ALREADY_EXISTS"
+    assert result_path.read_text(encoding="utf-8") == "terminal result\n" and launches == []
+
+
+def test_live_owned_child_blocks_recovery(tmp_path, monkeypatch):
+    watcher, base, worktree = recovery_fixture(tmp_path)
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    launches = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: launches.append(1)) is None
+    assert watcher.state["prelaunchRecoveryError"] == "RECOVERY_CHILD_STILL_ALIVE"
+    assert launches == []
 
 
 def test_launch_next_uses_resolved_worktree_and_records_owned_pid(tmp_path):

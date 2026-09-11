@@ -2114,13 +2114,15 @@ class LocalFirstOrchestrator:
             recoverable = existing.get("action") == "EXECUTE" and existing.get("state") != "LAUNCHED" and task_id and self._prelaunch_incomplete(task_id)
             if not recoverable:
                 return "DUPLICATE"
-            consumed.pop(existing_fingerprint, None)
-            self.state["prelaunchRecoveryState"] = "PRELAUNCH_INCOMPLETE"
-            self.save()
         if not task_id:
             raise ValueError("ARCHITECT_ENVELOPE_INVALID")
         decision = parse_orchestrator_result(response, task_id)
         if decision["action"] == "EXECUTE":
+            if existing_fingerprint:
+                self._validate_prelaunch_recovery(task_id, decision["prompt"])
+                consumed.pop(existing_fingerprint, None)
+                self.state["prelaunchRecoveryState"] = "PRELAUNCH_INCOMPLETE"
+                self.save()
             owned_worktree = self._owned_task_worktree(task_id, decision["prompt"])
             target = str(owned_worktree) if owned_worktree else resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
             canonical = self.prompts_dir / f"{task_id}.txt"
@@ -2152,13 +2154,44 @@ class LocalFirstOrchestrator:
             except (TypeError, ValueError):
                 return False
         result_path = self.state.get("executorResultPath")
-        result_exists = isinstance(result_path, str) and Path(result_path).is_file()
+        result_exists = isinstance(result_path, str) and Path(result_path).is_file() and Path(result_path).read_text(encoding="utf-8", errors="replace").strip()
         return not result_exists
+
+    def _validate_prelaunch_recovery(self, task_id: str, prompt: str) -> Path | None:
+        """Require unchanged task inputs before any same-task automatic relaunch."""
+        result_path = self.state.get("executorResultPath")
+        if isinstance(result_path, str) and Path(result_path).is_file() and Path(result_path).read_text(encoding="utf-8", errors="replace").strip():
+            raise RuntimeError("RECOVERY_RESULT_ALREADY_EXISTS")
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        if active_pid and LocalWatcher.process_alive(int(active_pid)):
+            raise RuntimeError("RECOVERY_CHILD_STILL_ALIVE")
+        record = self.state.get("taskWorktrees", {}).get(task_id)
+        if not isinstance(record, dict):
+            return None
+        expected_head = str(record.get("baseCommit", ""))
+        persisted_path = Path(str(record.get("worktreePath", ""))).resolve()
+        if not persisted_path.is_dir():
+            raise RuntimeError("RECOVERY_WORKTREE_MISSING")
+        if self._git(persisted_path, "rev-parse", "HEAD").lower() != expected_head.lower():
+            raise RuntimeError("RECOVERY_WORKTREE_HEAD_CHANGED")
+        if self._git(persisted_path, "status", "--porcelain"):
+            raise RuntimeError("RECOVERY_WORKTREE_DIRTY")
+        try:
+            owned = self._owned_task_worktree(task_id, prompt)
+        except RuntimeError as error:
+            if "AUTHORITY_ADVANCED" in str(error) or "SOURCE_MISMATCH" in str(error):
+                raise RuntimeError("RECOVERY_SOURCE_ADVANCED") from error
+            raise
+        if self._git(owned, "rev-parse", "HEAD").lower() != expected_head.lower():
+            raise RuntimeError("RECOVERY_WORKTREE_HEAD_CHANGED")
+        if self._git(owned, "status", "--porcelain"):
+            raise RuntimeError("RECOVERY_WORKTREE_DIRTY")
+        return owned
 
     def recover_prelaunch_incomplete(self, launcher: Callable[[str, Path], Any]) -> Any | None:
         """Recover one safely verified EXECUTE that died before producing a result."""
         task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
-        if not task_id or not self._prelaunch_incomplete(task_id):
+        if not task_id or task_id == self.state.get("lastCompletedTaskId"):
             return None
         prompt_path = self.state.get("nextPromptPath")
         if not isinstance(prompt_path, str) or not Path(prompt_path).is_file():
@@ -2167,7 +2200,7 @@ class LocalFirstOrchestrator:
             return None
         try:
             prompt = Path(prompt_path).read_text(encoding="utf-8")
-            owned = self._owned_task_worktree(task_id, prompt)
+            owned = self._validate_prelaunch_recovery(task_id, prompt)
             if owned is None:
                 raise RuntimeError("PRELAUNCH_WORKTREE_NOT_OWNED")
             self.state.update({"state": "NEXT_PROMPT_READY", "taskId": task_id, "nextTaskId": task_id, "targetProject": str(owned), "targetRepo": str(owned), "targetWorktree": str(owned), "prelaunchRecoveryState": "PRELAUNCH_INCOMPLETE"})
