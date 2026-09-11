@@ -1266,7 +1266,15 @@ class ArchitectPlaywright:
         if evaluate is None:
             return False
         try:
-            return bool(evaluate("""() => [...document.querySelectorAll('button,[role="button"]')].some((button) => /stop/i.test(button.innerText || button.getAttribute('aria-label') || ''))"""))
+            return bool(evaluate("""
+            () => [...document.querySelectorAll('[data-testid="stop-button"], button[aria-label*="Stop"], [role="button"][aria-label*="Stop"]')]
+              .filter((button) => button.isConnected && !button.disabled)
+              .some((button) => {
+                const style = getComputedStyle(button);
+                const rect = button.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              })
+            """))
         except Exception:
             return False
 
@@ -2058,7 +2066,12 @@ class LocalFirstOrchestrator:
             self.save()
             return "ARCHITECT_RUNNING"
         entries = bridge._assistant_entries()
-        response = entries[-1].get("text", "") if entries else ""
+        substantive = [
+            entry for entry in entries
+            if not str(entry.get("id") or "").startswith("request-placeholder-")
+            and (entry.get("text") or "").strip().lower() != "thinking"
+        ]
+        response = substantive[-1].get("text", "") if substantive else ""
         if response:
             try:
                 return self.consume_idle_architect_response(response, launcher)

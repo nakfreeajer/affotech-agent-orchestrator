@@ -1,4 +1,5 @@
 import json
+import hashlib
 import inspect
 import subprocess
 import time
@@ -712,3 +713,28 @@ def test_real_playwright_boundary_idle_reads_are_passive(tmp_path):
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
     assert len(page.operations) == 4
     assert all("bring_to_front" not in operation for operation in page.operations)
+
+
+def test_stale_thinking_placeholder_does_not_block_substantive_continuation(tmp_path):
+    substantive = "latest completed Architect response without envelope"
+
+    class Page:
+        def evaluate(self, script):
+            if 'data-message-author-role="assistant"' in script:
+                return [
+                    {"id": "architect-response-1", "text": substantive},
+                    {"id": "request-placeholder-1", "text": "Thinking"},
+                ]
+            return False
+
+    bridge = ArchitectPlaywright(Page())
+    sent = []
+    bridge.submit_result_bounded = lambda message: sent.append(message)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert len(sent) == 1
+    assert watcher.state["continuationSourceFingerprint"] == hashlib.sha256(substantive.encode()).hexdigest()
+    watcher.state["state"] = "IDLE"
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert len(sent) == 1

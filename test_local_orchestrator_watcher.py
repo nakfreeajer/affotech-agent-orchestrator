@@ -1601,6 +1601,31 @@ def test_steady_state_call_graph_has_no_locator_count_path():
     assert ".locator(" not in wait_source
 
 
+def test_generation_gate_ignores_historical_thinking_placeholder():
+    from local_orchestrator_watcher import ArchitectPlaywright
+    seen = []
+
+    class Page:
+        def evaluate(self, script):
+            seen.append(script)
+            return False
+
+    assert ArchitectPlaywright(Page()).generation_visible() is False
+    assert 'data-testid="stop-button"' in seen[0]
+    assert "data-message-author-role" not in seen[0]
+
+
+def test_generation_gate_accepts_live_visible_stop_control():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    class Page:
+        def evaluate(self, script):
+            assert "getBoundingClientRect" in script
+            return True
+
+    assert ArchitectPlaywright(Page()).generation_visible() is True
+
+
 def test_startup_scan_does_not_hide_pending_block_behind_newer_non_executor_response(tmp_path):
     from local_orchestrator_watcher import ArchitectPlaywright
     class Message:
