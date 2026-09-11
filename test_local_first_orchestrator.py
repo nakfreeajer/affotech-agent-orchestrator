@@ -177,11 +177,34 @@ def test_invalid_architect_envelope_gets_one_same_task_format_recovery(tmp_path)
 
 def test_format_recovery_is_not_repeated_and_falls_back_to_human(tmp_path):
     watcher = ready(tmp_path)
-    watcher.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1})
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": "task-1"})
     bridge = RecoveryBridge()
     watcher.request_format_recovery(bridge)
     assert bridge.messages == []
     assert watcher.state["state"] == "HUMAN_REQUIRED"
+
+
+def test_format_recovery_is_scoped_to_current_task(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "task-B", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": "task-A", "formatRecoveryExhausted": True})
+    bridge = RecoveryBridge()
+    watcher.request_format_recovery(bridge)
+    assert len(bridge.messages) == 1
+    assert watcher.state["architectFormatRecoveryTaskId"] == "task-B"
+    assert watcher.state["formatRecoveryCount"] == 1
+    assert watcher.state["formatRecoveryExhausted"] is False
+
+
+def test_successful_executor_result_clears_stale_failure_state(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    report = tmp_path / "report.txt"
+    report.write_text("completed", encoding="utf-8")
+    watcher.state.update({"taskId": "task-C", "executorFailureClass": "POSTLAUNCH_NO_RESULT", "executorProcessState": "EXITED_WITHOUT_RESULT", "executorCrash": {"old": True}})
+    assert watcher.mark_executor_exit(0, report) == "RESULT_READY"
+    assert watcher.state["lastCompletedTaskId"] == "task-C"
+    assert watcher.state["executorProcessState"] == "COMPLETED_WITH_RESULT"
+    assert watcher.state["executorFailureClass"] is None
+    assert watcher.state["executorCrash"] is None
 
 
 def test_format_recovery_response_uses_strict_same_task_parser():

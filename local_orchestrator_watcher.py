@@ -2169,6 +2169,26 @@ class LocalFirstOrchestrator:
     def _result_path(self, task_id: str) -> Path:
         return self.results_dir / f"{task_id}.txt"
 
+    def _reset_format_recovery_for_task(self, task_id: str) -> None:
+        if self.state.get("architectFormatRecoveryTaskId") != task_id:
+            self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
+
+    def _record_executor_success(self, task_id: str, result: Path, exit_code: int | None = None) -> None:
+        self.state.update({
+            "state": "RESULT_READY",
+            "taskId": task_id,
+            "lastCompletedTaskId": task_id,
+            "executorResultPath": str(result),
+            "executorExitCode": exit_code,
+            "executorProcessState": "COMPLETED_WITH_RESULT",
+            "executorFailureClass": None,
+            "executorCrash": None,
+            "repositoryEvidence": repository_evidence(self.project_dir),
+            "formatRecoveryCount": 0,
+            "formatRecoveryExhausted": False,
+            "architectFormatRecoveryTaskId": None,
+        })
+
     def intake_inbox(self, launcher: Callable[[str, Path], Any]) -> bool:
         """Consume and launch one approved local prompt while IDLE."""
         if self.state.get("state") != "IDLE":
@@ -2226,6 +2246,7 @@ class LocalFirstOrchestrator:
         if not task_id:
             raise ValueError("ARCHITECT_ENVELOPE_INVALID")
         decision = parse_orchestrator_result(response, task_id)
+        self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
         if decision["action"] == "EXECUTE":
             if existing_fingerprint:
                 self._validate_prelaunch_recovery(task_id, decision["prompt"])
@@ -2538,7 +2559,8 @@ class LocalFirstOrchestrator:
             return "EXECUTOR_RUNNING"
         path = self.state.get("executorResultPath")
         if isinstance(path, str) and Path(path).is_file() and Path(path).read_text(encoding="utf-8", errors="replace").strip():
-            self.state["state"] = "RESULT_READY"
+            task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
+            self._record_executor_success(task_id, Path(path), self.state.get("executorExitCode"))
         else:
             result_exists = bool(isinstance(path, str) and Path(path).is_file())
             process = getattr(self, "_active_process", None)
@@ -2597,7 +2619,7 @@ class LocalFirstOrchestrator:
         target = self.state.get("targetWorktree") or self.state.get("targetProject")
         attempt = int(self.state.get("executorAttemptNumber", 0)) + 1
         log_path = self.state.get("stderrLogPath") or str(self.state_dir / "executor-logs" / f"{task_id}-attempt-{attempt}.stderr.txt")
-        self.state.update({"state": "EXECUTOR_RUNNING", "executorLaunchState": "LAUNCHED", "automaticRetryAuthorized": False, "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "executorAttemptNumber": attempt, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": target, "executorResultPath": str(result_path), "stderrLogPath": str(log_path)})
+        self.state.update({"state": "EXECUTOR_RUNNING", "executorLaunchState": "LAUNCHED", "automaticRetryAuthorized": False, "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "executorAttemptNumber": attempt, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": target, "executorResultPath": str(result_path), "stderrLogPath": str(log_path), "executorFailureClass": None, "executorProcessState": None, "executorCrash": None, "stderrSummary": "", "executorExitCode": None})
         self._active_process = getattr(self, "_active_process", None)
         self.save()
 
@@ -2609,7 +2631,7 @@ class LocalFirstOrchestrator:
             self.state["state"] = "EXECUTOR_CRASHED"
             self.save()
             return "EXECUTOR_CRASHED"
-        self.state.update({"state": "RESULT_READY", "executorResultPath": str(result), "executorExitCode": exit_code, "repositoryEvidence": repository_evidence(self.project_dir)})
+        self._record_executor_success(task_id, result, exit_code)
         self.save()
         return "RESULT_READY"
 
@@ -2639,7 +2661,7 @@ class LocalFirstOrchestrator:
                 raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
             if observed == payload or normalize_prompt(observed) == normalize_prompt(payload):
                 baseline = self.state.get("architectDeliveryBaseline")
-                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None, "architectBaseline": baseline})
+                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
                 self.save()
                 return
             self.state["architectSendState"] = "FAILED"
@@ -2665,7 +2687,7 @@ class LocalFirstOrchestrator:
             self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS" if ambiguous else "FAILED", "architectSendError": code, "architectDeliveryFailureClass": failure_class})
             self.save()
             raise
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectResultFingerprint": None, "architectBaseline": baseline})
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
 
     def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
@@ -2697,11 +2719,12 @@ class LocalFirstOrchestrator:
 
     def request_format_recovery(self, bridge: Any) -> None:
         """Request one machine-readable envelope without replaying the result."""
+        task_id = str(self.state["taskId"])
+        self._reset_format_recovery_for_task(task_id)
         if int(self.state.get("formatRecoveryCount", 0)) >= 1:
             self.state.update({"state": "HUMAN_REQUIRED", "formatRecoveryExhausted": True})
             self.save()
             return
-        task_id = str(self.state["taskId"])
         message = "\n".join([
             f"Your previous response for task {task_id} was received successfully but did not contain a valid ORCHESTRATOR_RESULT envelope.",
             "Do not redo the underlying task.",
@@ -2726,6 +2749,8 @@ class LocalFirstOrchestrator:
         if fingerprint == self.state.get("architectResultFingerprint"):
             return {"action": "DUPLICATE"}
         decision = parse_orchestrator_result(response, str(self.state["taskId"]))
+        task_id = str(self.state["taskId"])
+        self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
         if decision["action"] == "EXECUTE":
             sequence = int(self.state.get("taskSequence", 0)) + 1
             next_id = f"{sequence:06d}"
