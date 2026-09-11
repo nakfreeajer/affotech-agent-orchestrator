@@ -650,3 +650,65 @@ def test_bootstrap_execute_response_uses_same_architect_task_once(tmp_path):
     assert watcher.consume_idle_architect_response(response, lambda prompt, result: (launches.append(prompt), type("Process", (), {"pid": 4003})())[1]) == "EXECUTE"
     assert watcher.state["taskId"] == "architect-task-2"
     assert len(launches) == 1
+
+
+def test_main_reuses_idle_playwright_bridge_until_state_changes(monkeypatch, tmp_path):
+    calls = {"attach": 0, "close": 0, "inspect": 0}
+
+    class Bridge:
+        def close(self):
+            calls["close"] += 1
+
+    bridge = Bridge()
+
+    class Watcher:
+        def __init__(self, *_args):
+            self.state = {"state": "IDLE"}
+
+        def _load_state(self): return self.state
+        def save(self): pass
+        def intake_inbox(self, _launch): return False
+
+        def inspect_idle_architect(self, _bridge, _launch):
+            calls["inspect"] += 1
+            if calls["inspect"] == 3:
+                raise KeyboardInterrupt
+            return "IDLE"
+
+    def attach(_endpoint, _conversation_id):
+        calls["attach"] += 1
+        return bridge
+
+    monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", Watcher)
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
+    monkeypatch.setenv("ORCHESTRATOR_POLL_INTERVAL", "0")
+    monkeypatch.setattr(watcher_module, "visible_executor_launcher", lambda *_: None)
+    watcher_module.main()
+    assert calls == {"attach": 1, "close": 1, "inspect": 3}
+
+
+def test_real_playwright_boundary_idle_reads_are_passive(tmp_path):
+    response = "unchanged completed Architect response"
+
+    class Page:
+        def __init__(self):
+            self.operations = []
+            self.response = response
+
+        def evaluate(self, script):
+            self.operations.append(script)
+            if "data-message-author-role=\"assistant\"" in script:
+                return [{"id": "architect-1", "text": self.response}]
+            if "button,[role=\"button\"]" in script:
+                return False
+            raise AssertionError("unexpected non-passive browser operation")
+
+    page = Page()
+    bridge = ArchitectPlaywright(page)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state["lastContinuationSourceFingerprint"] = __import__("hashlib").sha256(response.encode()).hexdigest()
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert len(page.operations) == 4
+    assert all("bring_to_front" not in operation for operation in page.operations)

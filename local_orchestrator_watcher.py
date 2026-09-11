@@ -2237,20 +2237,27 @@ def main() -> None:
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
     launch = visible_executor_launcher(project, watcher)
+    idle_bridge = None
     try:
         while True:
             state = watcher.state.get("state", "IDLE")
+            if state != "IDLE" and idle_bridge is not None:
+                idle_bridge.close()
+                idle_bridge = None
             if state == "IDLE":
                 print("STATE=IDLE")
                 if watcher.intake_inbox(launch):
                     continue
-                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                if idle_bridge is None:
+                    idle_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                 watcher.state["architectConversationId"] = conversation_id
                 watcher.save()
                 try:
-                    watcher.inspect_idle_architect(bridge, launch)
-                finally:
-                    bridge.close()
+                    watcher.inspect_idle_architect(idle_bridge, launch)
+                except Exception:
+                    idle_bridge.close()
+                    idle_bridge = None
+                    raise
                 if watcher.state.get("state") == "IDLE":
                     time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
                     watcher.state = watcher._load_state()
@@ -2324,6 +2331,9 @@ def main() -> None:
                 bridge.close()
     except KeyboardInterrupt:
         print("STATE=STOPPED")
+    finally:
+        if idle_bridge is not None:
+            idle_bridge.close()
 
 
 if __name__ == "__main__":
