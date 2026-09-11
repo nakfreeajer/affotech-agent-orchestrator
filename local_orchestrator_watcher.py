@@ -2017,6 +2017,7 @@ class LocalFirstOrchestrator:
         if source_fingerprint and source_fingerprint == self.state.get("lastContinuationSourceFingerprint"):
             self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
             self.save()
+            print("IDLE_GATE=continuation_fingerprint_duplicate")
             return False
         message = "\n".join([
             "Review the current authoritative project state after the completed work.",
@@ -2051,19 +2052,24 @@ class LocalFirstOrchestrator:
                 self.state["architectSendState"] = "AMBIGUOUS"
             self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
             self.save()
+            print("IDLE_GATE=send_failed")
             raise
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectContactCount": int(self.state.get("architectContactCount", 0)) + 1})
         self.save()
         if hasattr(bridge, "assistant_baseline"):
             self.state["architectBaseline"] = bridge.assistant_baseline()
             self.save()
+        print("IDLE_GATE=continuation_sent")
         return True
 
     def inspect_idle_architect(self, bridge: Any, launcher: Callable[[str, Path], Any]) -> str:
         """Inspect the configured Architect conversation while IDLE."""
-        if bridge.generation_visible():
+        generation_visible = bridge.generation_visible()
+        if generation_visible:
             self.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": bridge.assistant_baseline()})
             self.save()
+            print("IDLE_GATE=generation_visible")
+            print("IDLE_DIAGNOSTIC latestResponseFound=False latestResponseId=None latestResponseFingerprint=None latestResponseHasEnvelope=False generationVisible=True architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=False continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), self.state.get("state")))
             return "ARCHITECT_RUNNING"
         entries = bridge._assistant_entries()
         substantive = [
@@ -2072,14 +2078,26 @@ class LocalFirstOrchestrator:
             and (entry.get("text") or "").strip().lower() != "thinking"
         ]
         response = substantive[-1].get("text", "") if substantive else ""
+        response_id = substantive[-1].get("id") if substantive else None
+        response_fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest() if response else None
+        response_has_envelope = bool(self._architect_response_task_id(response)) if response else False
+        consumed = self.state.setdefault("consumedArchitectResponses", {})
+        response_consumed = bool(response_fingerprint and response_fingerprint in consumed)
+        continuation_eligible = not response_has_envelope and not response_consumed and response_fingerprint != self.state.get("lastContinuationSourceFingerprint")
         if response:
             try:
-                return self.consume_idle_architect_response(response, launcher)
+                result = self.consume_idle_architect_response(response, launcher)
+                print("IDLE_GATE=response_already_consumed" if result == "DUPLICATE" else "IDLE_GATE=valid_envelope_processed")
+                print("IDLE_DIAGNOSTIC latestResponseFound=True latestResponseId=%s latestResponseFingerprint=%s latestResponseHasEnvelope=True generationVisible=False architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=%s continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (response_id, response_fingerprint, self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), response_consumed, self.state.get("state")))
+                return result
             except ValueError:
                 pass
         self.state["continuationSourceFingerprint"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
-        if self.request_architect_bootstrap(bridge):
+        sent = self.request_architect_bootstrap(bridge)
+        print("IDLE_DIAGNOSTIC latestResponseFound=%s latestResponseId=%s latestResponseFingerprint=%s latestResponseHasEnvelope=%s generationVisible=False architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=%s continuationEligible=%s requestArchitectBootstrapCalled=True requestArchitectBootstrapSent=%s resultingState=%s" % (bool(response), response_id, response_fingerprint, response_has_envelope, self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), response_consumed, continuation_eligible, sent, self.state.get("state")))
+        if sent:
             return "ARCHITECT_RUNNING"
+        print("IDLE_GATE=send_suppressed")
         return self.state.get("state", "IDLE")
 
     def recover_5c(self, legacy_path: str | os.PathLike[str] = r"C:\Users\nitro\AppData\Local\Temp\codex-last-message-h_2bryhl.txt") -> bool:
