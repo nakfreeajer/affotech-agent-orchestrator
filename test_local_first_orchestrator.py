@@ -411,6 +411,66 @@ def test_ambiguous_result_delivery_retries_once_when_exact_payload_absent(tmp_pa
     assert len(sends) == 1
 
 
+def test_resident_recovery_reconciles_ambiguous_delivery_without_restart(tmp_path):
+    watcher = ready(tmp_path)
+    sent = []
+    class FirstBridge:
+        last_send_method = "playwright.click"
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+        def submit_result_bounded(self, message):
+            sent.append(message)
+            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED")
+        def close(self): pass
+    first = FirstBridge()
+    class ReattachedBridge:
+        def latest_user_message(self): return sent[0]
+        def assistant_baseline(self): return {"count": 2, "entries": []}
+        def submit_result_bounded(self, _message): raise AssertionError("duplicate delivery")
+        def close(self): pass
+    attachments = []
+    bridge = watcher.deliver_result_with_recovery(lambda: attachments.append(1) or ReattachedBridge(), initial_bridge=first)
+    assert bridge is not None
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert sent and attachments == [1]
+
+
+def test_resident_recovery_retries_ambiguous_delivery_only_when_absent(tmp_path):
+    watcher = ready(tmp_path)
+    sends = []
+    class FirstBridge:
+        last_send_method = "playwright.click"
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+        def submit_result_bounded(self, message):
+            sends.append(message)
+            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED")
+        def close(self): pass
+    class ReattachedBridge:
+        def latest_user_message(self): return "different delivery"
+        def assistant_baseline(self): return {"count": 2, "entries": []}
+        def submit_result_bounded(self, message): sends.append(message)
+        def close(self): pass
+    watcher.deliver_result_with_recovery(lambda: ReattachedBridge(), initial_bridge=FirstBridge())
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert len(sends) == 2
+
+
+def test_resident_recovery_exhaustion_preserves_result_and_stops_safely(tmp_path):
+    watcher = ready(tmp_path)
+    payload = Path(watcher.state["executorResultPath"]).read_bytes()
+    class FailedBridge:
+        last_send_method = "playwright.click"
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+        def submit_result_bounded(self, _message): raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED")
+        def latest_user_message(self): return None
+        def close(self): pass
+    assert watcher.deliver_result_with_recovery(lambda: FailedBridge(), max_attempts=3, initial_bridge=FailedBridge()) is None
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
+    assert Path(watcher.state["executorResultPath"]).read_bytes() == payload
+    assert watcher.state["architectTransportRecoveryCount"] == 3
+
+
 def test_normal_playwright_click_sends_exact_text():
     page = FakeComposerPage()
     ArchitectPlaywright(page).submit_result_bounded("click result", timeout=1)
@@ -1174,6 +1234,15 @@ def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeyp
     assert Path(child_cwds[1]) == next_worktree
     assert next_worktree != base
     assert next_worktree != watcher.project_dir
+    second_messages = []
+    class SecondBridge:
+        def submit_result_bounded(self, message): second_messages.append(message)
+        def assistant_baseline(self): return {"count": 2, "entries": []}
+    watcher.deliver_result(SecondBridge())
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert second_messages
+    assert watcher.accept_architect_response(envelope(watcher.state["taskId"], action="STOP"))["action"] == "STOP"
+    assert watcher.state["state"] == "IDLE"
 
 
 def test_post_result_execute_inherits_project_context_without_routing_lines(tmp_path):

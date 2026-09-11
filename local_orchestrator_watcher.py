@@ -1255,6 +1255,9 @@ class ArchitectPlaywright:
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         """Submit a result with explicit, bounded stages and typed failures."""
+        self.last_send_method = None
+        self.sendActionAttempted = False
+        self.sendActionAcknowledged = False
         deadline = time.monotonic() + timeout
         last_error = None
         try:
@@ -1317,6 +1320,7 @@ class ArchitectPlaywright:
         if not enabled:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
         try:
+            self.sendActionAttempted = True
             send.click(timeout=1000)
             self.last_send_method = "playwright.click"
         except Exception as error:
@@ -1327,6 +1331,7 @@ class ArchitectPlaywright:
             # already confirmed active composer; transition confirmation below
             # remains the delivery authority.
             try:
+                self.sendActionAttempted = True
                 composer = self._live_composer()
                 composer.focus(timeout=1000)
                 composer.press("Enter", timeout=1000)
@@ -1345,6 +1350,7 @@ class ArchitectPlaywright:
                 generation_visible = stop.count() > 0 and stop.is_visible(timeout=1000)
                 assistant_started = self.assistant_count() > assistant_count_before
                 if composer_empty or generation_visible or assistant_started:
+                    self.sendActionAcknowledged = True
                     return
             except Exception as error:
                 last_error = error
@@ -2620,16 +2626,18 @@ class LocalFirstOrchestrator:
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         prior_hash = self.state.get("architectDeliveryPayloadHash")
         delivery_state = self.state.get("architectSendState")
-        if prior_hash == payload_hash and delivery_state in {"PENDING", "AMBIGUOUS"}:
+        ambiguous_history = self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_AMBIGUOUS"
+        delivery_probe = getattr(bridge, "latest_user_message", None)
+        can_reconcile_delivery = callable(delivery_probe)
+        if prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
             observed = None
-            probe = getattr(bridge, "latest_user_message", None)
-            if callable(probe):
-                observed = probe()
+            if can_reconcile_delivery:
+                observed = delivery_probe()
             if observed is None:
                 self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_DELIVERY_AMBIGUOUS"})
                 self.save()
                 raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
-            if observed == payload:
+            if observed == payload or normalize_prompt(observed) == normalize_prompt(payload):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectResultFingerprint": None, "architectBaseline": baseline})
                 self.save()
@@ -2650,13 +2658,42 @@ class LocalFirstOrchestrator:
             sender(payload)
         except Exception as error:
             code = getattr(error, "code", None) or type(error).__name__
-            ambiguous = code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT" or bool(getattr(bridge, "last_send_method", None))
+            attempted = bool(getattr(bridge, "sendActionAttempted", False)) or bool(getattr(bridge, "last_send_method", None))
+            acknowledged = bool(getattr(bridge, "sendActionAcknowledged", False))
+            ambiguous = (attempted and not acknowledged) or code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT"
             failure_class = "ARCHITECT_DELIVERY_AMBIGUOUS" if ambiguous else "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
             self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS" if ambiguous else "FAILED", "architectSendError": code, "architectDeliveryFailureClass": failure_class})
             self.save()
             raise
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
+
+    def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
+        """Reconcile or deliver one result without exiting the resident watcher."""
+        bridge = initial_bridge
+        for attempt in range(max_attempts):
+            try:
+                if bridge is None:
+                    bridge = bridge_factory()
+                self.state["architectTransportRecoveryPayloadHash"] = self.state.get("architectDeliveryPayloadHash")
+                self.state["architectTransportRecoveryCount"] = attempt
+                self.save()
+                self.deliver_result(bridge)
+                self.state["architectTransportRecoveryCount"] = 0
+                self.save()
+                return bridge
+            except Exception as error:
+                try:
+                    bridge.close()
+                except Exception:
+                    pass
+                bridge = None
+                if attempt + 1 >= max_attempts:
+                    self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED", "architectTransportRecoveryCount": attempt + 1})
+                    self.save()
+                    return None
+                time.sleep(0.25)
+        return None
 
     def request_format_recovery(self, bridge: Any) -> None:
         """Request one machine-readable envelope without replaying the result."""
@@ -2740,7 +2777,8 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
         runner = CodexRunner(project, child_project_dir=target, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
         watcher.state.update({"executorSessionId": AFFOTECH_EXECUTOR_SESSION_ID, "executorSessionMode": "PERSISTENT"})
         attempt = int(watcher.state.get("executorAttemptNumber", 0)) + 1
-        stderr_path = watcher.state_dir / "executor-logs" / f"{watcher.state.get('taskId', 'unknown')}-attempt-{attempt}.stderr.txt"
+        stderr_identity = watcher.state.get("nextTaskId") or watcher.state.get("taskId") or "unknown"
+        stderr_path = watcher.state_dir / "executor-logs" / f"{stderr_identity}-attempt-{attempt}.stderr.txt"
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
         watcher.state.update({"stderrLogPath": str(stderr_path)})
         watcher.save()
@@ -2847,10 +2885,12 @@ def main() -> None:
             watcher.save()
             try:
                 if watcher.state.get("state") == "RESULT_READY":
-                    try:
-                        watcher.deliver_result(bridge)
-                    except ResultSubmissionError as error:
-                        print(f"STATE=RESULT_READY reason={getattr(error, 'code', type(error).__name__)}")
+                    bridge = watcher.deliver_result_with_recovery(
+                        lambda: ArchitectPlaywright.attach(endpoint, conversation_id),
+                        initial_bridge=bridge,
+                    )
+                    if bridge is None:
+                        print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
                         return
                 baseline = watcher.state.get("architectBaseline")
                 if not isinstance(baseline, dict):
