@@ -2044,12 +2044,14 @@ class LocalWatcher:
 
 
 ORCHESTRATOR_STATES = {"IDLE", "EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY", "HUMAN_REQUIRED", "EXECUTOR_CRASHED"}
+DOCUMENTATION_DISPOSITIONS = {"NOT_REQUIRED", "REQUIRED", "COMPLETE"}
 EXECUTOR_WORKTREE_RE = re.compile(r"(?im)^[ \t]*WORKTREE[ \t]*\r?\n[ \t]*(?P<path>(?:[A-Za-z]:[\\/]|/)[^\r\n]+)[ \t]*(?=\r?$|\r?\n)")
 ORCHESTRATOR_RESULT_RE = re.compile(
     r"<ORCHESTRATOR_RESULT>\s*"
     r"classification=(ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT)\s*"
     r"action=(EXECUTE|HUMAN_REQUIRED|STOP)\s*"
     r"taskId=([^\r\n]+)\s*"
+    r"(?:documentation=(NOT_REQUIRED|REQUIRED|COMPLETE)\s*)?"
     r"promptBegin\s*\r?\n?(.*?)\r?\npromptEnd\s*"
     r"</ORCHESTRATOR_RESULT>\s*$",
     re.S,
@@ -2075,13 +2077,13 @@ def parse_orchestrator_result(text: str, completed_task_id: str) -> dict[str, st
     match = ORCHESTRATOR_RESULT_RE.search(candidate)
     if not match or match.group(3).strip() != completed_task_id:
         raise ValueError("ARCHITECT_ENVELOPE_INVALID")
-    prompt = match.group(4).replace("\r\n", "\n").replace("\r", "\n")
+    prompt = match.group(5).replace("\r\n", "\n").replace("\r", "\n")
     action = match.group(2)
     if action == "EXECUTE" and not prompt.strip():
         raise ValueError("ARCHITECT_ENVELOPE_PROMPT_REQUIRED")
     if action != "EXECUTE" and prompt.strip():
         raise ValueError("ARCHITECT_ENVELOPE_PROMPT_FORBIDDEN")
-    return {"classification": match.group(1), "action": action, "taskId": completed_task_id, "prompt": prompt}
+    return {"classification": match.group(1), "action": action, "taskId": completed_task_id, "prompt": prompt, "documentation": match.group(4) or "NOT_REQUIRED"}
 
 
 def repository_evidence(repo: str | os.PathLike[str]) -> dict[str, str]:
@@ -2982,7 +2984,23 @@ class LocalFirstOrchestrator:
         if not task_id:
             raise ValueError("ARCHITECT_ENVELOPE_INVALID")
         decision = parse_orchestrator_result(response, task_id)
+        documentation = decision["documentation"]
+        pending_documentation = bool(self.state.get("documentationClosurePending"))
+        if pending_documentation and documentation != "COMPLETE":
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "DOCUMENTATION_CLOSURE_REQUIRED"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_BYPASS_BLOCKED", self.state, disposition=documentation)
+            raise ValueError("DOCUMENTATION_CLOSURE_REQUIRED")
+        if documentation == "REQUIRED" and (decision["classification"] != "ACCEPTED" or decision["action"] != "EXECUTE" or not decision["prompt"].strip()):
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "DOCUMENTATION_DISPOSITION_INVALID"})
+            self.save()
+            raise ValueError("DOCUMENTATION_DISPOSITION_INVALID")
         self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
+        if documentation == "REQUIRED":
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_REQUIRED", self.state, taskId=task_id, disposition=documentation)
+        if documentation == "COMPLETE":
+            self.state.update({"documentationClosurePending": False, "documentationClosureCompletedTaskId": task_id, "documentationClosureFingerprint": fingerprint})
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_ACCEPTED", self.state, taskId=task_id, disposition=documentation)
         if decision["action"] == "EXECUTE":
             current_sequence = int(self.state.get("taskSequence", 0))
             current_task = str(self.state.get("taskId") or "")
@@ -3002,6 +3020,9 @@ class LocalFirstOrchestrator:
             self.state["architectResultFingerprint"] = fingerprint
             target_text = str(target)
             self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target_text, "targetRepo": target_text, "targetWorktree": target_text, "humanRequiredReason": None})
+            if documentation == "REQUIRED":
+                self.state.update({"documentationClosurePending": True, "documentationClosureSourceTaskId": task_id, "documentationClosureTaskId": next_id})
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_TASK_STAGED", self.state, taskId=next_id, sourceTaskId=task_id)
         elif decision["action"] == "HUMAN_REQUIRED":
             self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None, "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})

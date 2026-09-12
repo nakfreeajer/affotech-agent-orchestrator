@@ -17,10 +17,11 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
 import local_orchestrator_watcher as watcher_module
 
 
-def envelope(task, action="EXECUTE", prompt="next task"):
+def envelope(task, action="EXECUTE", prompt="next task", documentation=None):
     body = prompt if action == "EXECUTE" else ""
+    documentation_line = f"documentation={documentation}\n" if documentation else ""
     return (f"explanation\n<ORCHESTRATOR_RESULT>\nclassification=ACCEPTED\n"
-            f"action={action}\ntaskId={task}\npromptBegin\n{body}\n"
+            f"action={action}\ntaskId={task}\n{documentation_line}promptBegin\n{body}\n"
             "promptEnd\n</ORCHESTRATOR_RESULT>")
 
 
@@ -328,7 +329,7 @@ def test_000016_startup_shape_consumes_existing_response_once(tmp_path):
 
 def test_format_recovery_response_uses_strict_same_task_parser():
     parsed = parse_orchestrator_result(envelope("task-1", prompt="next"), "task-1")
-    assert parsed == {"classification": "ACCEPTED", "action": "EXECUTE", "taskId": "task-1", "prompt": "next"}
+    assert parsed == {"classification": "ACCEPTED", "action": "EXECUTE", "taskId": "task-1", "prompt": "next", "documentation": "NOT_REQUIRED"}
 
 
 def test_atomic_write_and_github_free_evidence(tmp_path):
@@ -2318,3 +2319,62 @@ def test_executor_success_clears_stale_human_reason(tmp_path):
     watcher._record_executor_success("000025", result, 0)
     assert watcher.state["state"] == "RESULT_READY"
     assert watcher.state["humanRequiredReason"] is None
+
+
+def test_documentation_field_is_optional_and_defaults_not_required():
+    parsed = parse_orchestrator_result(envelope("task-doc"), "task-doc")
+    assert parsed["documentation"] == "NOT_REQUIRED"
+    assert parse_orchestrator_result(envelope("task-doc", documentation="COMPLETE"), "task-doc")["documentation"] == "COMPLETE"
+
+
+def test_documentation_required_stages_one_normal_sequential_task(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    watcher.state.update({"taskId": "000021", "taskSequence": 21, "state": "ARCHITECT_RUNNING"})
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    response = envelope("000021", prompt=configured_project_prompt(base, head, "documentation closure"), documentation="REQUIRED")
+    watcher.accept_architect_response(response)
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000022"
+    assert watcher.state["documentationClosurePending"] is True
+    assert watcher.state["documentationClosureSourceTaskId"] == "000021"
+    assert watcher.state["documentationClosureTaskId"] == "000022"
+    assert Path(watcher.state["nextPromptPath"]).read_text(encoding="utf-8") == configured_project_prompt(base, head, "documentation closure")
+
+
+def test_documentation_pending_survives_restart_and_blocks_bypass(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000021", "nextTaskId": "000022", "documentationClosurePending": True})
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.state["documentationClosurePending"] is True
+    with pytest.raises(ValueError, match="DOCUMENTATION_CLOSURE_REQUIRED"):
+        restarted.accept_architect_response(envelope("000021", action="STOP"))
+    assert restarted.state["state"] == "HUMAN_REQUIRED"
+
+
+def test_complete_documentation_clears_pending_and_honors_stop(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"taskId": "000022", "taskSequence": 22, "state": "ARCHITECT_RUNNING", "documentationClosurePending": True})
+    watcher.accept_architect_response(envelope("000022", action="STOP", documentation="COMPLETE"))
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state["documentationClosurePending"] is False
+    assert watcher.state["documentationClosureCompletedTaskId"] == "000022"
+
+
+def test_complete_documentation_can_be_architect_performed_without_extra_child(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"taskId": "000025", "state": "ARCHITECT_RUNNING", "documentationClosurePending": True})
+    watcher.accept_architect_response(envelope("000025", action="HUMAN_REQUIRED", documentation="COMPLETE"))
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["documentationClosurePending"] is False
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_DECISION_HUMAN_REQUIRED"
+
+
+def test_documentation_complete_execute_stages_next_ordinary_task_once(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    watcher.state.update({"taskId": "000022", "taskSequence": 22, "state": "ARCHITECT_RUNNING", "documentationClosurePending": True})
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    watcher.accept_architect_response(envelope("000022", prompt=configured_project_prompt(base, head, "ordinary next work"), documentation="COMPLETE"))
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000023"
+    assert watcher.state["documentationClosurePending"] is False
