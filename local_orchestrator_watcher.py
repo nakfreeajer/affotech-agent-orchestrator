@@ -2496,6 +2496,11 @@ class LocalFirstOrchestrator:
             "Do not repeat already accepted work.",
             "Do not invent work outside the established project direction.",
             "If an Executor or Documentation Curator action is appropriate, return the complete next instruction using the canonical ORCHESTRATOR_RESULT envelope.",
+            "Set documentation=NOT_REQUIRED|REQUIRED|COMPLETE.",
+            "NOT_REQUIRED means this decision does not require milestone/release documentation closure.",
+            "REQUIRED means the accepted milestone/release needs one bounded documentation closure task before ordinary advancement.",
+            "COMPLETE means required milestone documentation is already synchronized and verified.",
+            "Do not choose NOT_REQUIRED merely to continue execution; use REQUIRED or COMPLETE when governance requires it.",
             "If genuine human authority is required, return HUMAN_REQUIRED.",
             "Return STOP only if there is genuinely no further currently authorized project work.",
             "<ORCHESTRATOR_RESULT>",
@@ -2758,7 +2763,12 @@ class LocalFirstOrchestrator:
         task_id = str(self.state["taskId"])
         instruction = ("Verify the completed Executor report below, classify it, decide the next bounded action, "
                        "and finish with exactly one <ORCHESTRATOR_RESULT> envelope using taskId=" + task_id + ".\n"
-                       "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
+            "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
+        instruction += ("The Architect must also set documentation=NOT_REQUIRED|REQUIRED|COMPLETE: "
+                        "NOT_REQUIRED when no milestone/release documentation closure applies; "
+                        "REQUIRED when accepted work needs one bounded documentation closure task; "
+                        "COMPLETE when required documentation is synchronized and verified. "
+                        "Do not use NOT_REQUIRED merely to advance.\n\n")
         payload = instruction + report
         return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -2945,6 +2955,8 @@ class LocalFirstOrchestrator:
             "classification=ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT",
             "action=EXECUTE|HUMAN_REQUIRED|STOP",
             f"taskId={task_id}",
+            "documentation=NOT_REQUIRED|REQUIRED|COMPLETE",
+            "Preserve the documentation disposition from the already-completed decision; do not downgrade a pending documentation closure to NOT_REQUIRED.",
             "promptBegin <complete next Executor prompt only when action=EXECUTE>",
             "promptEnd",
             "</ORCHESTRATOR_RESULT>",

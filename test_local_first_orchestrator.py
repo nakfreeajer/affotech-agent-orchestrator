@@ -2378,3 +2378,61 @@ def test_documentation_complete_execute_stages_next_ordinary_task_once(tmp_path)
     assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state["nextTaskId"] == "000023"
     assert watcher.state["documentationClosurePending"] is False
+
+
+def test_result_review_instruction_advertises_documentation_disposition(tmp_path):
+    watcher = ready(tmp_path)
+    messages = []
+    class Bridge:
+        def assistant_baseline(self): return {"count": 0, "text_hash": "a" * 64}
+        def user_baseline(self): return {"count": 0, "text_hash": "b" * 64}
+        def submit_result_bounded(self, message): messages.append(message)
+    watcher.deliver_result(Bridge())
+    message = messages[0]
+    assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
+    assert "REQUIRED" in message and "COMPLETE" in message
+    assert "Do not use NOT_REQUIRED merely" in message
+
+
+def test_idle_bootstrap_instruction_advertises_documentation_disposition(tmp_path):
+    watcher = ready(tmp_path)
+    messages = []
+    class Bridge:
+        def submit_result_bounded(self, message): messages.append(message)
+    watcher.state.update({"continuationSourceFingerprint": "source-hash"})
+    assert watcher.request_architect_bootstrap(Bridge()) is True
+    message = messages[0]
+    assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
+    assert "milestone/release documentation closure" in message
+    assert "Do not choose NOT_REQUIRED merely" in message
+
+
+def test_format_recovery_instruction_preserves_documentation_disposition(tmp_path):
+    watcher = ready(tmp_path)
+    messages = []
+    class Bridge:
+        def submit_result_bounded(self, message): messages.append(message)
+        def assistant_baseline(self): return {"count": 1, "text_hash": "a" * 64}
+    watcher.state.update({"taskId": "task-1", "documentationClosurePending": True})
+    watcher.request_format_recovery(Bridge())
+    message = messages[0]
+    assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
+    assert "Preserve the documentation disposition" in message
+    assert "do not downgrade a pending documentation closure to NOT_REQUIRED" in message
+
+
+def test_all_production_documentation_schema_prompts_advertise_all_values(tmp_path):
+    watcher = ready(tmp_path)
+    captured = []
+    class Bridge:
+        def assistant_baseline(self): return {"count": 0, "text_hash": "a" * 64}
+        def user_baseline(self): return {"count": 0, "text_hash": "b" * 64}
+        def submit_result_bounded(self, message): captured.append(message)
+    watcher.deliver_result(Bridge())
+    watcher.state.update({"state": "IDLE", "continuationSourceFingerprint": "next-source"})
+    watcher.request_architect_bootstrap(Bridge())
+    watcher.state.update({"taskId": "task-1", "formatRecoveryCount": 0})
+    watcher.request_format_recovery(Bridge())
+    assert len(captured) == 3
+    for message in captured:
+        assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
