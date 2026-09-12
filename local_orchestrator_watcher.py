@@ -2760,18 +2760,21 @@ class LocalFirstOrchestrator:
         return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _delivery_evidence_advanced(self, bridge: Any, payload: str) -> bool:
-        user_baseline = self.state.get("architectDeliveryUserBaseline") or {}
-        if hasattr(bridge, "user_baseline"):
+        def usable_baseline(value: Any) -> bool:
+            return isinstance(value, dict) and isinstance(value.get("count"), int) and value.get("count") >= 0 and isinstance(value.get("text_hash"), str) and bool(value.get("text_hash"))
+
+        user_baseline = self.state.get("architectDeliveryUserBaseline")
+        if usable_baseline(user_baseline) and callable(getattr(bridge, "user_baseline", None)):
             current = bridge.user_baseline()
-            if isinstance(current, dict) and isinstance(user_baseline, dict):
+            if usable_baseline(current):
                 if int(current.get("count", 0)) > int(user_baseline.get("count", 0)):
                     return True
                 if current.get("text_hash") and current.get("text_hash") != user_baseline.get("text_hash"):
                     return True
-        assistant_baseline = self.state.get("architectDeliveryBaseline") or {}
-        if hasattr(bridge, "assistant_baseline"):
+        assistant_baseline = self.state.get("architectDeliveryBaseline")
+        if usable_baseline(assistant_baseline) and callable(getattr(bridge, "assistant_baseline", None)):
             current = bridge.assistant_baseline()
-            if isinstance(current, dict) and isinstance(assistant_baseline, dict):
+            if usable_baseline(current):
                 if int(current.get("count", 0)) > int(assistant_baseline.get("count", 0)):
                     return True
                 if current.get("text_hash") and current.get("text_hash") != assistant_baseline.get("text_hash"):
@@ -2792,7 +2795,12 @@ class LocalFirstOrchestrator:
         try:
             observed = composer.inner_text(timeout=1000)
             if isinstance(observed, str) and observed.strip() and normalize_prompt(observed) == normalize_prompt(payload):
-                composer.fill("")
+                composer.focus(timeout=1000)
+                composer.press("ControlOrMeta+A", timeout=1000)
+                composer.press("Backspace", timeout=1000)
+                cleared = composer.inner_text(timeout=1000)
+                if not isinstance(cleared, str) or cleared.strip():
+                    return False
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_STALE_COMPOSER_CLEARED", self.state, hash=payload_hash)
                 return True
         except Exception:

@@ -536,7 +536,7 @@ def test_ambiguous_result_delivery_does_not_duplicate_on_restart(tmp_path):
     assert sent == [payload]
 
 
-def test_ambiguous_result_delivery_retries_once_when_exact_payload_absent(tmp_path):
+def test_ambiguous_result_delivery_stays_blocked_without_positive_non_delivery(tmp_path):
     watcher = ready(tmp_path)
     class AmbiguousBridge:
         def assistant_baseline(self): return {"count": 1, "entries": []}
@@ -549,9 +549,10 @@ def test_ambiguous_result_delivery_retries_once_when_exact_payload_absent(tmp_pa
         def latest_user_message(self): return "different payload"
         def assistant_baseline(self): return {"count": 2, "entries": []}
         def submit_result_bounded(self, message): sends.append(message)
-    restarted.deliver_result(AbsentBridge())
+    with pytest.raises(ResultSubmissionError):
+        restarted.deliver_result(AbsentBridge())
     assert len(sends) == 0
-    assert restarted.state["state"] == "ARCHITECT_RUNNING"
+    assert restarted.state["state"] == "RESULT_READY"
 
 
 def test_confirmed_identical_result_delivery_is_terminally_idempotent(tmp_path):
@@ -662,7 +663,7 @@ def test_resident_recovery_reconciles_ambiguous_delivery_without_restart(tmp_pat
     assert sent and attachments == [1]
 
 
-def test_resident_recovery_retries_ambiguous_delivery_only_when_absent(tmp_path):
+def test_resident_recovery_exhausts_ambiguous_delivery_without_proof(tmp_path):
     watcher = ready(tmp_path)
     sends = []
     class FirstBridge:
@@ -678,7 +679,7 @@ def test_resident_recovery_retries_ambiguous_delivery_only_when_absent(tmp_path)
         def submit_result_bounded(self, message): sends.append(message)
         def close(self): pass
     watcher.deliver_result_with_recovery(lambda: ReattachedBridge(), initial_bridge=FirstBridge())
-    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
     assert len(sends) == 1
 
 
@@ -2137,3 +2138,137 @@ def test_runtime_logging_attach_failure_uses_actual_failure_event(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "event=ARCHITECT_ATTACH_FAILED" in text and "errorClass=ValueError" in text
     assert "replacement unavailable" in text
+
+
+class _DeliveryEvidenceBridge:
+    def __init__(self, *, user=None, assistant=None, generating=False, latest=None):
+        self._user = user
+        self._assistant = assistant
+        self._generating = generating
+        self._latest = latest
+
+    def user_baseline(self):
+        return self._user
+
+    def assistant_baseline(self):
+        return self._assistant
+
+    def generation_visible(self):
+        return self._generating
+
+    def latest_user_message(self):
+        return self._latest
+
+
+def _baseline(count, text_hash):
+    return {"count": count, "text_hash": text_hash}
+
+
+def test_delivery_missing_user_baseline_does_not_prove_advancement(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["architectDeliveryBaseline"] = _baseline(2, "a" * 64)
+    payload, _ = watcher._result_delivery_payload()
+    bridge = _DeliveryEvidenceBridge(user=_baseline(3, "b" * 64), assistant=_baseline(2, "a" * 64))
+    assert watcher._delivery_evidence_advanced(bridge, payload) is False
+
+
+def test_delivery_missing_assistant_baseline_does_not_prove_advancement(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["architectDeliveryUserBaseline"] = _baseline(2, "a" * 64)
+    payload, _ = watcher._result_delivery_payload()
+    bridge = _DeliveryEvidenceBridge(user=_baseline(2, "a" * 64), assistant=_baseline(3, "b" * 64))
+    assert watcher._delivery_evidence_advanced(bridge, payload) is False
+
+
+def test_delivery_missing_baselines_without_independent_evidence_fails_closed(tmp_path):
+    watcher = ready(tmp_path)
+    payload, _ = watcher._result_delivery_payload()
+    bridge = _DeliveryEvidenceBridge(user=_baseline(3, "b" * 64), assistant=_baseline(3, "c" * 64), latest="different")
+    assert watcher._delivery_evidence_advanced(bridge, payload) is False
+
+
+def test_legacy_task_000023_reconciles_from_assistant_baseline_only(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["taskId"] = "000023"
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED",
+        "architectDeliveryPayloadHash": payload_hash,
+        "architectDeliveryBaseline": _baseline(2, "a" * 64),
+        "architectDeliveryUserBaseline": None,
+    })
+    bridge = _DeliveryEvidenceBridge(assistant=_baseline(3, "b" * 64))
+    assert watcher.reconcile_exhausted_result_delivery(bridge) is True
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+
+
+def test_legacy_task_000023_unchanged_assistant_baseline_remains_human_required(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["taskId"] = "000023"
+    _, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED",
+        "architectDeliveryPayloadHash": payload_hash,
+        "architectDeliveryBaseline": _baseline(2, "a" * 64),
+        "architectDeliveryUserBaseline": None,
+    })
+    assert watcher.reconcile_exhausted_result_delivery(_DeliveryEvidenceBridge(assistant=_baseline(2, "a" * 64))) is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+
+
+def test_generation_and_exact_user_match_remain_independent_delivery_evidence(tmp_path):
+    watcher = ready(tmp_path)
+    payload, _ = watcher._result_delivery_payload()
+    assert watcher._delivery_evidence_advanced(_DeliveryEvidenceBridge(generating=True), payload) is True
+    assert watcher._delivery_evidence_advanced(_DeliveryEvidenceBridge(latest=payload), payload) is True
+
+
+def test_ambiguous_post_send_recovery_performs_no_second_send(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"architectDeliveryPayloadHash": payload_hash, "architectSendState": "AMBIGUOUS", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS", "architectDeliveryBaseline": _baseline(2, "a" * 64)})
+    sends = []
+    class Bridge(_DeliveryEvidenceBridge):
+        def submit_result_bounded(self, message): sends.append(message)
+    with pytest.raises(ResultSubmissionError):
+        watcher.deliver_result(Bridge(assistant=_baseline(2, "a" * 64), latest="different"))
+    assert sends == []
+
+
+class _RichEditor:
+    def __init__(self, text, clear=True):
+        self.text = text
+        self.clear = clear
+        self.actions = []
+
+    def inner_text(self, **_): return self.text
+    def focus(self, **_): self.actions.append("focus")
+    def press(self, key, **_):
+        self.actions.append(key)
+        if key == "ControlOrMeta+A" and self.clear:
+            self.text = ""
+
+
+def test_stale_composer_uses_rich_editor_clear_and_verifies_empty(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    editor = _RichEditor(payload)
+    bridge = type("Bridge", (), {"_live_composer": lambda self: editor})()
+    assert watcher.clear_confirmed_stale_composer(bridge, payload, payload_hash) is True
+    assert editor.actions == ["focus", "ControlOrMeta+A", "Backspace"]
+    assert editor.text == ""
+
+
+def test_stale_composer_cleanup_does_not_clear_unrelated_or_unverified_text(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    unrelated = _RichEditor("user draft")
+    bridge = type("Bridge", (), {"_live_composer": lambda self: unrelated})()
+    assert watcher.clear_confirmed_stale_composer(bridge, payload, payload_hash) is False
+    assert unrelated.actions == [] and unrelated.text == "user draft"
+    failed = _RichEditor(payload, clear=False)
+    bridge = type("Bridge", (), {"_live_composer": lambda self: failed})()
+    assert watcher.clear_confirmed_stale_composer(bridge, payload, payload_hash) is False
+    assert failed.text == payload
