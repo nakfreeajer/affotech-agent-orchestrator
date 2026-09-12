@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import tempfile
 import time
@@ -31,6 +34,34 @@ ARCHITECT_MEMORY_THRESHOLD_MIB = 1024
 AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
+RUNTIME_LOGGER_NAME = "affotech.orchestrator.runtime"
+
+
+def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
+    """Initialize the one durable, privacy-safe watcher log before workflow work."""
+    state_path = Path(state_dir)
+    log_path = state_path / "logs" / "orchestrator.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    logger = logging.getLogger(RUNTIME_LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s level=%(levelname)s runId=%(runId)s state=%(state)s taskId=%(taskId)s event=%(event)s %(message)s"))
+    logger.addHandler(handler)
+    return logger, run_id, str(log_path)
+
+
+def runtime_log(logger: logging.Logger | None, run_id: str | None, event: str, state: dict[str, Any] | None = None, level: int = logging.INFO, **fields: Any) -> None:
+    if logger is None:
+        return
+    current = state or {}
+    safe = {"runId": run_id or "UNKNOWN", "state": current.get("state", "UNKNOWN"), "taskId": current.get("taskId") or current.get("nextTaskId") or "NONE", "event": event}
+    safe.update({key: str(value).replace("\n", " ") for key, value in fields.items() if value is not None})
+    logger.log(level, " ".join(f"{key}={value}" for key, value in fields.items() if value is not None), extra=safe)
 AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
 DOCUMENTATION_KINDS = frozenset({"IMPLEMENTATION", "BUG_FIX", "REPAIR", "RECOVERY", "ARCHITECTURE_CHANGE", "GOVERNANCE_CHANGE", "INCIDENT_CLOSURE"})
@@ -725,9 +756,11 @@ class ArchitectSessionRollover:
         self.watcher.state["handoverRequested"] = True
         self.watcher.state["handoverReady"] = False
         self.watcher.save()
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_PENDING", self.watcher.state, trigger=trigger)
         try:
             bridge.submit_result_bounded(STANDARD_HANDOVER_REQUEST)
             emit("ARCHITECT_HANDOVER_REQUESTED")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_REQUESTED", self.watcher.state)
             return True
         except Exception:
             emit("STATE=ROLLOVER_PENDING")
@@ -739,6 +772,7 @@ class ArchitectSessionRollover:
         self.watcher.state["handoverReady"] = True
         self.watcher.state["pending_handover"] = response
         self.watcher.save()
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_READY", self.watcher.state)
         old_page = bridge.page
         try:
             new_page = bridge.open_fresh_with_handover(response)
@@ -757,7 +791,10 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverTrigger", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_NEW_CONVERSATION_CREATED", self.watcher.state, conversationId=conversation_id)
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_SWITCHED", self.watcher.state, conversationId=conversation_id)
             emit("ARCHITECT_SESSION_ROLLOVER_COMPLETE")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_SESSION_ROLLOVER_COMPLETE", self.watcher.state)
             return True
         except Exception:
             emit("STATE=ROLLOVER_PENDING")
@@ -2602,6 +2639,8 @@ class LocalFirstOrchestrator:
         if isinstance(path, str) and Path(path).is_file() and Path(path).read_text(encoding="utf-8", errors="replace").strip():
             task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
             self._record_executor_success(task_id, Path(path), self.state.get("executorExitCode"))
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_FOUND", self.state, resultPath=path)
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_READY", self.state)
         else:
             result_exists = bool(isinstance(path, str) and Path(path).is_file())
             process = getattr(self, "_active_process", None)
@@ -2635,6 +2674,8 @@ class LocalFirstOrchestrator:
                     "stderrSummary": stderr_summary,
                 },
             })
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_MISSING", self.state, resultPath=path, pid=pid)
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_CRASHED", self.state, pid=pid, exitCode=exit_code)
             print("EXECUTOR_PROCESS_STATE=EXITED_WITHOUT_RESULT taskId=%s pid=%s exitCode=%s stderrLogPath=%s stderrSummary=%s" % (self.state.get("taskId"), pid, exit_code, stderr_path, stderr_summary))
         self.save()
         return self.state["state"]
@@ -2663,6 +2704,7 @@ class LocalFirstOrchestrator:
         self.state.update({"state": "EXECUTOR_RUNNING", "executorLaunchState": "LAUNCHED", "automaticRetryAuthorized": False, "taskId": task_id, "taskSequence": int(self.state.get("taskSequence", 0)) + 1, "executorAttemptNumber": attempt, "codexPid": pid, "codexStartedAt": time.time(), "targetProject": target, "executorResultPath": str(result_path), "stderrLogPath": str(log_path), "executorFailureClass": None, "executorProcessState": None, "executorCrash": None, "stderrSummary": "", "executorExitCode": None})
         self._active_process = getattr(self, "_active_process", None)
         self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "CODEX_STARTED", self.state, pid=pid, attempt=attempt)
 
     def mark_executor_exit(self, exit_code: int, result_path: str | os.PathLike[str]) -> str:
         task_id = str(self.state.get("taskId", "unknown"))
@@ -2674,6 +2716,8 @@ class LocalFirstOrchestrator:
             return "EXECUTOR_CRASHED"
         self._record_executor_success(task_id, result, exit_code)
         self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_FOUND", self.state, pid=self.state.get("codexPid"), exitCode=exit_code, resultPath=result_path)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_READY", self.state)
         return "RESULT_READY"
 
     def deliver_result(self, bridge: Any) -> None:
@@ -2687,11 +2731,13 @@ class LocalFirstOrchestrator:
                        "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
         payload = instruction + report
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ATTEMPT", self.state, hash=payload_hash)
         prior_hash = self.state.get("architectDeliveryPayloadHash")
         delivery_state = self.state.get("architectSendState")
         if prior_hash == payload_hash and delivery_state == "CONFIRMED":
             self.state.update({"state": "ARCHITECT_RUNNING", "architectResultFingerprint": None})
             self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash, disposition="ALREADY_DELIVERED")
             return
         ambiguous_history = self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_AMBIGUOUS"
         delivery_probe = getattr(bridge, "latest_user_message", None)
@@ -2708,6 +2754,7 @@ class LocalFirstOrchestrator:
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
                 self.save()
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
                 return
             self.state["architectSendState"] = "FAILED"
         baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
@@ -2731,9 +2778,11 @@ class LocalFirstOrchestrator:
             failure_class = "ARCHITECT_DELIVERY_AMBIGUOUS" if ambiguous else "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
             self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS" if ambiguous else "FAILED", "architectSendError": code, "architectDeliveryFailureClass": failure_class})
             self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_FAILED", self.state, errorClass=code, failureClass=failure_class)
             raise
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash)
 
     def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
         """Reconcile or deliver one result without exiting the resident watcher."""
@@ -2758,6 +2807,8 @@ class LocalFirstOrchestrator:
                 if attempt + 1 >= max_attempts:
                     self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED", "architectTransportRecoveryCount": attempt + 1})
                     self.save()
+                    runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_EXHAUSTED", self.state, reason="ARCHITECT_RESULT_TRANSPORT_EXHAUSTED")
+                    runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_REQUIRED", self.state, reason="ARCHITECT_RESULT_TRANSPORT_EXHAUSTED")
                     return None
                 time.sleep(0.25)
         return None
@@ -2783,6 +2834,7 @@ class LocalFirstOrchestrator:
             "promptEnd",
             "</ORCHESTRATOR_RESULT>",
         ])
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "FORMAT_RECOVERY_REQUESTED", self.state)
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
         sender(message)
         baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
@@ -2811,6 +2863,7 @@ class LocalFirstOrchestrator:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         consumed = self.state.setdefault("consumedArchitectResponses", {})
         if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_RESPONSE_DUPLICATE", self.state, hash=fingerprint)
             return {"action": "DUPLICATE"}
         task_id = str(self.state.get("taskId") or self._architect_response_task_id(response) or "")
         if not task_id:
@@ -2844,6 +2897,7 @@ class LocalFirstOrchestrator:
             self.state.update({"state": "IDLE", "nextPromptPath": None})
         consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED"}
         self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_RESPONSE_ACCEPTED", self.state, hash=fingerprint, classification=decision["classification"], action=decision["action"])
         return decision
 
     def launch_next(self, launcher: Callable[[str, Path], Any]) -> Any:
@@ -2965,7 +3019,17 @@ def main() -> None:
     except RuntimeError as error:
         print(str(error))
         return
+    logger = None
+    run_id = None
+    try:
+        logger, run_id, log_path = initialize_runtime_logging(state_dir)
+    except Exception as error:
+        print(f"ORCHESTRATOR_LOGGING_INIT_FAILED error={type(error).__name__}:{error}")
+        instance_lock.release()
+        return
     watcher = LocalFirstOrchestrator(project, state_dir)
+    watcher.runtime_logger = logger
+    watcher.runtime_run_id = run_id
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     bind_memory_owner = getattr(watcher, "bind_architect_memory_owner", None)
     if bind_memory_owner is not None:
@@ -2988,14 +3052,20 @@ def main() -> None:
         recovery_state, watcher.state.get("taskId") or "NONE", watcher.state.get("nextTaskId") or "NONE",
         watcher.state.get("lastCompletedTaskId") or "NONE", watcher.state.get("codexPid") or "NONE",
         watcher.state.get("architectSendState") or "NONE", watcher.state.get("architectConversationId") or "NONE", recovery_action))
+    runtime_log(logger, run_id, "WATCHER_STARTED", watcher.state, source=log_path)
+    runtime_log(logger, run_id, "STATE_RECOVERED", watcher.state, recoveryAction=recovery_action)
     launch = visible_executor_launcher(project, watcher)
     idle_bridge = None
+    last_logged_state = recovery_state
     try:
         while True:
             rollover = getattr(watcher, "session_rollover", None)
             if rollover is not None:
                 rollover.sample_memory()
             state = watcher.state.get("state", "IDLE")
+            if state != last_logged_state:
+                runtime_log(logger, run_id, "STATE_TRANSITION", watcher.state, **{"from": last_logged_state, "to": state, "reason": watcher.state.get("humanRequiredReason")})
+                last_logged_state = state
             if state != "IDLE" and idle_bridge is not None:
                 idle_bridge.close()
                 idle_bridge = None
@@ -3005,7 +3075,13 @@ def main() -> None:
                     continue
                 if idle_bridge is None:
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
-                    idle_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                    runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+                    try:
+                        idle_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                    except Exception as error:
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
+                        raise
+                    runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                 try:
                     watcher.inspect_idle_architect(idle_bridge, launch)
                 except Exception:
@@ -3025,8 +3101,11 @@ def main() -> None:
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
+                runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
+                runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
                 process = watcher.launch_next(launch)
                 print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
+                runtime_log(logger, run_id, "CODEX_STARTED", watcher.state, pid=process.pid, attempt=watcher.state.get("executorAttemptNumber"))
                 continue
             if state == "HUMAN_REQUIRED":
                 state = run_human_required_startup_once(watcher, launch)
@@ -3039,7 +3118,15 @@ def main() -> None:
                 return
 
             conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
-            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+            try:
+                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            except Exception as error:
+                runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
+                raise
+            runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
+            if bridge.generation_visible():
+                runtime_log(logger, run_id, "ARCHITECT_GENERATION_STARTED", watcher.state, conversationId=conversation_id)
             watcher.state["architectConversationId"] = conversation_id
             watcher.save()
             try:
@@ -3071,6 +3158,7 @@ def main() -> None:
                 while True:
                     try:
                         observed = bridge.wait_for_new_response(baseline, poll_interval=5.0)
+                        runtime_log(logger, run_id, "ARCHITECT_GENERATION_FINISHED", watcher.state, conversationId=conversation_id)
                     except Exception:
                         watcher.state["state"] = "ARCHITECT_RUNNING"
                         watcher.save()
@@ -3115,10 +3203,16 @@ def main() -> None:
                     bridge.close()
     except KeyboardInterrupt:
         print("STATE=STOPPED")
+        runtime_log(logger, run_id, "WATCHER_STOPPED", watcher.state, reason="keyboard_interrupt")
+    except Exception as error:
+        if logger is not None:
+            logger.exception("unhandled production main-loop exception", extra={"runId": run_id or "UNKNOWN", "state": watcher.state.get("state", "UNKNOWN"), "taskId": watcher.state.get("taskId") or watcher.state.get("nextTaskId") or "NONE", "event": "WATCHER_EXCEPTION", "errorClass": type(error).__name__, "errorMessage": str(error)})
+        raise
     finally:
         if idle_bridge is not None:
             idle_bridge.close()
         instance_lock.release()
+        runtime_log(logger, run_id, "WATCHER_STOPPED", watcher.state if 'watcher' in locals() else None)
 
 
 if __name__ == "__main__":

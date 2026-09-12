@@ -1991,3 +1991,25 @@ def test_historical_baseline_execute_is_never_launched(tmp_path):
     watcher.save()
     assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "ARCHITECT_RUNNING"
     assert len(bridge.sent) == 1 and launches == []
+
+
+def test_runtime_logging_is_durable_rotating_contextual_and_private(tmp_path):
+    logger, run_id, log_path = watcher_module.initialize_runtime_logging(tmp_path)
+    state = {"state": "RESULT_READY", "taskId": "task-1"}
+    watcher_module.runtime_log(logger, run_id, "WATCHER_STARTED", state)
+    watcher_module.runtime_log(logger, run_id, "STATE_TRANSITION", state, **{"from": "IDLE", "to": "RESULT_READY", "reason": "result", "hash": "abc"})
+    logger.handlers[0].flush()
+    text = Path(log_path).read_text(encoding="utf-8")
+    assert Path(log_path) == tmp_path / "logs" / "orchestrator.log"
+    assert run_id in text and "WATCHER_STARTED" in text and "from=IDLE" in text
+    assert "private prompt body" not in text
+    handler = logger.handlers[0]
+    assert handler.maxBytes == 5 * 1024 * 1024 and handler.backupCount == 5
+
+
+def test_runtime_logging_initialization_fails_closed(tmp_path, monkeypatch):
+    def fail_handler(*_args, **_kwargs):
+        raise OSError("logging unavailable")
+    monkeypatch.setattr(watcher_module.logging.handlers, "RotatingFileHandler", fail_handler)
+    with pytest.raises(OSError, match="logging unavailable"):
+        watcher_module.initialize_runtime_logging(tmp_path)
