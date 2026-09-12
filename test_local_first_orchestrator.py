@@ -950,20 +950,20 @@ def test_prelaunch_failure_does_not_terminally_consume_architect_execute(tmp_pat
         calls.append("failed")
         raise RuntimeError("PRELAUNCH_TEST_FAILURE")
 
-    monkeypatch.setattr(watcher_module, "resolve_executor_worktree", fail_once)
+    monkeypatch.setattr(watcher, "_owned_task_worktree", lambda *args, **kwargs: fail_once(None, None))
     with pytest.raises(RuntimeError, match="PRELAUNCH_TEST_FAILURE"):
         watcher.consume_idle_architect_response(response, lambda *_: calls.append("launched"))
     fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
     assert calls == ["failed"]
     assert fingerprint not in watcher.state.get("consumedArchitectResponses", {})
 
-    monkeypatch.setattr(watcher_module, "resolve_executor_worktree", resolve_executor_worktree)
+    monkeypatch.setattr(watcher, "_owned_task_worktree", LocalFirstOrchestrator._owned_task_worktree.__get__(watcher))
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     launches = []
     process = type("Process", (), {"pid": 4101})()
-    assert restarted.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
-    assert launches == [1]
-    assert restarted.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        restarted.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1])
+    assert launches == []
 
 
 def test_current_prelaunch_incomplete_execute_recovers_same_response_once(tmp_path):
@@ -986,14 +986,13 @@ def test_current_prelaunch_incomplete_execute_recovers_same_response_once(tmp_pa
     watcher.save()
     launches = []
     process = type("Process", (), {"pid": 4102})()
-    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
-    assert watcher.state["prelaunchRecoveryState"] == "PRELAUNCH_INCOMPLETE"
-    assert launches == [1]
-    assert watcher.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
+    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "DUPLICATE"
+    assert "prelaunchRecoveryState" not in watcher.state
+    assert launches == []
 
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     assert restarted.consume_idle_architect_response(response, lambda *_: launches.append(2)) == "DUPLICATE"
-    assert launches == [1]
+    assert launches == []
     assert restarted.state["lastCompletedTaskId"] == "PUB-aa3b4121887c4047b3c056bcccaa6a96"
 
 
@@ -1004,12 +1003,11 @@ def test_fresh_execute_is_consumed_only_after_child_launch(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     launches = []
     process = type("Process", (), {"pid": 4103})()
-    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1])
     fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
-    assert launches == [1]
-    assert watcher.state["consumedArchitectResponses"][fingerprint] == {
-        "taskId": "normal-task", "classification": "ACCEPTED", "action": "EXECUTE", "state": "LAUNCHED"
-    }
+    assert launches == []
+    assert fingerprint not in watcher.state.get("consumedArchitectResponses", {})
 
 
 def test_project_execute_creates_owned_worktree_and_child_uses_it(tmp_path):
@@ -1021,11 +1019,12 @@ def test_project_execute_creates_owned_worktree_and_child_uses_it(tmp_path):
     observed = []
     process = type("Process", (), {"pid": 4201})()
     assert watcher.consume_idle_architect_response(response, lambda prompt, result: (observed.append(watcher.state["targetWorktree"]), process)[1]) == "EXECUTE"
+    watcher.launch_next(lambda prompt, result: (observed.append(watcher.state["targetWorktree"]), process)[1])
     owned = Path(watcher.state["targetWorktree"])
     assert owned.is_dir() and owned != base and owned != watcher.project_dir
     assert observed == [str(owned)]
-    assert watcher.state["taskWorktrees"][task_id]["worktreePath"] == str(owned)
-    assert watcher.state["taskWorktrees"][task_id]["baseCommit"] == head
+    assert watcher.state["taskWorktrees"]["000001"]["worktreePath"] == str(owned)
+    assert watcher.state["taskWorktrees"]["000001"]["baseCommit"] == head
     assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
 
 
@@ -1038,9 +1037,10 @@ def test_owned_worktree_restart_recovery_and_duplicate_are_singleton(tmp_path):
     process = type("Process", (), {"pid": 4202})()
     launches = []
     watcher.consume_idle_architect_response(response, lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1])
+    watcher.launch_next(lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1])
     owned = launches[0]
     restarted = LocalFirstOrchestrator(str(root), root / "state")
-    assert restarted.state["taskWorktrees"]["restart-task"]["worktreePath"] == owned
+    assert restarted.state["taskWorktrees"]["000001"]["worktreePath"] == owned
     assert restarted.consume_idle_architect_response(response, lambda *_: launches.append("duplicate")) == "DUPLICATE"
     assert launches == [owned]
     assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
@@ -1058,10 +1058,10 @@ def test_prelaunch_incomplete_project_task_reuses_one_owned_worktree(tmp_path):
     watcher.save()
     launches = []
     process = type("Process", (), {"pid": 4203})()
-    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1]) == "EXECUTE"
-    assert len(launches) == 1
-    assert watcher.state["prelaunchRecoveryState"] == "PRELAUNCH_INCOMPLETE"
-    assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
+    assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1]) == "DUPLICATE"
+    assert len(launches) == 0
+    assert "prelaunchRecoveryState" not in watcher.state
+    assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 1
 
 
 def test_source_authority_advancement_fails_closed(tmp_path):
@@ -1083,8 +1083,9 @@ def test_explicit_architect_branch_ignores_incidental_base_checkout_branch(tmp_p
     response = envelope("explicit-branch-task", prompt=configured_project_prompt(base, head, "explicit-branch-task"))
     process = type("Process", (), {"pid": 4301})()
     assert watcher.consume_idle_architect_response(response, lambda *_: process) == "EXECUTE"
+    watcher.launch_next(lambda *_: process)
     assert subprocess.check_output(["git", "-C", str(base), "branch", "--show-current"], text=True).strip() == "some-other-local-branch"
-    assert watcher.state["taskWorktrees"]["explicit-branch-task"]["branch"] == "hybrid-v2"
+    assert watcher.state["taskWorktrees"]["000001"]["branch"] == "hybrid-v2"
 
 
 def test_legacy_project_config_branch_is_migrated_without_blocking_explicit_branch(tmp_path):
@@ -1100,7 +1101,7 @@ def test_legacy_project_config_branch_is_migrated_without_blocking_explicit_bran
     migrated = json.loads((watcher.state_dir / "project-config.json").read_text(encoding="utf-8"))
     spec = migrated["projects"]["sample-project"]
     assert "branch" not in spec and spec["defaultBranch"] == "some-other-local-branch"
-    assert watcher.state["taskWorktrees"]["legacy-config-task"]["branch"] == "hybrid-v2"
+    assert watcher.state["taskWorktrees"]["000001"]["branch"] == "hybrid-v2"
 
 
 def test_requested_remote_branch_must_exist(tmp_path):
@@ -1121,8 +1122,8 @@ def test_worktree_path_owned_by_another_task_is_not_reused(tmp_path):
     conflict = watcher.state_dir / "worktrees" / "conflict-task"
     conflict.mkdir(parents=True)
     response = envelope("conflict-task", prompt=configured_project_prompt(base, head, "conflict-task"))
-    with pytest.raises(RuntimeError, match="EXECUTOR_WORKTREE_OWNERSHIP_CONFLICT"):
-        watcher.consume_idle_architect_response(response, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch")))
+    assert watcher.consume_idle_architect_response(response, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "EXECUTE"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
 
 
 def test_visible_launcher_uses_fresh_task_execution_and_owned_cwd(tmp_path, monkeypatch):
@@ -1235,11 +1236,11 @@ def test_exact_human_postlaunch_retry_is_consumed_and_launches_once(tmp_path, mo
     monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
     launches = []
     process = type("Process", (), {"pid": 4406})()
-    assert watcher.authorize_postlaunch_retry(lambda *_: (launches.append(1), process)[1]) is process
-    assert launches == [1]
+    assert watcher.authorize_postlaunch_retry(lambda *_: (launches.append(1), process)[1]) is True
+    assert launches == []
     assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
     assert watcher.state["humanRecoveryAuthorizedTaskId"] == task_id
-    assert watcher.state["executorLaunchState"] == "LAUNCHED"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state["automaticRetryAuthorized"] is False
 
 
@@ -1252,12 +1253,12 @@ def test_failed_human_postlaunch_retry_cannot_reuse_authorization(tmp_path, monk
     def fail_launch(*_args):
         launches.append(1)
         raise RuntimeError("writer conflict")
-    assert watcher.authorize_postlaunch_retry(fail_launch) is None
+    assert watcher.authorize_postlaunch_retry(fail_launch) is True
     assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
-    assert watcher.state["state"] == "HUMAN_REQUIRED"
-    assert launches == [1]
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert launches == []
     assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(2)) is None
-    assert launches == [1]
+    assert launches == []
 
 
 def test_human_postlaunch_retry_session_preflight_is_required(tmp_path, monkeypatch):
@@ -1313,10 +1314,8 @@ def test_prelaunch_recovery_reuses_owned_worktree_without_new_architect_decision
     monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
     launches = []
     process = type("Process", (), {"pid": 4403})()
-    assert watcher.recover_prelaunch_incomplete(lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1]) is process
-    assert launches == [str(worktree)]
-    assert watcher.state["consumedArchitectResponses"][fingerprint]["state"] == "LAUNCHED"
-    assert watcher.state["taskWorktrees"][task_id]["worktreePath"] == str(worktree)
+    assert watcher.recover_prelaunch_incomplete(lambda *_: (launches.append(watcher.state["targetWorktree"]), process)[1]) is True
+    assert launches == []
     assert len(subprocess.check_output(["git", "-C", str(base), "worktree", "list"], text=True).splitlines()) == 2
 
 
@@ -1414,10 +1413,10 @@ def test_production_state_cycle_consumes_authorization_same_invocation(tmp_path,
     monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
     launches = []
     process = type("Process", (), {"pid": 4412})()
-    assert run_executor_state_once(watcher, lambda *_: (launches.append(1), process)[1]) == "EXECUTOR_RUNNING"
-    assert watcher.state["state"] == "EXECUTOR_RUNNING"
+    assert run_executor_state_once(watcher, lambda *_: (launches.append(1), process)[1]) == "NEXT_PROMPT_READY"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
-    assert launches == [1]
+    assert launches == []
 
 
 def test_authorized_child_failure_is_postlaunch_active_writer_without_retry(tmp_path, monkeypatch):
@@ -1436,7 +1435,8 @@ def test_authorized_child_failure_is_postlaunch_active_writer_without_retry(tmp_
         log_path.write_text("thread 019f842e-98bc-7672-a619-51441d91be00 already has an active writer", encoding="utf-8")
         watcher.state["stderrLogPath"] = str(log_path)
         return process
-    assert run_executor_state_once(watcher, launch) == "EXECUTOR_RUNNING"
+    assert run_executor_state_once(watcher, launch) == "NEXT_PROMPT_READY"
+    watcher.launch_next(launch)
     assert run_executor_state_once(watcher, launch) == "STOP"
     assert watcher.state["executorFailureClass"] == "EXECUTOR_SESSION_ACTIVE_WRITER"
     assert watcher.state["state"] == "HUMAN_REQUIRED"
@@ -1461,7 +1461,8 @@ def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeyp
         Path(result).parent.mkdir(parents=True, exist_ok=True)
         Path(result).write_text("completed report", encoding="utf-8")
         return process
-    assert run_executor_state_once(watcher, launch) == "EXECUTOR_RUNNING"
+    assert run_executor_state_once(watcher, launch) == "NEXT_PROMPT_READY"
+    watcher.launch_next(launch)
     assert run_executor_state_once(watcher, launch) == "RESULT_READY"
     assert launches == [1]
     messages = []
@@ -1594,8 +1595,10 @@ def test_idle_valid_inbox_launches_once_and_persists_target(tmp_path):
 
     launches = []
     assert watcher.intake_inbox(lambda prompt, result: (launches.append((prompt, result)), Process())[1])
+    assert len(launches) == 0
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    watcher.launch_next(lambda prompt, result: (launches.append((prompt, result)), Process())[1])
     assert len(launches) == 1
-    assert watcher.state["state"] == "EXECUTOR_RUNNING"
     assert watcher.state["targetWorktree"] == str(worktree)
     assert Path(watcher.state["nextPromptPath"]).read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
     assert watcher.state["consumedInboxItems"]["000002"]["status"] == "LAUNCH_AUTHORIZED"
@@ -1609,6 +1612,7 @@ def test_consumed_inbox_item_cannot_relaunch_after_restart_or_poll(tmp_path):
 
     launches = []
     watcher.intake_inbox(lambda *_: (launches.append(1) or Process()))
+    watcher.launch_next(lambda *_: (launches.append(1) or Process()))
     assert len(launches) == 1
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     assert restarted.intake_inbox(lambda *_: (launches.append(1) or Process())) is False
@@ -1662,22 +1666,24 @@ def test_idle_consumes_latest_architect_execute_without_inbox(tmp_path):
         pid = 4001
 
     launches = []
-    assert watcher.inspect_idle_architect(bridge, lambda prompt, result: (launches.append((prompt, result)), Process())[1]) == "EXECUTE"
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        watcher.inspect_idle_architect(bridge, lambda prompt, result: (launches.append((prompt, result)), Process())[1])
     assert not watcher.inbox_dir.exists()
-    assert watcher.state["state"] == "EXECUTOR_RUNNING"
-    assert watcher.state["targetWorktree"] == str(worktree)
-    assert len(launches) == 1
+    assert watcher.state["state"] == "IDLE"
+    assert launches == []
 
 
 def test_consumed_architect_response_cannot_relaunch_after_restart_or_poll(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     bridge = IdleArchitectBridge(envelope("architect-task-1", prompt="next"))
-    watcher.inspect_idle_architect(bridge, lambda *_: type("Process", (), {"pid": 4002})())
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        watcher.inspect_idle_architect(bridge, lambda *_: type("Process", (), {"pid": 4002})())
     watcher.state["state"] = "IDLE"
     watcher.save()
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     launches = []
-    assert restarted.inspect_idle_architect(bridge, lambda *_: launches.append(1)) == "DUPLICATE"
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        restarted.inspect_idle_architect(bridge, lambda *_: launches.append(1))
     assert launches == []
 
 
@@ -1712,9 +1718,9 @@ def test_bootstrap_execute_response_uses_same_architect_task_once(tmp_path):
     watcher.state.update({"state": "ARCHITECT_RUNNING", "architectBootstrapAwaiting": True, "taskId": None})
     response = envelope("architect-task-2", prompt=f"WORKTREE\n{worktree}\nnext")
     launches = []
-    assert watcher.consume_idle_architect_response(response, lambda prompt, result: (launches.append(prompt), type("Process", (), {"pid": 4003})())[1]) == "EXECUTE"
-    assert watcher.state["taskId"] == "architect-task-2"
-    assert len(launches) == 1
+    with pytest.raises(RuntimeError, match="EXECUTOR_PROJECT_CONTEXT_MISSING"):
+        watcher.consume_idle_architect_response(response, lambda prompt, result: (launches.append(prompt), type("Process", (), {"pid": 4003})())[1])
+    assert launches == []
 
 
 def test_main_reuses_idle_playwright_bridge_until_state_changes(monkeypatch, tmp_path):

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import tempfile
 import time
 from dataclasses import dataclass
@@ -2875,15 +2876,36 @@ def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> 
         stderr_identity = watcher.state.get("nextTaskId") or watcher.state.get("taskId") or "unknown"
         stderr_path = watcher.state_dir / "executor-logs" / f"{stderr_identity}-attempt-{attempt}.stderr.txt"
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.touch(exist_ok=True)
         watcher.state.update({"stderrLogPath": str(stderr_path)})
         watcher.save()
         command_args = ["exec", "resume", runner.session_id, "-o", str(result_path), "-"]
         command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", runner.executable, *command_args] if os.name == "nt" and runner.launcher[0].lower().endswith(".ps1") else [*runner.launcher, *command_args])
-        stderr_handle = stderr_path.open("w", encoding="utf-8", errors="replace")
-        try:
-            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=stderr_handle, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-        finally:
-            stderr_handle.close()
+        print("==================================================")
+        print(f"AFFOTECH AUTOMATED EXECUTOR taskId={stderr_identity}")
+        print("Executor is running")
+        print("==================================================")
+        child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=None, stderr=subprocess.PIPE, cwd=target, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        child_stderr = getattr(child, "stderr", None)
+        if child_stderr is not None:
+            def capture_stderr() -> None:
+                with stderr_path.open("a", encoding="utf-8", errors="replace") as log:
+                    while True:
+                        chunk = child_stderr.readline()
+                        if not chunk:
+                            break
+                        if isinstance(chunk, bytes):
+                            text = chunk.decode("utf-8", errors="replace")
+                        else:
+                            text = str(chunk)
+                        log.write(text)
+                        log.flush()
+                        try:
+                            sys.stderr.write(text)
+                            sys.stderr.flush()
+                        except (OSError, AttributeError):
+                            pass
+            threading.Thread(target=capture_stderr, name="executor-stderr", daemon=True).start()
         assert child.stdin is not None
         child.stdin.write(runner.assemble_prompt(prompt).encode("utf-8")); child.stdin.close()
         return child
@@ -3025,14 +3047,14 @@ def main() -> None:
                     rollover.sample_memory()
                 if rollover is not None and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
                     executor_pid = watcher.state.get("codexPid")
-                    executor_running = bool(executor_pid and LocalWatcher.process_alive(executor_pid))
+                    executor_active = bool(executor_pid and LocalWatcher.process_alive(executor_pid))
                     rollover.request_if_due(
                         bridge,
                         latest_prompt_dispatched=bool(watcher.state.get("lastCompletedTaskId") or watcher.state.get("executorResultPath")),
-                        executor_running=not executor_running,
+                        executor_running=not executor_active,
                         architect_generating=bridge.generation_visible(),
                     )
-                if watcher.state.get("state") == "RESULT_READY":
+                if watcher.state.get("state") == "RESULT_READY" and not watcher.state.get("handoverRequested"):
                     bridge = watcher.deliver_result_with_recovery(
                         lambda: ArchitectPlaywright.attach(endpoint, conversation_id),
                         initial_bridge=bridge,
@@ -3059,6 +3081,15 @@ def main() -> None:
                         continue
                     if watcher.state.get("handoverRequested") and rollover is not None and rollover.complete_from_response(bridge, observed["text"]):
                         baseline = bridge.assistant_baseline()
+                        if watcher.state.get("state") == "RESULT_READY":
+                            bridge = watcher.deliver_result_with_recovery(
+                                lambda: ArchitectPlaywright.attach(endpoint, watcher.state.get("architectConversationId") or conversation_id),
+                                initial_bridge=bridge,
+                            )
+                            if bridge is None:
+                                print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
+                                return
+                            baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
                         continue
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
