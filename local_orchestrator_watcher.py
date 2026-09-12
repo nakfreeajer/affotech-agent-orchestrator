@@ -2555,6 +2555,35 @@ class LocalFirstOrchestrator:
         response_consumed = bool(response_fingerprint and response_fingerprint in consumed)
         continuation_eligible = not response_has_envelope and not response_consumed and response_fingerprint != self.state.get("lastContinuationSourceFingerprint")
         if response:
+            consumed_record = consumed.get(response_fingerprint, {}) if response_fingerprint else {}
+            origin = consumed_record.get("origin") if isinstance(consumed_record, dict) else None
+            if response_consumed:
+                legacy_review = (
+                    not origin
+                    and str(self.state.get("taskId") or "") == str(self.state.get("lastCompletedTaskId") or "")
+                    and str(self.state.get("architectDeliveryTaskId") or "") == str(self.state.get("taskId") or "")
+                    and self.state.get("architectSendState") == "CONFIRMED"
+                    and isinstance(self.state.get("executorResultPath"), str)
+                    and Path(self.state["executorResultPath"]).is_file()
+                    and Path(self.state["executorResultPath"]).read_text(encoding="utf-8", errors="replace").strip()
+                    and self.state.get("state") == "IDLE"
+                )
+                if origin == "RESULT_REVIEW" or legacy_review:
+                    if legacy_review:
+                        consumed[response_fingerprint]["origin"] = "RESULT_REVIEW"
+                        self.save()
+                    if response_fingerprint != self.state.get("lastContinuationSourceFingerprint"):
+                        self.state["continuationSourceFingerprint"] = response_fingerprint
+                        self.save()
+                        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "IDLE_CONSUMED_RESPONSE", self.state, hash=response_fingerprint, origin="RESULT_REVIEW")
+                        sent = self.request_architect_bootstrap(bridge)
+                        if sent:
+                            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "IDLE_CONTINUATION_BOOTSTRAP_REQUESTED", self.state, hash=response_fingerprint, origin="RESULT_REVIEW")
+                            return "ARCHITECT_RUNNING"
+                    runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "IDLE_CONTINUATION_SUPPRESSED", self.state, hash=response_fingerprint, origin="RESULT_REVIEW", reason="already_requested")
+                    return "IDLE"
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "IDLE_CONTINUATION_SUPPRESSED", self.state, hash=response_fingerprint, origin=origin or "BOOTSTRAP", reason="consumed")
+                return "IDLE"
             for attempt in range(2):
                 try:
                     result = self.consume_idle_architect_response(response, launcher)
@@ -2899,7 +2928,7 @@ class LocalFirstOrchestrator:
         else:
             self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "IDLE", "nextPromptPath": None})
-        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED"}
+        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED", "origin": "BOOTSTRAP" if self.state.get("architectBootstrapAwaiting") else "RESULT_REVIEW"}
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_RESPONSE_ACCEPTED", self.state, hash=fingerprint, classification=decision["classification"], action=decision["action"])
         return decision

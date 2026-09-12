@@ -1873,20 +1873,22 @@ def test_consumed_response_recovers_newest_virtualized_architect_window(tmp_path
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     old_fp = hashlib.sha256(old.encode()).hexdigest()
     watcher.state.update({
-        "state": "IDLE",
-        "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
+        "state": "IDLE", "taskId": "old-stop", "lastCompletedTaskId": "old-stop",
+        "architectDeliveryTaskId": "old-stop", "architectSendState": "CONFIRMED",
+        "executorResultPath": str(tmp_path / "completed.txt"),
         "consumedArchitectResponses": {old_fp: {"action": "STOP", "classification": "ACCEPTED", "taskId": "old-stop"}},
         "architectResultFingerprint": old_fp,
     })
+    Path(watcher.state["executorResultPath"]).write_text("completed", encoding="utf-8")
     watcher.save()
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
-    assert bridge.restores == 1 and bridge.snapshots == 2 and len(bridge.sent) == 1
-    assert watcher.state["continuationSourceFingerprint"] == hashlib.sha256(new.encode()).hexdigest()
+    assert bridge.restores == 0 and bridge.snapshots == 1 and len(bridge.sent) == 1
+    assert watcher.state["continuationSourceFingerprint"] == old_fp
     assert watcher.state["architectContactCount"] == 1
     watcher.state["state"] = "IDLE"
     watcher.save()
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
-    assert bridge.restores == 1 and len(bridge.sent) == 1
+    assert bridge.restores == 0 and len(bridge.sent) == 1
 
 
 def test_consumed_response_at_bottom_restores_once_and_restore_failure_is_safe(tmp_path):
@@ -1907,11 +1909,11 @@ def test_consumed_response_at_bottom_restores_once_and_restore_failure_is_safe(t
         watcher = LocalFirstOrchestrator(str(tmp_path / str(fail)), tmp_path / ("work-" + str(fail)))
         watcher.state.update({"state": "IDLE", "consumedArchitectResponses": {old_fp: {"action": "STOP"}}})
         watcher.save()
-        assert watcher.inspect_idle_architect(bridge, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "DUPLICATE"
+        assert watcher.inspect_idle_architect(bridge, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "IDLE"
         watcher.state["state"] = "IDLE"
         watcher.save()
-        assert watcher.inspect_idle_architect(bridge, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "DUPLICATE"
-        assert bridge.restores == 1 and watcher.state["state"] == "IDLE"
+        assert watcher.inspect_idle_architect(bridge, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "IDLE"
+        assert bridge.restores == 0 and watcher.state["state"] == "IDLE"
 
 
 def test_live_generation_does_not_trigger_virtualized_bottom_recovery(tmp_path):
@@ -1943,27 +1945,25 @@ def test_stuck_production_state_uses_baseline_only_for_reconfirmation(tmp_path):
     launches = []
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({
-        "state": "IDLE",
-        "architectContactCount": 0,
-        "architectBootstrapAwaiting": False,
-        "architectBootstrapCount": 1,
-        "architectSendState": "CONFIRMED",
-        "architectResultFingerprint": old_fp,
-        "architectLiveBottomFingerprint": old_fp,
-        "lastCompletedTaskId": "PUB-aa3b4121887c4047b3c056bcccaa6a96",
-        "consumedArchitectResponses": {old_fp: {"action": "STOP", "classification": "ACCEPTED", "taskId": "old-stop"}},
+        "state": "IDLE", "taskId": "000021", "architectContactCount": 0,
+        "architectBootstrapAwaiting": False, "architectBootstrapCount": 1,
+        "architectSendState": "CONFIRMED", "architectDeliveryTaskId": "000021",
+        "executorResultPath": str(tmp_path / "completed.txt"),
+        "architectResultFingerprint": old_fp, "architectLiveBottomFingerprint": old_fp,
+        "lastCompletedTaskId": "000021",
+        "consumedArchitectResponses": {old_fp: {"action": "STOP", "classification": "ACCEPTED", "taskId": "000021"}},
         "architectBaseline": {"entries": [{"id": "old", "text": old}, {"id": "new", "text": new}]},
-        "taskId": None,
     })
+    Path(watcher.state["executorResultPath"]).write_text("completed", encoding="utf-8")
     watcher.save()
     assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "ARCHITECT_RUNNING"
     assert bridge.restores == 0 and len(bridge.sent) == 1 and launches == []
-    assert watcher.state["continuationSourceFingerprint"] == hashlib.sha256(new.encode()).hexdigest()
+    assert watcher.state["continuationSourceFingerprint"] == old_fp
     assert watcher.state["architectContactCount"] == 1
-    assert "architectLiveBottomFingerprint" not in watcher.state
+    assert watcher.state["architectLiveBottomFingerprint"] == old_fp
     watcher.state["state"] = "IDLE"
     watcher.save()
-    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "DUPLICATE"
+    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "IDLE"
     assert watcher.state["state"] == "IDLE"
     assert len(bridge.sent) == 1
 
@@ -1989,8 +1989,8 @@ def test_historical_baseline_execute_is_never_launched(tmp_path):
         "architectBaseline": {"entries": [{"id": "historical", "text": historical_execute}]},
     })
     watcher.save()
-    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "ARCHITECT_RUNNING"
-    assert len(bridge.sent) == 1 and launches == []
+    assert watcher.inspect_idle_architect(bridge, lambda *args: launches.append(args)) == "IDLE"
+    assert len(bridge.sent) == 0 and launches == []
 
 
 def test_runtime_logging_is_durable_rotating_contextual_and_private(tmp_path):
@@ -2013,6 +2013,64 @@ def test_runtime_logging_initialization_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher_module.logging.handlers, "RotatingFileHandler", fail_handler)
     with pytest.raises(OSError, match="logging unavailable"):
         watcher_module.initialize_runtime_logging(tmp_path)
+
+
+def _idle_result_review_fixture(tmp_path, origin=None):
+    response = envelope("000021", action="STOP")
+    fingerprint = hashlib.sha256(response.encode()).hexdigest()
+    result = tmp_path / "results" / "000021.txt"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text("completed report", encoding="utf-8")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    record = {"taskId": "000021", "action": "STOP", "classification": "ACCEPTED"}
+    if origin:
+        record["origin"] = origin
+    watcher.state.update({
+        "state": "IDLE", "taskId": "000021", "lastCompletedTaskId": "000021",
+        "architectDeliveryTaskId": "000021", "architectSendState": "CONFIRMED",
+        "executorResultPath": str(result), "consumedArchitectResponses": {fingerprint: record},
+    })
+    watcher.save()
+    return watcher, response, fingerprint
+
+
+def test_idle_consumed_result_review_stop_bootstraps_once(tmp_path):
+    watcher, response, fingerprint = _idle_result_review_fixture(tmp_path, "RESULT_REVIEW")
+    bridge = IdleArchitectBridge(response)
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert len(bridge.messages) == 1
+    assert watcher.state["continuationSourceFingerprint"] == fingerprint
+    watcher.state["state"] = "IDLE"
+    watcher.save()
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert len(bridge.messages) == 1
+
+
+def test_idle_bootstrap_stop_does_not_recurse(tmp_path):
+    watcher, response, _ = _idle_result_review_fixture(tmp_path, "BOOTSTRAP")
+    bridge = IdleArchitectBridge(response)
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert bridge.messages == []
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert bridge.messages == []
+
+
+def test_idle_legacy_consumed_result_review_migrates_and_bootstraps_once(tmp_path):
+    watcher, response, fingerprint = _idle_result_review_fixture(tmp_path)
+    bridge = IdleArchitectBridge(response)
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "ARCHITECT_RUNNING"
+    assert bridge.messages and watcher.state["consumedArchitectResponses"][fingerprint]["origin"] == "RESULT_REVIEW"
+    assert watcher.state["architectContactCount"] == 1
+
+
+def test_idle_legacy_consumed_response_without_completed_context_stays_quiet(tmp_path):
+    watcher, response, fingerprint = _idle_result_review_fixture(tmp_path)
+    watcher.state.update({"lastCompletedTaskId": "different", "architectDeliveryTaskId": "different"})
+    watcher.save()
+    bridge = IdleArchitectBridge(response)
+    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
+    assert bridge.messages == []
+    assert "origin" not in watcher.state["consumedArchitectResponses"][fingerprint]
 
 
 def _logging_test_watcher(tmp_path):
