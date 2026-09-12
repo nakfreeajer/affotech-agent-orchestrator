@@ -2013,3 +2013,68 @@ def test_runtime_logging_initialization_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher_module.logging.handlers, "RotatingFileHandler", fail_handler)
     with pytest.raises(OSError, match="logging unavailable"):
         watcher_module.initialize_runtime_logging(tmp_path)
+
+
+def _logging_test_watcher(tmp_path):
+    logger, run_id, path = watcher_module.initialize_runtime_logging(tmp_path)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.runtime_logger = logger
+    watcher.runtime_run_id = run_id
+    return watcher, logger, Path(path)
+
+
+def test_runtime_logging_executor_lifecycle_is_single_and_contextual(tmp_path):
+    watcher, logger, path = _logging_test_watcher(tmp_path)
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "targetWorktree": str(tmp_path)})
+    watcher.save()
+    watcher.mark_executor_started("task-1", 1234, tmp_path / "result.txt")
+    (tmp_path / "result.txt").write_text("terminal", encoding="utf-8")
+    watcher.mark_executor_exit(7, tmp_path / "result.txt")
+    logger.handlers[0].flush()
+    text = path.read_text(encoding="utf-8")
+    assert text.count("event=CODEX_STARTED") == 1
+    assert text.count("event=EXECUTOR_RESULT_FOUND") >= 1
+    assert "pid=1234" in text and "exitCode=7" in text
+
+
+def test_runtime_logging_delivery_ambiguity_and_exhaustion_are_explicit(tmp_path):
+    watcher, logger, path = _logging_test_watcher(tmp_path)
+    result = tmp_path / "result.txt"
+    result.write_text("private report body", encoding="utf-8")
+    watcher.state.update({"state": "RESULT_READY", "taskId": "task-2", "executorResultPath": str(result)})
+    watcher.save()
+
+    class AmbiguousBridge:
+        sendActionAttempted = True
+        sendActionAcknowledged = False
+        def assistant_baseline(self): return {"count": 0, "entries": []}
+        def submit_result_bounded(self, _payload): raise RuntimeError("ACK timeout")
+        def latest_user_message(self): return None
+
+    with pytest.raises(RuntimeError):
+        watcher.deliver_result(AmbiguousBridge())
+    logger.handlers[0].flush()
+    text = path.read_text(encoding="utf-8")
+    assert "event=RESULT_DELIVERY_AMBIGUOUS" in text
+    assert "private report body" not in text
+
+
+def test_runtime_logging_human_required_reasons_and_format_exhaustion(tmp_path):
+    watcher, logger, path = _logging_test_watcher(tmp_path)
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-3", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": "task-3"})
+    watcher.save()
+    watcher.request_format_recovery(type("Bridge", (), {})())
+    logger.handlers[0].flush()
+    text = path.read_text(encoding="utf-8")
+    assert "event=HUMAN_REQUIRED" in text and "reason=FORMAT_RECOVERY_EXHAUSTED" in text
+
+
+def test_runtime_logging_attach_failure_uses_actual_failure_event(tmp_path):
+    watcher, logger, path = _logging_test_watcher(tmp_path)
+    error = ValueError("replacement unavailable")
+    watcher_module.runtime_log(logger, watcher.runtime_run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId="new")
+    watcher_module.runtime_log(logger, watcher.runtime_run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId="new")
+    logger.handlers[0].flush()
+    text = path.read_text(encoding="utf-8")
+    assert "event=ARCHITECT_ATTACH_FAILED" in text and "errorClass=ValueError" in text
+    assert "replacement unavailable" in text

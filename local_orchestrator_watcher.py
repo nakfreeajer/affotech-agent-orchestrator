@@ -3166,14 +3166,20 @@ def main() -> None:
                     try:
                         observed = bridge.wait_for_new_response(baseline, poll_interval=5.0)
                         runtime_log(logger, run_id, "ARCHITECT_GENERATION_FINISHED", watcher.state, conversationId=conversation_id)
-                    except Exception:
+                    except Exception as error:
                         watcher.state["state"] = "ARCHITECT_RUNNING"
                         watcher.save()
-                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass="ARCHITECT_REATTACH_FAILED", conversationId=conversation_id)
+                        runtime_log(logger, run_id, "ARCHITECT_WAIT_INTERRUPTED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                         if bridge is not None:
                             bridge.close()
                         conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
-                        bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+                        try:
+                            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                        except Exception as attach_error:
+                            runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(attach_error).__name__, errorMessage=str(attach_error), conversationId=conversation_id)
+                            raise
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                         time.sleep(1.0)
                         continue
                     if watcher.state.get("handoverRequested") and rollover is not None and rollover.complete_from_response(bridge, observed["text"]):
