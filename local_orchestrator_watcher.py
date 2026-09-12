@@ -2507,6 +2507,7 @@ class LocalFirstOrchestrator:
             "classification=ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT",
             "action=EXECUTE|HUMAN_REQUIRED|STOP",
             "taskId=<task id>",
+            "documentation=NOT_REQUIRED|REQUIRED|COMPLETE",
             "promptBegin <complete Executor prompt only when action=EXECUTE>",
             "promptEnd",
             "</ORCHESTRATOR_RESULT>",

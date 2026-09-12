@@ -2405,6 +2405,9 @@ def test_idle_bootstrap_instruction_advertises_documentation_disposition(tmp_pat
     assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
     assert "milestone/release documentation closure" in message
     assert "Do not choose NOT_REQUIRED merely" in message
+    envelope_start = message.index("<ORCHESTRATOR_RESULT>")
+    template = message[envelope_start:]
+    assert template.index("taskId=<task id>") < template.index("documentation=NOT_REQUIRED|REQUIRED|COMPLETE") < template.index("promptBegin <complete Executor prompt only when action=EXECUTE>")
 
 
 def test_format_recovery_instruction_preserves_documentation_disposition(tmp_path):
