@@ -137,6 +137,52 @@ def test_final_envelope_persists_exact_prompt_and_duplicate_is_ignored(tmp_path)
     assert watcher.accept_architect_response(response)["action"] == "DUPLICATE"
 
 
+def test_architect_execute_stages_next_sequential_task_without_launching(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "000021", "taskSequence": 21})
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    response = envelope("000021", prompt=configured_project_prompt(base, head, "next-000022"))
+    launch_calls = []
+    decision = watcher.accept_architect_response(response)
+    assert decision["action"] == "EXECUTE"
+    assert watcher.state["nextTaskId"] == "000022"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert launch_calls == []
+    watcher.launch_next(lambda *_: launch_calls.append(1) or type("Process", (), {"pid": 22022})())
+    assert launch_calls == [1]
+
+
+def test_prelaunch_recovery_only_restores_next_prompt_ready(tmp_path, monkeypatch):
+    base, config, head = configured_git_project(tmp_path)
+    root = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(root), root / "state")
+    write_project_config(watcher, config)
+    task_id = "recovery-only"
+    prompt = configured_project_prompt(base, head, task_id)
+    worktree = watcher._owned_task_worktree(task_id, prompt)
+    prompt_path = watcher.prompts_dir / f"{task_id}.txt"
+    atomic_write(prompt_path, prompt.encode("utf-8"))
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": task_id, "nextTaskId": task_id,
+                          "nextPromptPath": str(prompt_path), "targetWorktree": str(worktree),
+                          "executorResultPath": str(tmp_path / "missing-result"), "codexPid": None,
+                          "lastCompletedTaskId": "completed"})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    calls = []
+    assert watcher.recover_prelaunch_incomplete(lambda *_: calls.append(1)) is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert calls == []
+
+
+def test_exhausted_result_transport_cleanup_accepts_null_bridge(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"architectSendState": "PENDING", "architectTransportRecoveryCount": 2})
+    watcher.save()
+    assert watcher.deliver_result_with_recovery(lambda: None, max_attempts=1, initial_bridge=None) is None
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
+
+
 @pytest.mark.parametrize("action,state", [("HUMAN_REQUIRED", "HUMAN_REQUIRED"), ("STOP", "IDLE")])
 def test_terminal_actions_launch_nothing(tmp_path, action, state):
     watcher = ready(tmp_path)
@@ -273,6 +319,9 @@ def test_000016_startup_shape_consumes_existing_response_once(tmp_path):
     launches = []
     process = type("Process", (), {"pid": 17016})()
     assert watcher.consume_idle_architect_response(response, lambda *_: (launches.append(1), process)[1]) == "EXECUTE"
+    assert launches == []
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    watcher.launch_next(lambda *_: (launches.append(1), process)[1])
     assert launches == [1]
     assert watcher.state["state"] == "EXECUTOR_RUNNING"
 

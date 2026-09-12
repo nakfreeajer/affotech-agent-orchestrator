@@ -2303,12 +2303,6 @@ class LocalFirstOrchestrator:
                 consumed[identity] = {"source": str(source), "canonicalPrompt": str(canonical), "status": "LAUNCH_AUTHORIZED"}
                 self.state.update({"state": "NEXT_PROMPT_READY", "taskId": identity, "nextTaskId": identity, "nextPromptPath": str(canonical), "targetProject": target, "targetRepo": target, "targetWorktree": target})
                 self.save()
-                try:
-                    self.launch_next(launcher)
-                except Exception as error:
-                    consumed[identity].update({"status": "LAUNCH_FAILED", "error": type(error).__name__})
-                    self.state.update({"state": "HUMAN_REQUIRED", "inboxFailure": "INBOX_LAUNCH_FAILED"})
-                    self.save()
                 return True
             except (OSError, UnicodeError, RuntimeError) as error:
                 failures[identity] = {"source": str(source), "error": str(error)}
@@ -2324,45 +2318,9 @@ class LocalFirstOrchestrator:
         match = ORCHESTRATOR_RESULT_RE.search(candidate)
         return match.group(3).strip() if match else None
 
-    def consume_idle_architect_response(self, response: str, launcher: Callable[[str, Path], Any]) -> str:
-        """Consume one valid Architect envelope without requiring an inbox file."""
-        fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
-        task_id = self._architect_response_task_id(response)
-        consumed = self.state.setdefault("consumedArchitectResponses", {})
-        existing_fingerprint = fingerprint if fingerprint in consumed else next((key for key, item in consumed.items() if task_id and item.get("taskId") == task_id), None)
-        if existing_fingerprint:
-            existing = consumed.get(existing_fingerprint, {})
-            recoverable = existing.get("action") == "EXECUTE" and existing.get("state") != "LAUNCHED" and task_id and self._prelaunch_incomplete(task_id)
-            if not recoverable:
-                return "DUPLICATE"
-        if not task_id:
-            raise ValueError("ARCHITECT_ENVELOPE_INVALID")
-        decision = parse_orchestrator_result(response, task_id)
-        self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
-        if decision["action"] == "EXECUTE":
-            if existing_fingerprint:
-                self._validate_prelaunch_recovery(task_id, decision["prompt"])
-                consumed.pop(existing_fingerprint, None)
-                self.state["prelaunchRecoveryState"] = "PRELAUNCH_INCOMPLETE"
-                self.save()
-            owned_worktree = self._owned_task_worktree(task_id, decision["prompt"])
-            target = str(owned_worktree) if owned_worktree else resolve_executor_worktree(decision["prompt"], self._configured_fallback_project())
-            canonical = self.prompts_dir / f"{task_id}.txt"
-            if canonical.exists() and not (self.state.get("state") == "NEXT_PROMPT_READY" and self.state.get("nextTaskId") == task_id):
-                raise RuntimeError("ARCHITECT_TASK_ALREADY_CANONICAL")
-            if not canonical.exists():
-                atomic_write(canonical, decision["prompt"].encode("utf-8"))
-            self.state.update({"state": "NEXT_PROMPT_READY", "taskId": task_id, "nextTaskId": task_id, "nextPromptPath": str(canonical), "targetProject": target, "targetRepo": target, "targetWorktree": target, "architectResultFingerprint": fingerprint})
-            self.save()
-            self.launch_next(launcher)
-            consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "LAUNCHED"}
-            self.save()
-            return "EXECUTE"
-        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED"}
-        self.state["architectResultFingerprint"] = fingerprint
-        self.state["state"] = "HUMAN_REQUIRED" if decision["action"] == "HUMAN_REQUIRED" else "IDLE"
-        self.save()
-        return decision["action"]
+    def consume_idle_architect_response(self, response: str, launcher: Callable[[str, Path], Any] | None = None) -> str:
+        """Use the canonical Architect decision staging path after IDLE recovery."""
+        return self.accept_architect_response(response)["action"]
 
     def _prelaunch_incomplete(self, task_id: str) -> bool:
         """Recognize an EXECUTE transaction that never reached a child or result."""
@@ -2439,14 +2397,9 @@ class LocalFirstOrchestrator:
                 raise RuntimeError("PRELAUNCH_WORKTREE_NOT_OWNED")
             self.state.update({"state": "NEXT_PROMPT_READY", "taskId": task_id, "nextTaskId": task_id, "targetProject": str(owned), "targetRepo": str(owned), "targetWorktree": str(owned), "prelaunchRecoveryState": "PRELAUNCH_INCOMPLETE"})
             self.save()
-            process = self.launch_next(launcher)
-            fingerprint = self.state.get("architectResultFingerprint")
-            consumed = self.state.get("consumedArchitectResponses", {})
-            if isinstance(fingerprint, str) and isinstance(consumed.get(fingerprint), dict):
-                consumed[fingerprint]["state"] = "LAUNCHED"
-            self.state["prelaunchRecoveryState"] = "RECOVERED_AND_LAUNCHED"
+            self.state["prelaunchRecoveryState"] = "RECOVERABLE"
             self.save()
-            return process
+            return True
         except (OSError, UnicodeError, RuntimeError) as error:
             self.state.update({"state": "HUMAN_REQUIRED", "prelaunchRecoveryError": str(error)})
             self.save()
@@ -2481,12 +2434,7 @@ class LocalFirstOrchestrator:
             verify_executor_session(str(self.state.get("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)))
             self.state.update({"humanRecoveryAuthorizationConsumed": True, "humanRecoveryAuthorizedTaskId": task_id, "automaticRetryAuthorized": False, "state": "NEXT_PROMPT_READY", "nextTaskId": task_id, "targetProject": str(owned), "targetRepo": str(owned), "targetWorktree": str(owned)})
             self.save()
-            try:
-                return self.launch_next(launcher)
-            except Exception as error:
-                self.state.update({"state": "HUMAN_REQUIRED", "executorLaunchState": "POSTLAUNCH_NO_RESULT", "humanRecoveryAuthorizationError": f"HUMAN_RECOVERY_LAUNCH_FAILED:{type(error).__name__}"})
-                self.save()
-                return None
+            return True
         except (OSError, UnicodeError, RuntimeError) as error:
             self.state.update({"state": "HUMAN_REQUIRED", "automaticRetryAuthorized": False, "humanRecoveryAuthorizationError": str(error)})
             self.save()
@@ -2860,13 +2808,20 @@ class LocalFirstOrchestrator:
 
     def accept_architect_response(self, response: str) -> dict[str, str]:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
-        if fingerprint == self.state.get("architectResultFingerprint"):
+        consumed = self.state.setdefault("consumedArchitectResponses", {})
+        if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:
             return {"action": "DUPLICATE"}
-        decision = parse_orchestrator_result(response, str(self.state["taskId"]))
-        task_id = str(self.state["taskId"])
+        task_id = str(self.state.get("taskId") or self._architect_response_task_id(response) or "")
+        if not task_id:
+            raise ValueError("ARCHITECT_ENVELOPE_INVALID")
+        decision = parse_orchestrator_result(response, task_id)
         self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
         if decision["action"] == "EXECUTE":
-            sequence = int(self.state.get("taskSequence", 0)) + 1
+            current_sequence = int(self.state.get("taskSequence", 0))
+            current_task = str(self.state.get("taskId") or "")
+            if current_task.isdigit():
+                current_sequence = max(current_sequence, int(current_task))
+            sequence = current_sequence + 1
             next_id = f"{sequence:06d}"
             path = self.prompts_dir / f"{next_id}.txt"
             target = self._owned_task_worktree(next_id, decision["prompt"], context_task_id=str(self.state.get("taskId") or ""))
@@ -2886,6 +2841,7 @@ class LocalFirstOrchestrator:
         else:
             self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "IDLE", "nextPromptPath": None})
+        consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED"}
         self.save()
         return decision
 
@@ -2940,6 +2896,8 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
     state = watcher.state.get("state", "IDLE")
     if state == "EXECUTOR_RUNNING":
         state = watcher.wait_for_executor()
+        if state != "EXECUTOR_RUNNING":
+            print("CODEX_FINISHED taskId=%s pid=%s exitCode=%s" % (watcher.state.get("taskId"), watcher.state.get("codexPid"), watcher.state.get("executorExitCode")))
         if state == "EXECUTOR_CRASHED":
             watcher.state["state"] = "HUMAN_REQUIRED"
             watcher.save()
@@ -2949,12 +2907,10 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
     if watcher.state.get("state") == "HUMAN_REQUIRED":
         recovered = watcher.recover_prelaunch_incomplete(launch)
         if recovered is not None:
-            print(f"CODEX_STARTED pid={recovered.pid}")
-            return "EXECUTOR_RUNNING"
+            return "NEXT_PROMPT_READY"
         recovered = watcher.authorize_postlaunch_retry(launch)
         if recovered is not None:
-            print(f"CODEX_STARTED pid={recovered.pid}")
-            return "EXECUTOR_RUNNING"
+            return "NEXT_PROMPT_READY"
         print("STATE=HUMAN_REQUIRED")
         return "STOP"
     return watcher.state.get("state", "IDLE")
@@ -2997,6 +2953,19 @@ def main() -> None:
             print(f"ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED reason={error}")
             instance_lock.release()
             return
+    recovery_state = watcher.state.get("state", "IDLE")
+    recovery_action = {
+        "EXECUTOR_RUNNING": "WAIT_EXISTING_EXECUTOR",
+        "RESULT_READY": "DELIVER_RESULT",
+        "ARCHITECT_RUNNING": "WAIT_ARCHITECT",
+        "NEXT_PROMPT_READY": "LAUNCH_EXECUTOR",
+        "HUMAN_REQUIRED": "STOP_FOR_HUMAN",
+        "IDLE": "WAIT_IDLE",
+    }.get(recovery_state, "STOP_FOR_HUMAN")
+    print("WATCHER_STARTED state=%s taskId=%s nextTaskId=%s lastCompletedTaskId=%s codexPid=%s architectSendState=%s architectConversationId=%s recoveryAction=%s" % (
+        recovery_state, watcher.state.get("taskId") or "NONE", watcher.state.get("nextTaskId") or "NONE",
+        watcher.state.get("lastCompletedTaskId") or "NONE", watcher.state.get("codexPid") or "NONE",
+        watcher.state.get("architectSendState") or "NONE", watcher.state.get("architectConversationId") or "NONE", recovery_action))
     launch = visible_executor_launcher(project, watcher)
     idle_bridge = None
     try:
@@ -3018,7 +2987,8 @@ def main() -> None:
                 try:
                     watcher.inspect_idle_architect(idle_bridge, launch)
                 except Exception:
-                    idle_bridge.close()
+                    if idle_bridge is not None:
+                        idle_bridge.close()
                     idle_bridge = None
                     raise
                 if watcher.state.get("state") == "IDLE":
@@ -3034,11 +3004,11 @@ def main() -> None:
                 continue
             if state == "NEXT_PROMPT_READY":
                 process = watcher.launch_next(launch)
-                print(f"CODEX_STARTED pid={process.pid}")
+                print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
                 state = run_human_required_startup_once(watcher, launch)
-                if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING"}:
+                if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY"}:
                     continue
                 print("STATE=HUMAN_REQUIRED")
                 return
@@ -3053,9 +3023,13 @@ def main() -> None:
             try:
                 if rollover is not None:
                     rollover.sample_memory()
-                if rollover is not None and watcher.state.get("state") == "ARCHITECT_RUNNING":
+                if rollover is not None and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
+                    executor_pid = watcher.state.get("codexPid")
+                    executor_running = bool(executor_pid and LocalWatcher.process_alive(executor_pid))
                     rollover.request_if_due(
-                        bridge, latest_prompt_dispatched=True, executor_running=True,
+                        bridge,
+                        latest_prompt_dispatched=bool(watcher.state.get("lastCompletedTaskId") or watcher.state.get("executorResultPath")),
+                        executor_running=not executor_running,
                         architect_generating=bridge.generation_visible(),
                     )
                 if watcher.state.get("state") == "RESULT_READY":
@@ -3106,7 +3080,8 @@ def main() -> None:
                         return
                     break
             finally:
-                bridge.close()
+                if bridge is not None:
+                    bridge.close()
     except KeyboardInterrupt:
         print("STATE=STOPPED")
     finally:
