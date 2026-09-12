@@ -2749,9 +2749,7 @@ class LocalFirstOrchestrator:
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_READY", self.state)
         return "RESULT_READY"
 
-    def deliver_result(self, bridge: Any) -> None:
-        if self.state.get("state") != "RESULT_READY":
-            raise RuntimeError("RESULT_NOT_READY")
+    def _result_delivery_payload(self) -> tuple[str, str]:
         path = Path(self.state["executorResultPath"])
         report = path.read_text(encoding="utf-8")
         task_id = str(self.state["taskId"])
@@ -2759,7 +2757,66 @@ class LocalFirstOrchestrator:
                        "and finish with exactly one <ORCHESTRATOR_RESULT> envelope using taskId=" + task_id + ".\n"
                        "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
         payload = instruction + report
-        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _delivery_evidence_advanced(self, bridge: Any, payload: str) -> bool:
+        user_baseline = self.state.get("architectDeliveryUserBaseline") or {}
+        if hasattr(bridge, "user_baseline"):
+            current = bridge.user_baseline()
+            if isinstance(current, dict) and isinstance(user_baseline, dict):
+                if int(current.get("count", 0)) > int(user_baseline.get("count", 0)):
+                    return True
+                if current.get("text_hash") and current.get("text_hash") != user_baseline.get("text_hash"):
+                    return True
+        assistant_baseline = self.state.get("architectDeliveryBaseline") or {}
+        if hasattr(bridge, "assistant_baseline"):
+            current = bridge.assistant_baseline()
+            if isinstance(current, dict) and isinstance(assistant_baseline, dict):
+                if int(current.get("count", 0)) > int(assistant_baseline.get("count", 0)):
+                    return True
+                if current.get("text_hash") and current.get("text_hash") != assistant_baseline.get("text_hash"):
+                    return True
+        if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
+            return True
+        latest = getattr(bridge, "latest_user_message", None)
+        if callable(latest):
+            observed = latest()
+            if isinstance(observed, str) and observed.strip() and normalize_prompt(observed) == normalize_prompt(payload):
+                return True
+        return False
+
+    def clear_confirmed_stale_composer(self, bridge: Any, payload: str, payload_hash: str) -> bool:
+        composer = getattr(bridge, "_live_composer", lambda: None)()
+        if composer is None:
+            return False
+        try:
+            observed = composer.inner_text(timeout=1000)
+            if isinstance(observed, str) and observed.strip() and normalize_prompt(observed) == normalize_prompt(payload):
+                composer.fill("")
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_STALE_COMPOSER_CLEARED", self.state, hash=payload_hash)
+                return True
+        except Exception:
+            return False
+        return False
+
+    def reconcile_exhausted_result_delivery(self, bridge: Any) -> bool:
+        if self.state.get("state") != "HUMAN_REQUIRED" or self.state.get("humanRequiredReason") != "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
+            return False
+        payload, payload_hash = self._result_delivery_payload()
+        if self.state.get("architectDeliveryPayloadHash") != payload_hash or not self._delivery_evidence_advanced(bridge, payload):
+            return False
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectDeliveryFailureClass": None, "architectSendError": None})
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
+        self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
+        return True
+
+    def deliver_result(self, bridge: Any) -> None:
+        if self.state.get("state") != "RESULT_READY":
+            raise RuntimeError("RESULT_NOT_READY")
+        path = Path(self.state["executorResultPath"])
+        payload, payload_hash = self._result_delivery_payload()
+        task_id = str(self.state["taskId"])
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ATTEMPT", self.state, hash=payload_hash)
         prior_hash = self.state.get("architectDeliveryPayloadHash")
         delivery_state = self.state.get("architectSendState")
@@ -2772,6 +2829,13 @@ class LocalFirstOrchestrator:
         delivery_probe = getattr(bridge, "latest_user_message", None)
         can_reconcile_delivery = callable(delivery_probe)
         if prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
+            if self._delivery_evidence_advanced(bridge, payload):
+                baseline = self.state.get("architectDeliveryBaseline")
+                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
+                self.save()
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
+                self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
+                return
             observed = None
             if can_reconcile_delivery:
                 observed = delivery_probe()
@@ -2785,13 +2849,19 @@ class LocalFirstOrchestrator:
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
                 self.save()
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
+                self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
                 return
-            self.state["architectSendState"] = "FAILED"
+            self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_DELIVERY_AMBIGUOUS", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode="ARCHITECT_DELIVERY_AMBIGUOUS")
+            raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
         baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
+        user_baseline = bridge.user_baseline() if hasattr(bridge, "user_baseline") else None
         self.state.update({
             "architectDeliveryTaskId": task_id,
             "architectDeliveryPayloadHash": payload_hash,
             "architectDeliveryBaseline": baseline,
+            "architectDeliveryUserBaseline": user_baseline,
             "architectSendState": "PENDING",
             "architectSendError": None,
             "state": "RESULT_READY",
@@ -2815,6 +2885,7 @@ class LocalFirstOrchestrator:
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash)
+        self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
 
     def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
         """Reconcile or deliver one result without exiting the resident watcher."""
@@ -3144,6 +3215,18 @@ def main() -> None:
                 print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
+                if watcher.state.get("humanRequiredReason") == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
+                    conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+                    runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+                    try:
+                        recovery_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
+                        if watcher.reconcile_exhausted_result_delivery(recovery_bridge):
+                            recovery_bridge.close()
+                            continue
+                        recovery_bridge.close()
+                    except Exception as error:
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 state = run_human_required_startup_once(watcher, launch)
                 if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY"}:
                     continue

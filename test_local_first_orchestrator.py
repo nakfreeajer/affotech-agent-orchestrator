@@ -550,7 +550,8 @@ def test_ambiguous_result_delivery_retries_once_when_exact_payload_absent(tmp_pa
         def assistant_baseline(self): return {"count": 2, "entries": []}
         def submit_result_bounded(self, message): sends.append(message)
     restarted.deliver_result(AbsentBridge())
-    assert len(sends) == 1
+    assert len(sends) == 0
+    assert restarted.state["state"] == "ARCHITECT_RUNNING"
 
 
 def test_confirmed_identical_result_delivery_is_terminally_idempotent(tmp_path):
@@ -678,7 +679,7 @@ def test_resident_recovery_retries_ambiguous_delivery_only_when_absent(tmp_path)
         def close(self): pass
     watcher.deliver_result_with_recovery(lambda: ReattachedBridge(), initial_bridge=FirstBridge())
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
-    assert len(sends) == 2
+    assert len(sends) == 1
 
 
 def test_resident_recovery_exhaustion_preserves_result_and_stops_safely(tmp_path):
