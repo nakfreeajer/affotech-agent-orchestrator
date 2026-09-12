@@ -2272,3 +2272,49 @@ def test_stale_composer_cleanup_does_not_clear_unrelated_or_unverified_text(tmp_
     bridge = type("Bridge", (), {"_live_composer": lambda self: failed})()
     assert watcher.clear_confirmed_stale_composer(bridge, payload, payload_hash) is False
     assert failed.text == payload
+
+
+def test_architect_stop_clears_stale_transport_reason(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["humanRequiredReason"] = "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
+    watcher.accept_architect_response(envelope("task-1", action="STOP"))
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state["humanRequiredReason"] is None
+
+
+def test_architect_human_required_replaces_stale_transport_reason(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["humanRequiredReason"] = "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
+    watcher.accept_architect_response(envelope("task-1", action="HUMAN_REQUIRED"))
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_DECISION_HUMAN_REQUIRED"
+    assert watcher.reconcile_exhausted_result_delivery(_DeliveryEvidenceBridge(generating=True)) is False
+
+
+def test_architect_execute_clears_stale_transport_reason(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    watcher.state.update({"taskId": "000021", "taskSequence": 21, "state": "ARCHITECT_RUNNING", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"})
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    watcher.accept_architect_response(envelope("000021", prompt=configured_project_prompt(base, head, "next-000022")))
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["humanRequiredReason"] is None
+    assert watcher.state["nextTaskId"] == "000022"
+
+
+def test_exhausted_delivery_reconciliation_clears_stale_reason(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["taskId"] = "000023"
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED", "architectDeliveryPayloadHash": payload_hash, "architectDeliveryBaseline": _baseline(1, "a" * 64)})
+    assert watcher.reconcile_exhausted_result_delivery(_DeliveryEvidenceBridge(assistant=_baseline(2, "b" * 64))) is True
+    assert watcher.state["humanRequiredReason"] is None
+
+
+def test_executor_success_clears_stale_human_reason(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "result.txt"
+    result.write_text("completed", encoding="utf-8")
+    watcher.state.update({"taskId": "000025", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"})
+    watcher._record_executor_success("000025", result, 0)
+    assert watcher.state["state"] == "RESULT_READY"
+    assert watcher.state["humanRequiredReason"] is None

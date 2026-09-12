@@ -2313,6 +2313,7 @@ class LocalFirstOrchestrator:
             "executorProcessState": "COMPLETED_WITH_RESULT",
             "executorFailureClass": None,
             "executorCrash": None,
+            "humanRequiredReason": None,
             "repositoryEvidence": repository_evidence(self.project_dir),
             "formatRecoveryCount": 0,
             "formatRecoveryExhausted": False,
@@ -2813,7 +2814,7 @@ class LocalFirstOrchestrator:
         payload, payload_hash = self._result_delivery_payload()
         if self.state.get("architectDeliveryPayloadHash") != payload_hash or not self._delivery_evidence_advanced(bridge, payload):
             return False
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectDeliveryFailureClass": None, "architectSendError": None})
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectDeliveryFailureClass": None, "architectSendError": None, "humanRequiredReason": None})
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
         self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
@@ -2839,7 +2840,7 @@ class LocalFirstOrchestrator:
         if prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
             if self._delivery_evidence_advanced(bridge, payload):
                 baseline = self.state.get("architectDeliveryBaseline")
-                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
+                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
                 self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
@@ -2854,7 +2855,7 @@ class LocalFirstOrchestrator:
                 raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
             if observed == payload or normalize_prompt(observed) == normalize_prompt(payload):
                 baseline = self.state.get("architectDeliveryBaseline")
-                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
+                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
                 self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
@@ -2890,7 +2891,7 @@ class LocalFirstOrchestrator:
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode=code, failureClass=failure_class, attempt=self.state.get("architectTransportRecoveryCount"))
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_FAILED", self.state, errorClass=code, failureClass=failure_class)
             raise
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline})
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash)
         self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
@@ -2950,7 +2951,7 @@ class LocalFirstOrchestrator:
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
         sender(message)
         baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
-        self.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": task_id, "architectBaseline": baseline})
+        self.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": task_id, "architectBaseline": baseline, "humanRequiredReason": None})
         self.save()
 
     def recover_stale_format_human_required(self) -> bool:
@@ -3000,13 +3001,13 @@ class LocalFirstOrchestrator:
                 atomic_write(path, prompt_bytes)
             self.state["architectResultFingerprint"] = fingerprint
             target_text = str(target)
-            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target_text, "targetRepo": target_text, "targetWorktree": target_text})
+            self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target_text, "targetRepo": target_text, "targetWorktree": target_text, "humanRequiredReason": None})
         elif decision["action"] == "HUMAN_REQUIRED":
             self.state["architectResultFingerprint"] = fingerprint
-            self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None})
+            self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None, "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})
         else:
             self.state["architectResultFingerprint"] = fingerprint
-            self.state.update({"state": "IDLE", "nextPromptPath": None})
+            self.state.update({"state": "IDLE", "nextPromptPath": None, "humanRequiredReason": None})
         consumed[fingerprint] = {"taskId": task_id, "classification": decision["classification"], "action": decision["action"], "state": "RECEIVED", "origin": "BOOTSTRAP" if self.state.get("architectBootstrapAwaiting") else "RESULT_REVIEW"}
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_RESPONSE_ACCEPTED", self.state, hash=fingerprint, classification=decision["classification"], action=decision["action"])
