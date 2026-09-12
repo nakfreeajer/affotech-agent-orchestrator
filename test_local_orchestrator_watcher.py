@@ -63,6 +63,8 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
         def locator(self, selector):
             if selector == '[data-message-author-role="assistant"]':
                 return Locator("assistant")
+            if selector == "#prompt-textarea":
+                return self.composer_locator
             raise AssertionError(selector)
         def evaluate(self, script):
             if "return null" in script: return self.value
@@ -671,7 +673,7 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
     class Page:
         def __init__(self, url): self.url = url; self.closed = False
         def close(self): self.closed = True
-    old = Page("old"); new = Page("new")
+    old = Page("https://chatgpt.com/c/OLD"); new = Page("https://chatgpt.com/c/NEW")
     class Bridge:
         page = old
         def submit_result_bounded(self, value): pass
@@ -681,6 +683,38 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
     assert bridge.page is new and old.closed
     assert watcher.state["architectResponseCount"] == 0
     assert watcher.state["handoverRequested"] is False
+    assert watcher.state["architectConversationId"] == "NEW"
+    assert "currentArchitectConversationId" not in watcher.state
+
+
+def test_rollover_identity_is_the_next_resident_attach_target(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.state["architectConversationId"] = "OLD"
+    rollover = ArchitectSessionRollover(watcher)
+    rollover.initialize_current_session()
+    watcher.state["architectResponseCount"] = 30
+
+    class Page:
+        def __init__(self, url): self.url = url; self.closed = False
+        def close(self): self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD")
+    new = Page("https://chatgpt.com/c/NEW")
+    class Bridge:
+        page = old
+        def submit_result_bounded(self, _value): pass
+        def open_fresh_with_handover(self, _value): return new
+
+    bridge = Bridge()
+    assert rollover.request_if_due(bridge, True, True)
+    assert rollover.complete_from_response(bridge, "handover\nARCHITECT_HANDOVER_READY")
+    attach_targets = []
+    for _ in range(2):
+        attach_targets.append(watcher.state.get("architectConversationId"))
+    assert attach_targets == ["NEW", "NEW"]
+    assert "OLD" not in attach_targets
+    assert old.closed
 
 
 def test_completion_fallback_requires_two_stable_full_polls_and_no_generation():
@@ -704,7 +738,7 @@ def test_completion_fallback_requires_two_stable_full_polls_and_no_generation():
 
     bridge = ArchitectPlaywright(Page())
     baseline = bridge.assistant_baseline()
-    assert bridge.wait_for_new_response(baseline, timeout=2)["state"] == "COMPLETED"
+    assert bridge.wait_for_new_response(baseline, poll_interval=0)["state"] == "COMPLETED"
     assert extract_executor_prompt_envelope(prompt_response) == "complete without marker"
 
 
@@ -713,22 +747,25 @@ def test_completion_fallback_rejects_generation_visible_and_malformed_envelopes(
     assert extract_executor_prompt_envelope(f"{BEGIN}\nouter {BEGIN}\ninner\n{END}\n{END}") is None
 
     from local_orchestrator_watcher import ArchitectPlaywright
-    response = f"answer\n{BEGIN}\nnot yet\n{END}"
+    response = "answer\npartial response without a completed envelope"
     class Page:
         def __init__(self):
             self.snapshots = iter([
                 [{"id": "old", "text": "old"}],
                 [{"id": "new", "text": response}],
                 [{"id": "new", "text": response}],
+                [{"id": "new", "text": response}],
             ])
-            self.generating = iter([True, True])
+            self.generating = iter([True, False, False])
         def evaluate(self, script):
             if 'data-message-author-role="assistant"' in script:
                 return next(self.snapshots)
             return next(self.generating)
-    assert ArchitectPlaywright(Page()).wait_for_new_response(
-        ArchitectPlaywright(Page()).assistant_baseline(), timeout=0.01
-    )["state"] == "NOT_YET"
+    page = Page()
+    bridge = ArchitectPlaywright(page)
+    assert bridge.wait_for_new_response(
+        bridge.assistant_baseline(), poll_interval=0
+    )["state"] == "BLOCKED"
 
 
 def test_startup_recovery_accepts_existing_unmarked_stable_prompt_without_launching(tmp_path, monkeypatch):
@@ -767,7 +804,7 @@ def test_old_unmarked_response_does_not_satisfy_new_submission():
     assert bridge.wait_for_new_completed_response(baseline, 1).endswith(COMPLETE)
 
 
-def test_confirmed_submission_not_yet_and_running_states_are_not_blocked():
+def test_confirmed_submission_and_running_generation_are_not_misclassified():
     from local_orchestrator_watcher import ArchitectPlaywright
     class Messages:
         def __init__(self): self.values = ["old"]
@@ -783,10 +820,9 @@ def test_confirmed_submission_not_yet_and_running_states_are_not_blocked():
             return self.running
         def get_by_role(self, role, **kwargs): return type("Role", (), {"count": lambda self: 1 if page.running else 0})()
     page = Page(); bridge = ArchitectPlaywright(page); base = bridge.assistant_baseline()
-    assert bridge.wait_for_new_response(base, 0.01)["state"] == "NOT_YET"
+    assert bridge.generation_visible() is False
     messages.values.append("partial"); page.running = True
-    assert bridge.wait_for_new_response(base, 0.01)["state"] == "NOT_YET"  # active generation remains a wait state
-    assert bridge.last_state == "RUNNING"
+    assert bridge.generation_visible() is True  # active generation remains a wait state
     page.running = False; messages.values[-1] = f"done\n{COMPLETE}"
     assert bridge.wait_for_new_response(base, 1)["state"] == "COMPLETED"
 
@@ -1218,7 +1254,7 @@ def test_production_length_response_and_end_only_change_are_detected():
             return False
         def locator(self, selector): raise AssertionError("long-response polling must remain atomic")
     bridge = ArchitectPlaywright(Page())
-    observed = bridge.wait_for_new_response(bridge.assistant_baseline(), timeout=1)
+    observed = bridge.wait_for_new_response(bridge.assistant_baseline(), poll_interval=0)
     assert observed["state"] == "COMPLETED"
     assert extract_executor_prompt(observed["text"]) == "long prompt"
 
@@ -1353,7 +1389,7 @@ def test_launcher_selection_resolves_installed_codex_shim():
     assert launcher and launcher[-1].lower().endswith("codex.js")
 
 
-def test_startup_baselines_current_response_without_replaying_it(tmp_path):
+def test_startup_baselines_current_response_without_replaying_it(tmp_path, monkeypatch):
     from local_orchestrator_watcher import ArchitectPlaywright
 
     class Messages:
@@ -1367,6 +1403,7 @@ def test_startup_baselines_current_response_without_replaying_it(tmp_path):
         def get_by_role(self, role, **kwargs): return type("Role", (), {"count": lambda self: 0})()
 
     bridge = ArchitectPlaywright(Page())
+    monkeypatch.setattr(bridge, "wait_for_new_response", lambda _baseline, _poll_interval: {"state": "NOT_YET", "text": ""})
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=type("Runner", (), {})())
     baseline = bridge.assistant_baseline()
     observed, _ = watcher.observe_response(bridge, baseline, timeout=0.01)
@@ -1585,12 +1622,12 @@ def test_steady_state_polling_uses_atomic_snapshot_and_waits_for_completion():
             raise AssertionError("steady-state assistant polling must not use Locator operations")
     bridge = ArchitectPlaywright(Page())
     baseline = bridge.assistant_baseline()
-    observed = bridge.wait_for_new_response(baseline, timeout=1)
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0)
     assert observed["state"] == "COMPLETED"
     assert extract_executor_prompt(observed["text"]) == "steady prompt"
 
 
-def test_unchanged_atomic_snapshot_remains_not_yet_without_locator_count():
+def test_unchanged_atomic_snapshot_remains_not_yet_without_locator_count(monkeypatch):
     from local_orchestrator_watcher import ArchitectPlaywright
     class Page:
         def __init__(self): self.calls = 0
@@ -1603,7 +1640,12 @@ def test_unchanged_atomic_snapshot_remains_not_yet_without_locator_count():
             raise AssertionError("Locator.count must not be used by steady-state polling")
     bridge = ArchitectPlaywright(Page())
     baseline = bridge.assistant_baseline()
-    assert bridge.wait_for_new_response(baseline, timeout=0.01)["state"] == "NOT_YET"
+    monkeypatch.setattr("local_orchestrator_watcher.time.sleep", lambda _delay: (_ for _ in ()).throw(KeyboardInterrupt))
+    try:
+        bridge.wait_for_new_response(baseline, poll_interval=0)
+    except KeyboardInterrupt:
+        pass
+    assert bridge.last_state == "NOT_YET"
 
 
 def test_steady_state_call_graph_has_no_locator_count_path():

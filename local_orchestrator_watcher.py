@@ -28,6 +28,7 @@ ARCHITECT_MEMORY_THRESHOLD_BYTES = 1_073_741_824
 ARCHITECT_MEMORY_THRESHOLD_MIB = 1024
 AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
+ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
 AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
 DOCUMENTATION_KINDS = frozenset({"IMPLEMENTATION", "BUG_FIX", "REPAIR", "RECOVERY", "ARCHITECTURE_CHANGE", "GOVERNANCE_CHANGE", "INCIDENT_CLOSURE"})
@@ -220,6 +221,14 @@ def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[s
                 pids.add(pid)
                 pending.append(pid)
     return sum(int(row.get("workingSet", 0)) for row in process_rows if int(row["pid"]) in pids)
+
+
+def architect_conversation_id_from_url(url: str) -> str:
+    """Extract the bare conversation identity from a ChatGPT conversation URL."""
+    match = ARCHITECT_CONVERSATION_URL_RE.search(str(url or ""))
+    if not match:
+        raise RuntimeError("ARCHITECT_CONVERSATION_ID_UNAVAILABLE")
+    return match.group(1)
 
 
 def stable_json(value: Any) -> str:
@@ -625,6 +634,12 @@ class ArchitectSessionRollover:
         """Sample only the explicitly governed Architect process tree."""
         reader = memory_reader or getattr(self.watcher, "architect_memory_reader", None)
         if reader is None:
+            if getattr(self.watcher, "memory_ownership_required", False) and self.watcher.state.get("architectMemoryOwnershipWarningEmitted") is not True:
+                self.watcher.state["architectMemoryOwnership"] = "UNCONFIGURED"
+                self.watcher.state["architectMemoryError"] = "ARCHITECT_BROWSER_ROOT_PID_REQUIRED"
+                self.watcher.state["architectMemoryOwnershipWarningEmitted"] = True
+                self.watcher.save()
+                emit("ARCHITECT_MEMORY_OWNERSHIP_REQUIRED")
             return None
         try:
             memory_bytes = reader()
@@ -695,10 +710,13 @@ class ArchitectSessionRollover:
         try:
             new_page = bridge.open_fresh_with_handover(response)
             current_id = getattr(new_page, "url", "")
+            current_id = current_id() if callable(current_id) else current_id
+            conversation_id = architect_conversation_id_from_url(current_id)
             bridge.page = new_page
             if hasattr(old_page, "close"):
                 old_page.close()
-            self.watcher.state["currentArchitectConversationId"] = current_id() if callable(current_id) else current_id
+            self.watcher.state["architectConversationId"] = conversation_id
+            self.watcher.state.pop("currentArchitectConversationId", None)
             self.watcher.state["architectResponseCount"] = 0
             self.watcher.state["handoverRequested"] = False
             self.watcher.state["handoverReady"] = False
@@ -2035,6 +2053,13 @@ class LocalFirstOrchestrator:
         self.state.setdefault("executorSessionMode", "PERSISTENT")
         root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
         self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
+        self.memory_ownership_required = not bool(root_pid)
+        if not root_pid:
+            self.state["architectMemoryOwnership"] = "UNCONFIGURED"
+            self.state["architectMemoryError"] = "ARCHITECT_BROWSER_ROOT_PID_REQUIRED"
+        else:
+            self.state["architectMemoryOwnership"] = "CONFIGURED"
+            self.state.pop("architectMemoryError", None)
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
         self.session_rollover = ArchitectSessionRollover(self)
 
@@ -2903,7 +2928,6 @@ def main() -> None:
         return
     watcher = LocalFirstOrchestrator(project, state_dir)
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
-    conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
     launch = visible_executor_launcher(project, watcher)
     idle_bridge = None
     try:
@@ -2920,9 +2944,8 @@ def main() -> None:
                 if watcher.intake_inbox(launch):
                     continue
                 if idle_bridge is None:
+                    conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     idle_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
-                watcher.state["architectConversationId"] = conversation_id
-                watcher.save()
                 try:
                     watcher.inspect_idle_architect(idle_bridge, launch)
                 except Exception:
@@ -2954,6 +2977,7 @@ def main() -> None:
                 print(f"STATE={state}")
                 return
 
+            conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
             bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
             watcher.state["architectConversationId"] = conversation_id
             watcher.save()
@@ -2986,6 +3010,7 @@ def main() -> None:
                         watcher.state["state"] = "ARCHITECT_RUNNING"
                         watcher.save()
                         bridge.close()
+                        conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                         bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                         time.sleep(1.0)
                         continue

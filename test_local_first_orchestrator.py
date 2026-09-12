@@ -535,6 +535,16 @@ def test_localfirst_has_governed_memory_rollover_at_safe_boundary(tmp_path):
     assert len(messages) == 1
 
 
+def test_localfirst_samples_explicit_governed_architect_root_pid(tmp_path, monkeypatch):
+    observed = []
+    monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "4242")
+    monkeypatch.setattr(watcher_module, "architect_process_tree_memory_bytes", lambda pid: observed.append(pid) or 123)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert watcher.state["architectMemoryOwnership"] == "CONFIGURED"
+    assert watcher.session_rollover.sample_memory() is None
+    assert observed == [4242]
+
+
 def test_resident_recovery_reconciles_ambiguous_delivery_without_restart(tmp_path):
     watcher = ready(tmp_path)
     sent = []
