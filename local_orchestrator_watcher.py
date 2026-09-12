@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 COMPLETE = "ARCHITECT_RESPONSE_COMPLETE"
 BEGIN = "EXECUTOR_PROMPT_BEGIN"
@@ -229,6 +230,37 @@ def architect_conversation_id_from_url(url: str) -> str:
     if not match:
         raise RuntimeError("ARCHITECT_CONVERSATION_ID_UNAVAILABLE")
     return match.group(1)
+
+
+def resolve_architect_browser_root_pid(endpoint: str) -> int:
+    """Resolve the unique Windows listener owner for the governed CDP endpoint."""
+    parts = urlsplit(endpoint)
+    port = parts.port
+    if port is None or parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED")
+    if os.name != "nt":
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED")
+    script = f"Get-NetTCPConnection -State Listen -LocalPort {port} | Select-Object -ExpandProperty OwningProcess"
+    try:
+        raw = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            text=True, encoding="utf-8", errors="strict",
+        )
+    except (OSError, subprocess.CalledProcessError, UnicodeError) as error:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED") from error
+    owners = set()
+    for line in raw.splitlines():
+        value = line.strip()
+        if value:
+            try:
+                pid = int(value)
+            except ValueError as error:
+                raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED") from error
+            if pid > 0:
+                owners.add(pid)
+    if len(owners) != 1:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED")
+    return next(iter(owners))
 
 
 def stable_json(value: Any) -> str:
@@ -2052,7 +2084,16 @@ class LocalFirstOrchestrator:
         self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
         self.state.setdefault("executorSessionMode", "PERSISTENT")
         root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
-        self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
+        if root_pid:
+            try:
+                self.architect_browser_root_pid = int(root_pid)
+            except ValueError as error:
+                raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED") from error
+            if self.architect_browser_root_pid <= 0:
+                raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED")
+        else:
+            self.architect_browser_root_pid = None
+        self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(self.architect_browser_root_pid)) if self.architect_browser_root_pid else None
         self.memory_ownership_required = not bool(root_pid)
         if not root_pid:
             self.state["architectMemoryOwnership"] = "UNCONFIGURED"
@@ -2062,6 +2103,26 @@ class LocalFirstOrchestrator:
             self.state.pop("architectMemoryError", None)
         self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
         self.session_rollover = ArchitectSessionRollover(self)
+
+    def bind_architect_memory_owner(self, endpoint: str, emit: Callable[[str], None] = print) -> int:
+        """Bind rollover sampling to the explicit PID or exact CDP listener owner."""
+        if self.architect_browser_root_pid is not None:
+            pid = self.architect_browser_root_pid
+            source = "ENVIRONMENT"
+        else:
+            pid = resolve_architect_browser_root_pid(endpoint)
+            source = "CDP_LISTENER"
+        self.architect_browser_root_pid = pid
+        self.architect_memory_reader = lambda: architect_process_tree_memory_bytes(pid)
+        self.memory_ownership_required = False
+        self.state["architectMemoryOwnership"] = "CONFIGURED"
+        self.state["architectMemoryOwnershipSource"] = source
+        self.state["architectBrowserRootPid"] = pid
+        self.state.pop("architectMemoryError", None)
+        self.state.pop("architectMemoryOwnershipWarningEmitted", None)
+        self.save()
+        emit(f"ARCHITECT_MEMORY_OWNER pid={pid} source={source}")
+        return pid
 
     def _configured_fallback_project(self) -> Path | None:
         """Use a caller-provided project root, never this Orchestrator source root."""
@@ -2928,6 +2989,14 @@ def main() -> None:
         return
     watcher = LocalFirstOrchestrator(project, state_dir)
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
+    bind_memory_owner = getattr(watcher, "bind_architect_memory_owner", None)
+    if bind_memory_owner is not None:
+        try:
+            bind_memory_owner(endpoint)
+        except RuntimeError as error:
+            print(f"ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED reason={error}")
+            instance_lock.release()
+            return
     launch = visible_executor_launcher(project, watcher)
     idle_bridge = None
     try:

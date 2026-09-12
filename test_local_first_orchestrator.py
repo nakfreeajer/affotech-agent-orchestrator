@@ -545,6 +545,49 @@ def test_localfirst_samples_explicit_governed_architect_root_pid(tmp_path, monke
     assert observed == [4242]
 
 
+def test_cdp_listener_resolves_unique_architect_memory_owner(tmp_path, monkeypatch):
+    monkeypatch.delenv("ARCHITECT_BROWSER_ROOT_PID", raising=False)
+    monkeypatch.setattr(watcher_module.os, "name", "nt")
+    monkeypatch.setattr(watcher_module.subprocess, "check_output", lambda *args, **kwargs: "5151\n")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    lines = []
+    assert watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lines.append) == 5151
+    assert watcher.state["architectMemoryOwnershipSource"] == "CDP_LISTENER"
+    assert watcher.state["architectBrowserRootPid"] == 5151
+    assert lines == ["ARCHITECT_MEMORY_OWNER pid=5151 source=CDP_LISTENER"]
+    assert watcher.architect_memory_reader is not None
+
+
+def test_cdp_listener_requires_exactly_one_owner(tmp_path, monkeypatch):
+    monkeypatch.delenv("ARCHITECT_BROWSER_ROOT_PID", raising=False)
+    monkeypatch.setattr(watcher_module.os, "name", "nt")
+    for output in ("", "5151\n5152\n"):
+        monkeypatch.setattr(watcher_module.subprocess, "check_output", lambda *args, _output=output, **kwargs: _output)
+        watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / ("work-" + str(len(output))))
+        with pytest.raises(RuntimeError, match="ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED"):
+            watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lambda _: None)
+
+
+def test_explicit_architect_root_pid_wins_over_cdp_lookup(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "6161")
+    monkeypatch.setattr(watcher_module.os, "name", "nt")
+    def unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("CDP lookup must not override explicit PID")
+    monkeypatch.setattr(watcher_module.subprocess, "check_output", unexpected_lookup)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    lines = []
+    assert watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lines.append) == 6161
+    assert watcher.state["architectMemoryOwnershipSource"] == "ENVIRONMENT"
+    assert lines == ["ARCHITECT_MEMORY_OWNER pid=6161 source=ENVIRONMENT"]
+
+
+def test_bound_cdp_owner_drives_threshold_rollover(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "7171")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    assert watcher.session_rollover.sample_memory() == "MEMORY_THRESHOLD"
+
+
 def test_resident_recovery_reconciles_ambiguous_delivery_without_restart(tmp_path):
     watcher = ready(tmp_path)
     sent = []
