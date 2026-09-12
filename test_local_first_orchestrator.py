@@ -504,6 +504,37 @@ def test_ambiguous_result_delivery_retries_once_when_exact_payload_absent(tmp_pa
     assert len(sends) == 1
 
 
+def test_confirmed_identical_result_delivery_is_terminally_idempotent(tmp_path):
+    watcher = ready(tmp_path)
+    sent = []
+    class Bridge:
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+        def submit_result_bounded(self, message): sent.append(message)
+    watcher.deliver_result(Bridge())
+    watcher.state["state"] = "RESULT_READY"
+    watcher.save()
+    class DuplicateBridge:
+        def latest_user_message(self): return sent[0]
+        def submit_result_bounded(self, _message): raise AssertionError("confirmed result resent")
+    watcher.deliver_result(DuplicateBridge())
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert len(sent) == 1
+
+
+def test_localfirst_has_governed_memory_rollover_at_safe_boundary(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "architectResponseCount": 1})
+    watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES)
+    messages = []
+    class Bridge:
+        def submit_result_bounded(self, message): messages.append(message)
+    assert watcher.session_rollover.request_if_due(Bridge(), True, True, architect_generating=False) is True
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["handoverRequested"] is True
+    assert len(messages) == 1
+
+
 def test_resident_recovery_reconciles_ambiguous_delivery_without_restart(tmp_path):
     watcher = ready(tmp_path)
     sent = []
@@ -670,6 +701,28 @@ def test_architect_response_requires_stopped_stable_final_envelope(monkeypatch):
     assert parse_orchestrator_result(observed["text"], "task-1")["action"] == "EXECUTE"
 
 
+def test_partial_architect_response_is_not_authoritative_until_final(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    response = envelope("task-1", prompt="next") + "\nARCHITECT_RESPONSE_COMPLETE"
+    bridge = FakeResponseBridge(
+        [[{"id": "a", "text": "partial one"}], [{"id": "a", "text": "partial two"}], [{"id": "a", "text": response}]],
+        [False, False, False],
+    )
+    observed = bridge.wait_for_new_response({"count": 0, "text_hash": "", "entries": []}, poll_interval=1)
+    assert observed["state"] == "COMPLETED"
+    assert parse_orchestrator_result(observed["text"], "task-1")["action"] == "EXECUTE"
+
+
+def test_format_recovery_transport_failure_is_contained(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "task-1"})
+    class BrokenBridge:
+        def submit_result_bounded(self, _message): raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED")
+    assert handle_architect_value_error(watcher, BrokenBridge()) is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED"
+
+
 def test_restart_architect_running_uses_persisted_baseline_without_resend(tmp_path):
     watcher = ready(tmp_path)
     watcher.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": {"count": 1, "text_hash": "h", "entries": []}})
@@ -682,8 +735,8 @@ def test_restart_architect_running_uses_persisted_baseline_without_resend(tmp_pa
 def test_stopped_malformed_architect_response_is_safe_without_resend(monkeypatch):
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
     bridge = FakeResponseBridge(
-        [[{"id": "a", "text": "malformed final"}]],
-        [False],
+        [[{"id": "a", "text": "malformed final"}], [{"id": "a", "text": "malformed final"}]],
+        [False, False],
     )
     observed = bridge.wait_for_new_response({"count": 0, "text_hash": "", "entries": []}, poll_interval=1)
     assert observed["state"] == "BLOCKED"

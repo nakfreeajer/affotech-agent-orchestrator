@@ -1204,23 +1204,25 @@ class ArchitectPlaywright:
                     self.last_state = "NOT_YET"
                 time.sleep(poll_interval)
                 continue
-            if identity_changed and text.rstrip().endswith(COMPLETE):
-                self.last_state = "COMPLETED"
-                return {"state": "COMPLETED", "text": text}
-            fallback_prompt = extract_executor_prompt_envelope(text) if identity_changed else None
-            if identity_changed and fallback_prompt is not None:
+            if identity_changed and text.strip():
+                if text.rstrip().endswith(COMPLETE):
+                    self.last_state = "COMPLETED"
+                    return {"state": "COMPLETED", "text": text}
                 current_hash = hashlib.sha256(text.encode()).hexdigest()
                 if current_hash == stable_hash:
                     stable_polls += 1
                 else:
                     stable_hash = current_hash
                     stable_polls = 1
-                if stable_polls >= 2:
+                if stable_polls < 2:
+                    self.last_state = "RUNNING"
+                    time.sleep(poll_interval)
+                    continue
+                if text.rstrip().endswith(COMPLETE) or extract_executor_prompt_envelope(text) is not None:
                     self.last_state = "COMPLETED"
                     return {"state": "COMPLETED", "text": text}
-                self.last_state = "RUNNING"
-                time.sleep(poll_interval)
-                continue
+                self.last_state = "BLOCKED"
+                return {"state": "BLOCKED", "text": text}
             stable_hash = None
             stable_polls = 0
             if identity_changed:
@@ -2031,6 +2033,10 @@ class LocalFirstOrchestrator:
         self.state = self._load_state()
         self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
         self.state.setdefault("executorSessionMode", "PERSISTENT")
+        root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
+        self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
+        self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
+        self.session_rollover = ArchitectSessionRollover(self)
 
     def _configured_fallback_project(self) -> Path | None:
         """Use a caller-provided project root, never this Orchestrator source root."""
@@ -2648,6 +2654,10 @@ class LocalFirstOrchestrator:
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         prior_hash = self.state.get("architectDeliveryPayloadHash")
         delivery_state = self.state.get("architectSendState")
+        if prior_hash == payload_hash and delivery_state == "CONFIRMED":
+            self.state.update({"state": "ARCHITECT_RUNNING", "architectResultFingerprint": None})
+            self.save()
+            return
         ambiguous_history = self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_AMBIGUOUS"
         delivery_probe = getattr(bridge, "latest_user_message", None)
         can_reconcile_delivery = callable(delivery_probe)
@@ -2866,7 +2876,12 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
 
 def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -> bool:
     """Apply task-scoped format recovery from the resident main-loop path."""
-    watcher.request_format_recovery(bridge)
+    try:
+        watcher.request_format_recovery(bridge)
+    except ResultSubmissionError as error:
+        watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED", "architectSendError": getattr(error, "code", type(error).__name__)})
+        watcher.save()
+        return False
     return watcher.state.get("state") == "ARCHITECT_RUNNING"
 
 
@@ -2893,6 +2908,9 @@ def main() -> None:
     idle_bridge = None
     try:
         while True:
+            rollover = getattr(watcher, "session_rollover", None)
+            if rollover is not None:
+                rollover.sample_memory()
             state = watcher.state.get("state", "IDLE")
             if state != "IDLE" and idle_bridge is not None:
                 idle_bridge.close()
@@ -2940,6 +2958,13 @@ def main() -> None:
             watcher.state["architectConversationId"] = conversation_id
             watcher.save()
             try:
+                if rollover is not None:
+                    rollover.sample_memory()
+                if rollover is not None and watcher.state.get("state") == "ARCHITECT_RUNNING":
+                    rollover.request_if_due(
+                        bridge, latest_prompt_dispatched=True, executor_running=True,
+                        architect_generating=bridge.generation_visible(),
+                    )
                 if watcher.state.get("state") == "RESULT_READY":
                     bridge = watcher.deliver_result_with_recovery(
                         lambda: ArchitectPlaywright.attach(endpoint, conversation_id),
@@ -2963,6 +2988,9 @@ def main() -> None:
                         bridge.close()
                         bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                         time.sleep(1.0)
+                        continue
+                    if watcher.state.get("handoverRequested") and rollover is not None and rollover.complete_from_response(bridge, observed["text"]):
+                        baseline = bridge.assistant_baseline()
                         continue
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
