@@ -1,6 +1,7 @@
 import json
 import hashlib
 import inspect
+import os
 import subprocess
 import threading
 import time
@@ -15,7 +16,8 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         run_executor_state_once, visible_executor_launcher,
                                         WatcherInstanceLock, handle_architect_value_error,
                                         run_human_required_startup_once, DiscussionHotkeyController,
-                                        RemoteDiscussionControlMonitor)
+                                        RemoteDiscussionControlMonitor,
+                                        architect_process_tree_memory_bytes)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -702,6 +704,36 @@ def test_bound_cdp_owner_drives_threshold_rollover(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
     assert watcher.session_rollover.sample_memory() == "MEMORY_THRESHOLD"
+
+
+def test_process_tree_memory_json_boundary_includes_descendants_only(monkeypatch):
+    captured = []
+    monkeypatch.setattr(watcher_module.os, "name", "nt")
+    monkeypatch.setattr(watcher_module.subprocess, "check_output", lambda command, **kwargs: captured.append(command[-1]) or json.dumps([
+        {"pid": 100, "parentPid": 1, "workingSet": 10},
+        {"pid": 101, "parentPid": 100, "workingSet": 20},
+        {"pid": 102, "parentPid": 101, "workingSet": 30},
+        {"pid": 900, "parentPid": 1, "workingSet": 9000},
+    ]))
+    assert architect_process_tree_memory_bytes(100) == 60
+    assert "`t" not in captured[0]
+    assert "ConvertTo-Json" in captured[0]
+
+
+def test_process_tree_memory_sampler_fails_closed_on_bad_snapshots():
+    for rows, error in [
+        ([], "ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED"),
+        ([{"pid": 2, "parentPid": 1}], "ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED"),
+        ([{"pid": 2, "parentPid": 1, "workingSet": 1}], "ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE"),
+        ([{"pid": 2, "parentPid": 1, "workingSet": 1}, "bad"], "ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED"),
+    ]:
+        with pytest.raises(RuntimeError, match=error):
+            architect_process_tree_memory_bytes(100, rows)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell qualification")
+def test_live_windows_current_process_memory_sampler_is_positive():
+    assert architect_process_tree_memory_bytes(os.getpid()) > 0
 
 
 def test_resident_recovery_reconciles_ambiguous_delivery_without_restart(tmp_path):

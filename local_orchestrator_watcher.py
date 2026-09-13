@@ -231,16 +231,41 @@ def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[s
     if process_rows is None:
         if os.name != "nt":
             raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
-        script = "Get-CimInstance Win32_Process | ForEach-Object { $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { '{0}`t{1}`t{2}' -f $_.ProcessId, $_.ParentProcessId, $p.WorkingSet64 } }"
+        script = ("Get-CimInstance Win32_Process | ForEach-Object { "
+                  "$p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; "
+                  "if ($p) { [pscustomobject][ordered]@{ pid=[int]$_.ProcessId; "
+                  "parentPid=[int]$_.ParentProcessId; workingSet=[int64]$p.WorkingSet64 } } "
+                  "} | ConvertTo-Json -Compress")
         try:
             raw = subprocess.check_output(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], text=True, encoding="utf-8", errors="strict")
-            process_rows = []
-            for line in raw.splitlines():
-                parts = line.split("\t")
-                if len(parts) == 3:
-                    process_rows.append({"pid": int(parts[0]), "parentPid": int(parts[1]), "workingSet": int(parts[2])})
+            decoded = json.loads(raw)
+            process_rows = decoded if isinstance(decoded, list) else [decoded]
         except (OSError, subprocess.CalledProcessError, ValueError, UnicodeError) as error:
             raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED") from error
+    if not isinstance(process_rows, list) or not process_rows:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED")
+    normalized_rows: list[dict[str, int]] = []
+    seen_pids: set[int] = set()
+    try:
+        for row in process_rows:
+            if not isinstance(row, dict):
+                raise ValueError("invalid process row")
+            pid = int(row["pid"])
+            parent_pid = int(row["parentPid"])
+            working_set = int(row["workingSet"])
+            # Win32 enumeration includes the synthetic System Idle Process;
+            # it cannot own a governed browser tree and has no usable PID.
+            if pid == 0:
+                continue
+            if pid < 0 or parent_pid < 0 or working_set < 0 or pid in seen_pids:
+                raise ValueError("invalid process row")
+            seen_pids.add(pid)
+            normalized_rows.append({"pid": pid, "parentPid": parent_pid, "workingSet": working_set})
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED") from error
+    if root_pid not in seen_pids:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
+    process_rows = normalized_rows
     by_parent: dict[int, list[dict[str, Any]]] = {}
     for row in process_rows:
         by_parent.setdefault(int(row["parentPid"]), []).append(row)
@@ -253,7 +278,7 @@ def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[s
             if pid not in pids:
                 pids.add(pid)
                 pending.append(pid)
-    return sum(int(row.get("workingSet", 0)) for row in process_rows if int(row["pid"]) in pids)
+    return sum(row["workingSet"] for row in process_rows if row["pid"] in pids)
 
 
 def architect_conversation_id_from_url(url: str) -> str:
