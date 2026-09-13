@@ -1343,24 +1343,61 @@ class ArchitectPlaywright:
 
     def _live_composer(self) -> Any:
         """Resolve the current editor, never reusing a locator across rerenders."""
+        def actionable(candidate: Any, require_count: bool = False) -> bool:
+            try:
+                count = getattr(candidate, "count", None)
+                if require_count and callable(count) and count() < 1:
+                    return False
+                return bool(getattr(candidate, "is_visible", lambda **_: True)(timeout=1000)) and bool(
+                    getattr(candidate, "is_editable", lambda **_: True)(timeout=1000)
+                )
+            except Exception:
+                return False
+
+        # The semantic textbox is the authoritative current composer.  The
+        # id selector is only a compatibility fallback and must itself pass
+        # actionability checks; DOM presence alone is not sufficient.
+        try:
+            semantic = self.page.get_by_role("textbox").last
+            if actionable(semantic):
+                return semantic
+        except Exception:
+            pass
         locator = getattr(self.page, "locator", None)
         if locator is not None:
-            candidate = locator("#prompt-textarea")
-            candidate = getattr(candidate, "last", candidate)
             try:
-                if candidate.count() > 0:
-                    return candidate
+                fallback_locator = locator("#prompt-textarea")
+                fallback = getattr(fallback_locator, "last", fallback_locator)
+                if actionable(fallback, require_count=True):
+                    return fallback
             except Exception:
                 pass
-        return self.page.get_by_role("textbox").last
+        raise ResultSubmissionError("ARCHITECT_COMPOSER_UNAVAILABLE")
+
+    def clear_unsent_payload(self, payload: str) -> bool:
+        """Clear only an exactly matching pre-send draft after safe failure."""
+        try:
+            composer = self._live_composer()
+            observed = composer.inner_text(timeout=1000)
+            if not isinstance(observed, str) or normalize_prompt(observed) != normalize_prompt(payload):
+                return False
+            composer.focus(timeout=1000)
+            composer.press("ControlOrMeta+A", timeout=1000)
+            composer.press("Backspace", timeout=1000)
+            cleared = composer.inner_text(timeout=1000)
+            return isinstance(cleared, str) and not cleared.strip()
+        except Exception:
+            return False
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         """Submit a result with explicit, bounded stages and typed failures."""
         self.last_send_method = None
         self.sendActionAttempted = False
         self.sendActionAcknowledged = False
+        self.last_unsent_payload_cleared = False
         deadline = time.monotonic() + timeout
         last_error = None
+        populated = False
         try:
             self.restore_live_bottom(delay=0)
         except Exception:
@@ -1391,8 +1428,11 @@ class ArchitectPlaywright:
             if keyboard is None:
                 raise RuntimeError("KEYBOARD_INPUT_UNAVAILABLE")
             keyboard.insert_text(result)
+            populated = True
         except Exception as error:
             code = "ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
+            if populated and not self.sendActionAttempted:
+                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
             raise ResultSubmissionError(code, type(error).__name__) from error
 
         try:
@@ -1400,10 +1440,16 @@ class ArchitectPlaywright:
             observed = composer.inner_text(timeout=1000)
         except Exception as error:
             code = "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
+            if populated and not self.sendActionAttempted:
+                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
             raise ResultSubmissionError(code, type(error).__name__) from error
         if not isinstance(observed, str) or not observed.strip():
+            if populated and not self.sendActionAttempted:
+                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
             raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED")
         if normalize_prompt(observed) != normalize_prompt(result):
+            if populated and not self.sendActionAttempted:
+                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
             raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", "CONTENT_MISMATCH")
         assistant_count_before = self.assistant_count()
 
@@ -2579,7 +2625,16 @@ class LocalFirstOrchestrator:
         try:
             sender(message)
         except Exception as error:
-            ambiguous = isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT"
+            attempted = bool(getattr(bridge, "sendActionAttempted", False)) or bool(getattr(bridge, "last_send_method", None))
+            ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+            if isinstance(error, ResultSubmissionError) and not attempted:
+                if bool(getattr(bridge, "last_unsent_payload_cleared", False)):
+                    runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_UNSENT_PAYLOAD_CLEARED", self.state, taskId=self.state.get("taskId"))
+                self.state.pop("lastContinuationSourceFingerprint", None)
+                self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False, "architectSendState": "FAILED"})
+                self.save()
+                print("IDLE_GATE=pre_send_failed")
+                return False
             if not ambiguous:
                 self.state.pop("lastContinuationSourceFingerprint", None)
                 self.state["architectSendState"] = "FAILED"
@@ -3203,7 +3258,7 @@ class DiscussionHotkeyController:
 
 class RemoteDiscussionControlMonitor:
     """Read-only Architect user-message monitor for exact pause/resume commands."""
-    def __init__(self, watcher: LocalFirstOrchestrator, bridge_factory: Callable[[], Any], emit: Callable[[str], None] = print):
+    def __init__(self, watcher: LocalFirstOrchestrator, bridge_factory: Callable[[], Any], emit: Callable[[str], None] = print, startup_timeout: float = 45.0, shutdown_timeout: float = 5.0):
         self.watcher = watcher
         self.bridge_factory = bridge_factory
         self.emit = emit
@@ -3216,6 +3271,8 @@ class RemoteDiscussionControlMonitor:
         self._ready = threading.Event()
         self._stop_event = threading.Event()
         self._startup_ok = False
+        self.startup_timeout = startup_timeout
+        self.shutdown_timeout = shutdown_timeout
 
     @staticmethod
     def _identity(message: dict[str, Any], index: int) -> str:
@@ -3273,6 +3330,8 @@ class RemoteDiscussionControlMonitor:
         def run() -> None:
             try:
                 self.establish_startup_baseline()
+                if self._stop_event.is_set():
+                    return
                 self._startup_ok = True
                 self.active = True
                 self._ready.set()
@@ -3302,7 +3361,10 @@ class RemoteDiscussionControlMonitor:
         self._startup_ok = False
         self._thread = threading.Thread(target=run, name="orchestrator-remote-control", daemon=True)
         self._thread.start()
-        if not self._ready.wait(2.0) or not self._startup_ok:
+        if not self._ready.wait(self.startup_timeout) or not self._startup_ok:
+            self._stop_event.set()
+            if self._thread.is_alive():
+                self._thread.join(timeout=self.shutdown_timeout)
             self.emit("REMOTE_CONTROL_UNAVAILABLE")
             return False
         self.emit("REMOTE CONTROL ACTIVE")

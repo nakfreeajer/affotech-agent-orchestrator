@@ -488,6 +488,68 @@ def test_current_composer_receives_exact_text_and_is_confirmed():
     assert page.sent == [result]
 
 
+def test_hidden_prompt_textarea_does_not_override_visible_semantic_composer():
+    page = FakeComposerPage()
+
+    class Hidden:
+        last = None
+        def count(self): return 1
+        def is_visible(self, **_): return False
+        def is_editable(self, **_): return False
+
+    page.locator = lambda _selector: Hidden()
+    result = "semantic live payload"
+    ArchitectPlaywright(page).submit_result_bounded(result, timeout=1)
+    assert page.sent == [result]
+
+
+class _InputVerificationRerenderPage(FakeComposerPage):
+    def __init__(self):
+        super().__init__()
+        self.verification_reads = 0
+
+    def get_by_role(self, role, **kwargs):
+        if role == "textbox":
+            page = self
+            class RerenderedComposer(FakeComposer):
+                def inner_text(self, **_):
+                    page.verification_reads += 1
+                    if page.verification_reads == 2:
+                        raise TimeoutError("DOM rerender")
+                    return super().inner_text(**_)
+            return RerenderedComposer(self)
+        return super().get_by_role(role, **kwargs)
+
+
+def test_composer_rerender_between_input_and_verification_reacquires_current_editor():
+    page = _InputVerificationRerenderPage()
+    result = "rerendered payload"
+    ArchitectPlaywright(page).submit_result_bounded(result, timeout=1)
+    assert page.sent == [result]
+
+
+def test_unsent_known_payload_is_cleared_after_pre_send_input_failure():
+    page = FakeComposerPage()
+    original_inner_text = FakeComposer.inner_text
+    reads = {"count": 0}
+
+    def failing_once(composer, **kwargs):
+        reads["count"] += 1
+        if reads["count"] == 1:
+            raise TimeoutError("acceptance unavailable")
+        return original_inner_text(composer, **kwargs)
+
+    FakeComposer.inner_text = failing_once
+    try:
+        with pytest.raises(ResultSubmissionError) as error:
+            ArchitectPlaywright(page).submit_result_bounded("known unsent payload", timeout=1)
+        assert error.value.code == "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT"
+        assert page.content == ""
+        assert page.sent == []
+    finally:
+        FakeComposer.inner_text = original_inner_text
+
+
 def test_stale_composer_is_reacquired_before_focus_and_send():
     page = ReplacingComposerPage()
     result = "reacquired payload"
@@ -2545,6 +2607,43 @@ def test_remote_monitor_playwright_bridge_is_created_used_and_closed_on_worker_t
     monitor.stop()
     assert factory_threads and factory_threads[0] != caller
     assert set(factory_threads + use_threads + close_threads) == {factory_threads[0]}
+
+
+def test_remote_monitor_delayed_startup_uses_attachment_budget(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    caller = threading.get_ident()
+    factory_threads = []
+
+    class Bridge:
+        def control_user_messages(self): return []
+        def close(self): pass
+
+    def factory():
+        factory_threads.append(threading.get_ident())
+        time.sleep(2.1)
+        return Bridge()
+
+    monitor = RemoteDiscussionControlMonitor(watcher, factory, emit=lambda _message: None, startup_timeout=3.0)
+    assert monitor.start() is True
+    monitor.stop()
+    assert factory_threads and factory_threads[0] != caller
+
+
+def test_remote_monitor_startup_timeout_terminates_worker(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+
+    class Bridge:
+        def control_user_messages(self): return []
+        def close(self): pass
+
+    def factory():
+        time.sleep(0.2)
+        return Bridge()
+
+    monitor = RemoteDiscussionControlMonitor(watcher, factory, emit=lambda _message: None, startup_timeout=0.05, shutdown_timeout=1.0)
+    assert monitor.start() is False
+    assert monitor.active is False
+    assert monitor._thread is not None and not monitor._thread.is_alive()
 
 
 def test_remote_monitor_startup_failure_isolated_from_workflow_state(tmp_path):
