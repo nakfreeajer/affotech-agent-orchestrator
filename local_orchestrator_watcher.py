@@ -1247,6 +1247,17 @@ class ArchitectPlaywright:
         text = messages.nth(count - 1).inner_text() if count else ""
         return {"count": count, "text_hash": hashlib.sha256(text.encode()).hexdigest()}
 
+    def control_user_messages(self) -> list[dict[str, str | None]]:
+        """Read only user-message identities/text for the remote pause monitor."""
+        messages = self.page.locator('[data-message-author-role="user"]')
+        result = []
+        for index in range(messages.count()):
+            message = messages.nth(index)
+            text = message.inner_text()
+            identity = message.get_attribute("data-message-id") or message.get_attribute("id")
+            result.append({"id": identity, "text": text})
+        return result
+
     def latest_user_message(self) -> str | None:
         messages = self.page.locator('[data-message-author-role="user"]')
         count = messages.count()
@@ -2298,9 +2309,22 @@ class LocalFirstOrchestrator:
     def save(self) -> None:
         atomic_write(self.state_path, (json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
+    def discussion_pause_active(self) -> bool:
+        marker = self.state_dir / "discussion-pause.marker"
+        try:
+            if marker.read_text(encoding="ascii").strip() == "PAUSED":
+                return True
+        except OSError:
+            pass
+        return bool(self.state.get("discussionPauseActive"))
+
+    def _write_discussion_pause_marker(self, active: bool) -> None:
+        atomic_write(self.state_dir / "discussion-pause.marker", ("PAUSED\n" if active else "RESUMED\n").encode("ascii"))
+
     def request_discussion_pause(self) -> None:
-        if self.state.get("discussionPauseActive"):
+        if self.discussion_pause_active():
             return
+        self._write_discussion_pause_marker(True)
         self.state["discussionPauseActive"] = True
         self.save()
         task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
@@ -2308,8 +2332,9 @@ class LocalFirstOrchestrator:
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_PAUSE_REQUESTED", self.state, taskId=task_id)
 
     def request_discussion_resume(self) -> None:
-        if not self.state.get("discussionPauseActive"):
+        if not self.discussion_pause_active():
             return
+        self._write_discussion_pause_marker(False)
         self.state["discussionPauseActive"] = False
         self.save()
         task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
@@ -2343,7 +2368,7 @@ class LocalFirstOrchestrator:
 
     def intake_inbox(self, launcher: Callable[[str, Path], Any]) -> bool:
         """Consume and launch one approved local prompt while IDLE."""
-        if self.state.get("state") != "IDLE" or self.state.get("discussionPauseActive"):
+        if self.state.get("state") != "IDLE" or self.discussion_pause_active():
             return False
         consumed = self.state.setdefault("consumedInboxItems", {})
         failures = self.state.setdefault("inboxFailures", {})
@@ -2502,7 +2527,7 @@ class LocalFirstOrchestrator:
 
     def request_architect_bootstrap(self, bridge: Any) -> bool:
         """Ask Architect once to evaluate current project state and choose the next action."""
-        if self.state.get("discussionPauseActive"):
+        if self.discussion_pause_active():
             return False
         source_fingerprint = self.state.get("continuationSourceFingerprint")
         if source_fingerprint and source_fingerprint == self.state.get("lastContinuationSourceFingerprint"):
@@ -2857,7 +2882,7 @@ class LocalFirstOrchestrator:
     def deliver_result(self, bridge: Any) -> None:
         if self.state.get("state") != "RESULT_READY":
             raise RuntimeError("RESULT_NOT_READY")
-        if self.state.get("discussionPauseActive"):
+        if self.discussion_pause_active():
             return
         path = Path(self.state["executorResultPath"])
         payload, payload_hash = self._result_delivery_payload()
@@ -2963,7 +2988,7 @@ class LocalFirstOrchestrator:
 
     def request_format_recovery(self, bridge: Any) -> None:
         """Request one machine-readable envelope without replaying the result."""
-        if self.state.get("discussionPauseActive"):
+        if self.discussion_pause_active():
             return
         task_id = str(self.state["taskId"])
         self._reset_format_recovery_for_task(task_id)
@@ -3073,7 +3098,7 @@ class LocalFirstOrchestrator:
         return decision
 
     def launch_next(self, launcher: Callable[[str, Path], Any]) -> Any:
-        if self.state.get("state") != "NEXT_PROMPT_READY" or self.state.get("discussionPauseActive"):
+        if self.state.get("state") != "NEXT_PROMPT_READY" or self.discussion_pause_active():
             return None
         prompt_path = Path(self.state["nextPromptPath"])
         prompt = prompt_path.read_text(encoding="utf-8")
@@ -3161,6 +3186,117 @@ class DiscussionHotkeyController:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         self.active = False
+
+
+class RemoteDiscussionControlMonitor:
+    """Read-only Architect user-message monitor for exact pause/resume commands."""
+    def __init__(self, watcher: LocalFirstOrchestrator, bridge_factory: Callable[[], Any], emit: Callable[[str], None] = print):
+        self.watcher = watcher
+        self.bridge_factory = bridge_factory
+        self.emit = emit
+        self.bridge = None
+        self.active = False
+        self._thread = None
+        self._cursor = None
+        self._conversation_id = None
+        self._consumed_command_ids: list[str] = []
+
+    @staticmethod
+    def _identity(message: dict[str, Any], index: int) -> str:
+        identity = message.get("id")
+        return str(identity) if identity else hashlib.sha256(str(message.get("text") or "").encode("utf-8")).hexdigest() + f":{index}"
+
+    def _messages(self, bridge: Any) -> list[dict[str, Any]]:
+        reader = getattr(bridge, "control_user_messages", None) or getattr(bridge, "user_messages", None)
+        if not callable(reader):
+            raise RuntimeError("REMOTE_CONTROL_USER_READER_UNAVAILABLE")
+        messages = reader()
+        return [message for message in messages if isinstance(message, dict) and message.get("author", "user") == "user"] if isinstance(messages, list) else []
+
+    def establish_startup_baseline(self, bridge: Any | None = None) -> None:
+        self.bridge = bridge or self.bridge_factory()
+        self._conversation_id = self.watcher.state.get("architectConversationId")
+        messages = self._messages(self.bridge)
+        self._cursor = self._identity(messages[-1], len(messages) - 1) if messages else None
+        atomic_write(self.watcher.state_dir / "remote-control.json", json.dumps({"cursor": self._cursor, "count": len(messages)}).encode("utf-8"))
+
+    def poll_once(self) -> int:
+        messages = self._messages(self.bridge)
+        start = 0
+        if self._cursor is not None:
+            positions = [index for index, message in enumerate(messages) if self._identity(message, index) == self._cursor]
+            if positions:
+                start = positions[-1] + 1
+            else:
+                start = len(messages)
+        observed = 0
+        for index, message in enumerate(messages[start:], start=start):
+            text = message.get("text")
+            if isinstance(text, str):
+                command = text.strip()
+                if command in {"ORCH:PAUSE", "ORCH:RESUME"}:
+                    identity = self._identity(message, index)
+                    if identity in self._consumed_command_ids:
+                        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_DUPLICATE_IGNORED", self.watcher.state, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
+                        continue
+                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_OBSERVED", self.watcher.state, command=command, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
+                    if command == "ORCH:PAUSE":
+                        self.watcher.request_discussion_pause()
+                        event = "REMOTE_DISCUSSION_PAUSE_REQUESTED"
+                    else:
+                        self.watcher.request_discussion_resume()
+                        event = "REMOTE_DISCUSSION_RESUME_REQUESTED"
+                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), event, self.watcher.state, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
+                    self._consumed_command_ids.append(identity)
+                    self._consumed_command_ids = self._consumed_command_ids[-32:]
+                    observed += 1
+                    self._cursor = identity
+        if messages:
+            self._cursor = self._identity(messages[-1], len(messages) - 1)
+        atomic_write(self.watcher.state_dir / "remote-control.json", json.dumps({"cursor": self._cursor, "count": len(messages)}).encode("utf-8"))
+        return observed
+
+    def start(self) -> bool:
+        try:
+            self.establish_startup_baseline()
+            self.active = True
+            self.emit("REMOTE CONTROL ACTIVE")
+            self.emit("ORCH:PAUSE = pause Architect relay")
+            self.emit("ORCH:RESUME = resume Orchestrator")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_STARTED", self.watcher.state)
+        except Exception as error:
+            self.emit(f"REMOTE_CONTROL_UNAVAILABLE error={type(error).__name__}")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_ERROR", self.watcher.state, errorClass=type(error).__name__)
+            return False
+
+        def run() -> None:
+            while self.active:
+                try:
+                    current = self.watcher.state.get("architectConversationId")
+                    if current and self._conversation_id and current != self._conversation_id:
+                        self.bridge.close()
+                        self.establish_startup_baseline()
+                    self.poll_once()
+                except Exception as error:
+                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_ERROR", self.watcher.state, errorClass=type(error).__name__)
+                    self.active = False
+                    break
+                time.sleep(1.0)
+
+        self._thread = threading.Thread(target=run, name="orchestrator-remote-control", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self.active = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if self.bridge is not None:
+            try:
+                self.bridge.close()
+            except Exception:
+                pass
+            self.bridge = None
 
 
 def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> Callable[[str, Path], Any]:
@@ -3309,10 +3445,22 @@ def main() -> None:
         print("ORCHESTRATOR_HOTKEY_REGISTRATION_FAILED")
         instance_lock.release()
         return
-    if watcher.state.get("discussionPauseActive"):
+    discussion_paused = getattr(watcher, "discussion_pause_active", lambda: bool(watcher.state.get("discussionPauseActive")))
+    if discussion_paused():
         print(f"ORCHESTRATOR PAUSED BY HUMAN state={watcher.state.get('state')} taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId') or 'NONE'}")
         runtime_log(logger, run_id, "HUMAN_DISCUSSION_PAUSE_ACTIVE", watcher.state)
     launch = visible_executor_launcher(project, watcher)
+    remote_monitor = None
+    if hasattr(watcher, "discussion_pause_active"):
+        remote_monitor = RemoteDiscussionControlMonitor(
+            watcher,
+            lambda: ArchitectPlaywright.attach(
+                endpoint,
+                watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID,
+            ),
+        )
+        if not remote_monitor.start():
+            print("REMOTE CONTROL UNAVAILABLE; F9/F10 remain available")
     idle_bridge = None
     last_logged_state = recovery_state
     stop_logged = False
@@ -3326,7 +3474,7 @@ def main() -> None:
             if state != last_logged_state:
                 runtime_log(logger, run_id, "STATE_TRANSITION", watcher.state, **{"from": last_logged_state, "to": state, "reason": watcher.state.get("humanRequiredReason")})
                 last_logged_state = state
-            if watcher.state.get("discussionPauseActive") and state in {"IDLE", "RESULT_READY", "NEXT_PROMPT_READY"}:
+            if discussion_paused() and state in {"IDLE", "RESULT_READY", "NEXT_PROMPT_READY"}:
                 notice = (state, watcher.state.get("taskId") or watcher.state.get("nextTaskId"))
                 if notice != pause_notice:
                     print(f"ORCHESTRATOR PAUSED BY HUMAN state={state} taskId={notice[1] or 'NONE'} architectRelay=BLOCKED F10=RESUME")
@@ -3412,7 +3560,7 @@ def main() -> None:
             try:
                 if rollover is not None:
                     rollover.sample_memory()
-                if rollover is not None and not watcher.state.get("discussionPauseActive") and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
+                if rollover is not None and not discussion_paused() and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
                     executor_pid = watcher.state.get("codexPid")
                     executor_active = bool(executor_pid and LocalWatcher.process_alive(executor_pid))
                     rollover.request_if_due(
@@ -3421,7 +3569,7 @@ def main() -> None:
                         executor_running=not executor_active,
                         architect_generating=bridge.generation_visible(),
                     )
-                if watcher.state.get("state") == "RESULT_READY" and not watcher.state.get("discussionPauseActive") and not watcher.state.get("handoverRequested"):
+                if watcher.state.get("state") == "RESULT_READY" and not discussion_paused() and not watcher.state.get("handoverRequested"):
                     bridge = watcher.deliver_result_with_recovery(
                         lambda: ArchitectPlaywright.attach(endpoint, conversation_id),
                         initial_bridge=bridge,
@@ -3498,6 +3646,8 @@ def main() -> None:
             logger.exception("unhandled production main-loop exception", extra={"runId": run_id or "UNKNOWN", "state": watcher.state.get("state", "UNKNOWN"), "taskId": watcher.state.get("taskId") or watcher.state.get("nextTaskId") or "NONE", "event": "WATCHER_EXCEPTION", "errorClass": type(error).__name__, "errorMessage": str(error)})
         raise
     finally:
+        if remote_monitor is not None:
+            remote_monitor.stop()
         hotkeys.stop()
         if idle_bridge is not None:
             idle_bridge.close()

@@ -13,7 +13,8 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         parse_orchestrator_result, resolve_executor_worktree,
                                         run_executor_state_once, visible_executor_launcher,
                                         WatcherInstanceLock, handle_architect_value_error,
-                                        run_human_required_startup_once, DiscussionHotkeyController)
+                                        run_human_required_startup_once, DiscussionHotkeyController,
+                                        RemoteDiscussionControlMonitor)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -2447,6 +2448,79 @@ def test_discussion_hotkey_unknown_key_is_ignored(tmp_path):
     controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
     assert controller.dispatch("F8") is False
     assert not watcher.state.get("discussionPauseActive")
+
+
+class _RemoteControlBridge:
+    def __init__(self, messages):
+        self.messages = messages
+        self.closed = False
+
+    def control_user_messages(self):
+        return list(self.messages)
+
+    def close(self):
+        self.closed = True
+
+
+def test_remote_exact_user_commands_share_durable_pause_authority(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    messages = [{"id": "old", "text": "ORCH:PAUSE"}]
+    bridge = _RemoteControlBridge(messages)
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: bridge, emit=lambda _message: None)
+    monitor.establish_startup_baseline(bridge)
+    messages.append({"id": "pause-1", "text": "ORCH:PAUSE"})
+    assert monitor.poll_once() == 1
+    assert watcher.discussion_pause_active() is True
+    messages.append({"id": "pause-1", "text": "ORCH:PAUSE"})
+    assert monitor.poll_once() == 0
+    messages.append({"id": "resume-1", "text": "ORCH:RESUME"})
+    assert monitor.poll_once() == 1
+    assert watcher.discussion_pause_active() is False
+    assert watcher.state.get("taskId") is None
+
+
+def test_remote_commands_require_exact_user_message_and_ignore_assistant(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    messages = [{"id": "base", "text": "ordinary discussion"}]
+    bridge = _RemoteControlBridge(messages)
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: bridge, emit=lambda _message: None)
+    monitor.establish_startup_baseline(bridge)
+    messages.extend([
+        {"id": "fuzzy", "text": "please pause"},
+        {"id": "space", "text": "ORCH: PAUSE"},
+        {"id": "assistant", "author": "assistant", "text": "ORCH:PAUSE"},
+        {"id": "unknown", "text": "ORCH:STOP"},
+    ])
+    assert monitor.poll_once() == 0
+    assert watcher.discussion_pause_active() is False
+
+
+def test_remote_command_identity_is_consumed_once_and_restart_baseline_ignores_old_command(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    messages = [{"id": "base", "text": "hello"}]
+    bridge = _RemoteControlBridge(messages)
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: bridge, emit=lambda _message: None)
+    monitor.establish_startup_baseline(bridge)
+    messages.append({"id": "pause-1", "text": "ORCH:PAUSE"})
+    assert monitor.poll_once() == 1
+    assert monitor.poll_once() == 0
+    restarted = RemoteDiscussionControlMonitor(watcher, lambda: bridge, emit=lambda _message: None)
+    restarted.establish_startup_baseline(bridge)
+    assert restarted.poll_once() == 0
+    assert watcher.discussion_pause_active() is True
+
+
+def test_remote_monitor_failure_isolated_and_rollover_target_follows_state(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state["architectConversationId"] = "OLD"
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: (_ for _ in ()).throw(RuntimeError("attach failed")), emit=lambda _message: None)
+    assert monitor.start() is False
+    assert watcher.state.get("taskId") is None
+    bridge = _RemoteControlBridge([])
+    monitor.establish_startup_baseline(bridge)
+    watcher.state["architectConversationId"] = "NEW"
+    assert monitor._conversation_id == "OLD"
+    monitor.stop()
 
 
 def test_result_review_instruction_advertises_documentation_disposition(tmp_path):
