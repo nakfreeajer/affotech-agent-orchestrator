@@ -2298,6 +2298,25 @@ class LocalFirstOrchestrator:
     def save(self) -> None:
         atomic_write(self.state_path, (json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
+    def request_discussion_pause(self) -> None:
+        if self.state.get("discussionPauseActive"):
+            return
+        self.state["discussionPauseActive"] = True
+        self.save()
+        task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
+        print(f"ORCHESTRATOR PAUSED BY HUMAN state={self.state.get('state')} taskId={task_id} F10=RESUME")
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_PAUSE_REQUESTED", self.state, taskId=task_id)
+
+    def request_discussion_resume(self) -> None:
+        if not self.state.get("discussionPauseActive"):
+            return
+        self.state["discussionPauseActive"] = False
+        self.save()
+        task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
+        print(f"ORCHESTRATOR RESUMED BY HUMAN state={self.state.get('state')} taskId={task_id}")
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_RESUME_REQUESTED", self.state, taskId=task_id)
+
+
     def _result_path(self, task_id: str) -> Path:
         return self.results_dir / f"{task_id}.txt"
 
@@ -2324,7 +2343,7 @@ class LocalFirstOrchestrator:
 
     def intake_inbox(self, launcher: Callable[[str, Path], Any]) -> bool:
         """Consume and launch one approved local prompt while IDLE."""
-        if self.state.get("state") != "IDLE":
+        if self.state.get("state") != "IDLE" or self.state.get("discussionPauseActive"):
             return False
         consumed = self.state.setdefault("consumedInboxItems", {})
         failures = self.state.setdefault("inboxFailures", {})
@@ -2483,6 +2502,8 @@ class LocalFirstOrchestrator:
 
     def request_architect_bootstrap(self, bridge: Any) -> bool:
         """Ask Architect once to evaluate current project state and choose the next action."""
+        if self.state.get("discussionPauseActive"):
+            return False
         source_fingerprint = self.state.get("continuationSourceFingerprint")
         if source_fingerprint and source_fingerprint == self.state.get("lastContinuationSourceFingerprint"):
             self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
@@ -2836,6 +2857,8 @@ class LocalFirstOrchestrator:
     def deliver_result(self, bridge: Any) -> None:
         if self.state.get("state") != "RESULT_READY":
             raise RuntimeError("RESULT_NOT_READY")
+        if self.state.get("discussionPauseActive"):
+            return
         path = Path(self.state["executorResultPath"])
         payload, payload_hash = self._result_delivery_payload()
         task_id = str(self.state["taskId"])
@@ -2940,6 +2963,8 @@ class LocalFirstOrchestrator:
 
     def request_format_recovery(self, bridge: Any) -> None:
         """Request one machine-readable envelope without replaying the result."""
+        if self.state.get("discussionPauseActive"):
+            return
         task_id = str(self.state["taskId"])
         self._reset_format_recovery_for_task(task_id)
         if int(self.state.get("formatRecoveryCount", 0)) >= 1:
@@ -3048,7 +3073,7 @@ class LocalFirstOrchestrator:
         return decision
 
     def launch_next(self, launcher: Callable[[str, Path], Any]) -> Any:
-        if self.state.get("state") != "NEXT_PROMPT_READY":
+        if self.state.get("state") != "NEXT_PROMPT_READY" or self.state.get("discussionPauseActive"):
             return None
         prompt_path = Path(self.state["nextPromptPath"])
         prompt = prompt_path.read_text(encoding="utf-8")
@@ -3061,6 +3086,81 @@ class LocalFirstOrchestrator:
         self._active_process = process
         self.mark_executor_started(str(self.state["nextTaskId"]), int(process.pid), self._result_path(str(self.state["nextTaskId"])))
         return process
+
+
+class DiscussionHotkeyController:
+    """Small process-local F9/F10 controller; the durable flag remains watcher-owned."""
+    VK_F9 = 0x78
+    VK_F10 = 0x79
+    WM_HOTKEY = 0x0312
+    WM_QUIT = 0x0012
+    MOD_NOREPEAT = 0x4000
+
+    def __init__(self, watcher: LocalFirstOrchestrator, emit: Callable[[str], None] = print):
+        self.watcher = watcher
+        self.emit = emit
+        self.active = False
+        self._thread = None
+        self._thread_id = None
+
+    def dispatch(self, key: str) -> bool:
+        if key == "F9":
+            self.watcher.request_discussion_pause()
+            return True
+        if key == "F10":
+            self.watcher.request_discussion_resume()
+            return True
+        return False
+
+    def start(self, log: Callable[[str], None] | None = None) -> bool:
+        if os.name != "nt":
+            self.emit("HUMAN_DISCUSSION_HOTKEYS_UNAVAILABLE platform=non_windows")
+            return False
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+        registration = {"ok": False, "thread_id": None}
+
+        def run() -> None:
+            thread_id = int(ctypes.windll.kernel32.GetCurrentThreadId())
+            registration["thread_id"] = thread_id
+            if not user32.RegisterHotKey(None, 9, self.MOD_NOREPEAT, self.VK_F9) or not user32.RegisterHotKey(None, 10, self.MOD_NOREPEAT, self.VK_F10):
+                user32.UnregisterHotKey(None, 9)
+                user32.UnregisterHotKey(None, 10)
+                return
+            registration["ok"] = True
+            message = ctypes.wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                if message.message == self.WM_HOTKEY:
+                    self.dispatch("F9" if message.wParam == 9 else "F10" if message.wParam == 10 else "")
+            user32.UnregisterHotKey(None, 9)
+            user32.UnregisterHotKey(None, 10)
+
+        self._thread = threading.Thread(target=run, name="orchestrator-hotkeys", daemon=True)
+        self._thread.start()
+        deadline = time.monotonic() + 1.0
+        while registration["thread_id"] is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        while not registration["ok"] and registration["thread_id"] is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not registration["ok"]:
+            self.emit("HUMAN_DISCUSSION_HOTKEY_REGISTRATION_FAILED")
+            if log:
+                log("HUMAN_DISCUSSION_HOTKEY_REGISTRATION_FAILED")
+            return False
+        self._thread_id = registration["thread_id"]
+        self.active = True
+        self.emit("F9 = PAUSE FOR ARCHITECT DISCUSSION")
+        self.emit("F10 = RESUME ORCHESTRATOR")
+        return True
+
+    def stop(self) -> None:
+        if self.active and self._thread_id and os.name == "nt":
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self.active = False
 
 
 def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> Callable[[str, Path], Any]:
@@ -3204,10 +3304,19 @@ def main() -> None:
         watcher.state.get("architectSendState") or "NONE", watcher.state.get("architectConversationId") or "NONE", recovery_action))
     runtime_log(logger, run_id, "WATCHER_STARTED", watcher.state, source=log_path)
     runtime_log(logger, run_id, "STATE_RECOVERED", watcher.state, recoveryAction=recovery_action)
+    hotkeys = DiscussionHotkeyController(watcher)
+    if not hotkeys.start(lambda event: runtime_log(logger, run_id, event, watcher.state)) and os.name == "nt":
+        print("ORCHESTRATOR_HOTKEY_REGISTRATION_FAILED")
+        instance_lock.release()
+        return
+    if watcher.state.get("discussionPauseActive"):
+        print(f"ORCHESTRATOR PAUSED BY HUMAN state={watcher.state.get('state')} taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId') or 'NONE'}")
+        runtime_log(logger, run_id, "HUMAN_DISCUSSION_PAUSE_ACTIVE", watcher.state)
     launch = visible_executor_launcher(project, watcher)
     idle_bridge = None
     last_logged_state = recovery_state
     stop_logged = False
+    pause_notice = None
     try:
         while True:
             rollover = getattr(watcher, "session_rollover", None)
@@ -3217,6 +3326,15 @@ def main() -> None:
             if state != last_logged_state:
                 runtime_log(logger, run_id, "STATE_TRANSITION", watcher.state, **{"from": last_logged_state, "to": state, "reason": watcher.state.get("humanRequiredReason")})
                 last_logged_state = state
+            if watcher.state.get("discussionPauseActive") and state in {"IDLE", "RESULT_READY", "NEXT_PROMPT_READY"}:
+                notice = (state, watcher.state.get("taskId") or watcher.state.get("nextTaskId"))
+                if notice != pause_notice:
+                    print(f"ORCHESTRATOR PAUSED BY HUMAN state={state} taskId={notice[1] or 'NONE'} architectRelay=BLOCKED F10=RESUME")
+                    pause_notice = notice
+                time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                watcher.state = watcher._load_state()
+                continue
+            pause_notice = None
             if state != "IDLE" and idle_bridge is not None:
                 idle_bridge.close()
                 idle_bridge = None
@@ -3294,7 +3412,7 @@ def main() -> None:
             try:
                 if rollover is not None:
                     rollover.sample_memory()
-                if rollover is not None and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
+                if rollover is not None and not watcher.state.get("discussionPauseActive") and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
                     executor_pid = watcher.state.get("codexPid")
                     executor_active = bool(executor_pid and LocalWatcher.process_alive(executor_pid))
                     rollover.request_if_due(
@@ -3303,7 +3421,7 @@ def main() -> None:
                         executor_running=not executor_active,
                         architect_generating=bridge.generation_visible(),
                     )
-                if watcher.state.get("state") == "RESULT_READY" and not watcher.state.get("handoverRequested"):
+                if watcher.state.get("state") == "RESULT_READY" and not watcher.state.get("discussionPauseActive") and not watcher.state.get("handoverRequested"):
                     bridge = watcher.deliver_result_with_recovery(
                         lambda: ArchitectPlaywright.attach(endpoint, conversation_id),
                         initial_bridge=bridge,
@@ -3380,6 +3498,7 @@ def main() -> None:
             logger.exception("unhandled production main-loop exception", extra={"runId": run_id or "UNKNOWN", "state": watcher.state.get("state", "UNKNOWN"), "taskId": watcher.state.get("taskId") or watcher.state.get("nextTaskId") or "NONE", "event": "WATCHER_EXCEPTION", "errorClass": type(error).__name__, "errorMessage": str(error)})
         raise
     finally:
+        hotkeys.stop()
         if idle_bridge is not None:
             idle_bridge.close()
         instance_lock.release()

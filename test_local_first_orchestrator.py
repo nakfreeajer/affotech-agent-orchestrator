@@ -13,7 +13,7 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         parse_orchestrator_result, resolve_executor_worktree,
                                         run_executor_state_once, visible_executor_launcher,
                                         WatcherInstanceLock, handle_architect_value_error,
-                                        run_human_required_startup_once)
+                                        run_human_required_startup_once, DiscussionHotkeyController)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -2378,6 +2378,75 @@ def test_documentation_complete_execute_stages_next_ordinary_task_once(tmp_path)
     assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state["nextTaskId"] == "000023"
     assert watcher.state["documentationClosurePending"] is False
+
+
+def test_discussion_pause_dispatch_is_durable_and_survives_restart(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "000025", "lastCompletedTaskId": "000024", "codexPid": 1234})
+    controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
+    assert controller.dispatch("F9") is True
+    assert watcher.state["discussionPauseActive"] is True
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.state["discussionPauseActive"] is True
+    assert restarted.state["taskId"] == "000025"
+    assert controller.dispatch("F10") is True
+    assert watcher.state["discussionPauseActive"] is False
+
+
+def test_discussion_pause_allows_executor_observation_but_blocks_new_actions(tmp_path, monkeypatch):
+    watcher = ready(tmp_path)
+    watcher.state.update({"discussionPauseActive": True, "state": "RESULT_READY", "taskId": "000025"})
+    sends = []
+    class Bridge:
+        def submit_result_bounded(self, message): sends.append(message)
+    watcher.deliver_result(Bridge())
+    assert sends == [] and watcher.state["state"] == "RESULT_READY"
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(tmp_path / "missing-prompt"), "nextTaskId": "000026"})
+    launches = []
+    assert watcher.launch_next(lambda *_: launches.append(1)) is None
+    assert launches == []
+    watcher.state.update({"state": "IDLE"})
+    assert watcher.request_architect_bootstrap(Bridge()) is False
+    assert watcher.intake_inbox(lambda *_: launches.append(1)) is False
+
+
+def test_discussion_pause_does_not_abort_executor_completion(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "result.txt"
+    result.write_text("completed", encoding="utf-8")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "000025", "codexPid": 4321, "executorResultPath": str(result), "discussionPauseActive": True})
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    assert run_executor_state_once(watcher, lambda *_: (_ for _ in ()).throw(AssertionError("must not relaunch"))) == "RESULT_READY"
+    assert watcher.state["state"] == "RESULT_READY"
+    assert watcher.state["discussionPauseActive"] is True
+
+
+def test_discussion_resume_restores_normal_result_delivery_eligibility(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["discussionPauseActive"] = True
+    watcher.request_discussion_resume()
+    sent = []
+    class Bridge:
+        def assistant_baseline(self): return {"count": 1, "text_hash": "a" * 64}
+        def user_baseline(self): return {"count": 1, "text_hash": "b" * 64}
+        def submit_result_bounded(self, message): sent.append(message)
+    watcher.deliver_result(Bridge())
+    assert len(sent) == 1
+
+
+def test_discussion_resume_does_not_change_human_required(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "discussionPauseActive": True})
+    watcher.request_discussion_resume()
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_DECISION_HUMAN_REQUIRED"
+
+
+def test_discussion_hotkey_unknown_key_is_ignored(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
+    assert controller.dispatch("F8") is False
+    assert not watcher.state.get("discussionPauseActive")
 
 
 def test_result_review_instruction_advertises_documentation_disposition(tmp_path):
