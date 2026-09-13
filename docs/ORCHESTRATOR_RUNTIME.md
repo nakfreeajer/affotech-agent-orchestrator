@@ -6,7 +6,7 @@ Repository: `nakfreeajer/affotech-agent-orchestrator`
 
 Branch authority: remote `main`
 
-Current accepted Orchestrator source checkpoint: `e5b47ffc7892a208679dd1a9c54983e19e5982d8` (`fix(orchestrator): complete documentation envelope template`).
+Current accepted Orchestrator source checkpoint: `78ba0a5d8f56bae2dece6ba1a07fa70594cc21de` (`feat(orchestrator): add durable discussion pause`).
 
 For this repository, the Architect also performs Documentation Curator duties. Runtime/source/test mutations remain bounded Maintainer/Executor work. The Architect independently verifies implementation evidence and may directly maintain Orchestrator governance/history documentation.
 
@@ -26,7 +26,7 @@ The permanent invariant is:
 
 ## Production status
 
-The core local Orchestrator is production-qualified for the behavior already exercised in real AFFOTECH work:
+The core local Orchestrator is production-qualified for the behavior already exercised or independently regression-qualified in AFFOTECH work:
 
 - resident watcher startup/recovery;
 - one visible Codex child at a time;
@@ -39,9 +39,10 @@ The core local Orchestrator is production-qualified for the behavior already exe
 - IDLE continuation;
 - Architect browser rollover foundation;
 - deliberate `HUMAN_REQUIRED` stopping;
-- documentation-closure governance protocol.
+- documentation-closure governance protocol;
+- durable human discussion pause with global F9/F10 controls on Windows.
 
-Latest full regression count after documentation-protocol closure: `247 passed / 0 failed`; Python compile PASS; `git diff --check` PASS.
+Latest full regression count after discussion-pause closure: `253 passed / 0 failed`; Python compile PASS; `git diff --check` PASS.
 
 The live AFFOTECH orchestration boundary after Receipt OCR 5G is intentional:
 
@@ -67,7 +68,9 @@ Exceptional state retained by runtime:
 
 - `EXECUTOR_CRASHED`
 
-Only the production main dispatcher may perform `NEXT_PROMPT_READY -> EXECUTOR_RUNNING`. Recovery, parsing, transport, documentation governance and rollover helpers may inspect/restore state but must not directly launch project work.
+There is deliberately no `PAUSED` state. Human discussion pause is a durable overlay flag and never replaces the truthful underlying workflow state.
+
+Only the production main dispatcher may perform `NEXT_PROMPT_READY -> EXECUTOR_RUNNING`. Recovery, parsing, transport, documentation governance, discussion-pause controls and rollover helpers may inspect/restore state but must not directly launch project work.
 
 ## Canonical sequence
 
@@ -86,6 +89,38 @@ Only the production main dispatcher may perform `NEXT_PROMPT_READY -> EXECUTOR_R
 10. Repeat.
 
 A reviewed task ID is never reused. If task `000021` is reviewed and the Architect returns `EXECUTE`, the next task is `000022`.
+
+## Human discussion pause
+
+The discussion pause exists so the final human authority can use the Project Architect conversation for ideas, brainstorming or roadmap/document updates without the Orchestrator injecting an Executor report or starting another task in the middle of that discussion.
+
+Windows production hotkeys while the watcher is running:
+
+- `F9` = pause for Architect discussion;
+- `F10` = resume Orchestrator.
+
+The pause is persisted as `discussionPauseActive=true`. It survives watcher restart and is not represented as a new state.
+
+Pause semantics:
+
+- an already-running Executor is not killed, cancelled or modified;
+- `EXECUTOR_RUNNING` continues to be observed normally;
+- if that Executor completes successfully, the underlying state may advance to `RESULT_READY` while the pause remains active;
+- `RESULT_READY` is held locally and must not be delivered to the Architect;
+- `NEXT_PROMPT_READY` is held and must not launch another Executor;
+- `IDLE` must not bootstrap/contact the Architect or consume new inbox work;
+- a pause requested during an already-in-flight `ARCHITECT_RUNNING` transaction does not retract or corrupt that interaction; the already-started Architect decision may complete, after which any newly staged work is held at the next safe boundary;
+- existing Executor crash/no-result recovery remains authoritative and is not hidden by pause;
+- `HUMAN_REQUIRED` remains `HUMAN_REQUIRED` when F10 clears the discussion pause;
+- F10 clears only the discussion-pause flag and does not synthesize a task, milestone, Architect prompt or human authorization.
+
+The global Windows hotkeys use `RegisterHotKey` from the standard/native Windows API rather than a third-party keyboard package. Hotkeys exist only while the watcher process is running. Registration failure is reported visibly and to the runtime log; the watcher must never pretend the hotkeys are active when registration did not succeed.
+
+The intended normal human workflow is:
+
+`Executor running -> F9 -> Executor may finish -> result waits -> human/Architect discussion -> F10 -> normal exactly-once relay resumes`
+
+Discussion content itself is not machine authority. The Orchestrator ignores brainstorming while paused and resumes only the existing durable workflow when F10 is pressed.
 
 ## Canonical Architect envelope
 
@@ -138,12 +173,14 @@ A pending documentation closure cannot be bypassed by a missing or `NOT_REQUIRED
 - `EXECUTOR_RUNNING` + live PID -> observe only.
 - `EXECUTOR_RUNNING` + dead PID + usable result -> `RESULT_READY`.
 - `EXECUTOR_RUNNING` + dead PID + no usable result -> `HUMAN_REQUIRED`.
-- `RESULT_READY` restart -> resume/reconcile result transport; never rerun Executor.
+- `RESULT_READY` restart -> resume/reconcile result transport unless discussion pause is active; never rerun Executor.
 - `ARCHITECT_RUNNING` restart after confirmed delivery -> observe Architect; never resend confirmed result.
-- `NEXT_PROMPT_READY` restart -> main dispatcher launches exactly one Executor.
+- `NEXT_PROMPT_READY` restart -> main dispatcher launches exactly one Executor unless discussion pause is active.
+- `IDLE` restart -> normal continuation behavior unless discussion pause is active.
 - no blind post-launch retry.
 - human-authorized recovery may restore `NEXT_PROMPT_READY`, but recovery helpers do not launch directly.
 - deliberate Architect `HUMAN_REQUIRED` uses `humanRequiredReason=ARCHITECT_DECISION_HUMAN_REQUIRED` and must not enter transport-exhaustion recovery.
+- restart never clears an active discussion pause silently.
 
 ## Exactly-once Architect result transport
 
@@ -163,6 +200,8 @@ If delivery is independently proven, any stale composer is cleared only when its
 
 Transport recovery must never rerun completed project work.
 
+Discussion pause is an additional outbound gate: while pause is active, a waiting `RESULT_READY` payload is not sent. F10 merely re-enables the existing exactly-once delivery path; it does not create a new delivery identity or authorize a duplicate send.
+
 ## HUMAN_REQUIRED reason hygiene
 
 `humanRequiredReason` describes only the current authority boundary.
@@ -172,6 +211,8 @@ Successful Executor completion, successful transport recovery, Architect `EXECUT
 Architect `HUMAN_REQUIRED` replaces any previous reason with `ARCHITECT_DECISION_HUMAN_REQUIRED`.
 
 Historical transport reason `ARCHITECT_RESULT_TRANSPORT_EXHAUSTED` must never survive into later healthy task states.
+
+Discussion resume does not clear, reinterpret or bypass `HUMAN_REQUIRED`.
 
 ## Persistent Executor model
 
@@ -196,6 +237,8 @@ Rules:
 Production launches print a visible task banner and allow live Codex activity to remain visible. Runtime captures stderr evidence without hiding all meaningful execution from the user.
 
 `CREATE_NEW_CONSOLE` remains part of the Windows launch path, so an auxiliary console may still appear. This is a presentation caveat, not authority for a second Executor.
+
+When discussion pause is active, the watcher visibly reports the underlying state/task and that Architect relay is blocked. It avoids repeated poll-cycle console spam for an unchanged paused state.
 
 ## Durable runtime logging
 
@@ -224,6 +267,8 @@ Important event families include:
 - `RESULT_DELIVERY_ATTEMPT`, `RESULT_DELIVERY_CONFIRMED`, `RESULT_DELIVERY_AMBIGUOUS`, `RESULT_DELIVERY_RECONCILED`, `RESULT_DELIVERY_EXHAUSTED`;
 - `ARCHITECT_STALE_COMPOSER_CLEARED`;
 - `HUMAN_REQUIRED`;
+- `HUMAN_DISCUSSION_PAUSE_REQUESTED`, `HUMAN_DISCUSSION_PAUSE_ACTIVE`, `HUMAN_DISCUSSION_RESUME_REQUESTED`;
+- `HUMAN_DISCUSSION_HOTKEY_REGISTRATION_FAILED` when global hotkeys cannot be registered;
 - `DOCUMENTATION_CLOSURE_REQUIRED`, `DOCUMENTATION_CLOSURE_TASK_STAGED`, `DOCUMENTATION_CLOSURE_ACCEPTED`, `DOCUMENTATION_CLOSURE_BYPASS_BLOCKED`;
 - rollover lifecycle events.
 
@@ -234,6 +279,8 @@ Accepted logging closure: `b5ed8dcde5de92c5b7fe8df08b84243dc3a6dd98`.
 Accepted closure: `06a743f986d462f5f6de246dac9292bd47800f0b`.
 
 Consumed result-review responses may request exactly one continuation bootstrap. A bootstrap-origin STOP remains quietly IDLE and cannot recursively bootstrap itself. Ambiguous legacy consumed responses fail closed unless they satisfy the qualified migration conditions.
+
+Discussion pause takes precedence over new IDLE bootstrap/contact. Resuming simply restores the ordinary IDLE continuation rules.
 
 ## Architect browser rollover
 
@@ -253,6 +300,8 @@ At a safe point, rollover may:
 
 Rollover must never launch project work, regenerate results, renumber completed tasks, or resend already-confirmed work.
 
+A human discussion pause prevents starting new rollover/result-delivery outbound activity at the held safe states. It does not corrupt an already-in-flight Architect transaction.
+
 ## Accepted repair chain
 
 Do not re-audit these milestones absent regression evidence:
@@ -265,6 +314,7 @@ Do not re-audit these milestones absent regression evidence:
 - `cfd673e3f278c4269fe252f40210b935eb3fb622` — milestone documentation governance implemented.
 - `38b3aeca711b36f19f1ad612b6ec223eea1691c3` — documentation disposition propagated to production Architect prompts.
 - `e5b47ffc7892a208679dd1a9c54983e19e5982d8` — canonical IDLE documentation envelope template completed.
+- `78ba0a5d8f56bae2dece6ba1a07fa70594cc21de` — durable human discussion pause with F9/F10 controls accepted.
 
 Earlier accepted foundations also include Orchestrator-owned worktrees, persistent session identity, postlaunch retry fencing, human recovery/single-instance locking, post-result worktree inheritance, and cross-task transport/state hygiene.
 
@@ -281,26 +331,30 @@ The month-long stabilization exposed permanent lessons:
 7. production prompts must advertise the same protocol the parser enforces;
 8. a completed task/result must never be rerun simply because transport failed;
 9. visible execution and durable logs are operational requirements, not optional diagnostics;
-10. human authority remains the boundary for new product direction.
+10. human authority remains the boundary for new product direction;
+11. the final human must be able to reserve the Architect conversation for discussion without aborting an already-authorized Executor or losing a completed result.
 
 ## Next qualification gate
 
 Do not manufacture another Orchestrator-only milestone merely to exercise the final protocol.
 
-The next real AFFOTECH roadmap milestone should be used as the production proof of the final documentation-governance protocol. Observe that:
+The next real AFFOTECH roadmap milestone should be used as the production proof of the final documentation-governance and discussion-pause behavior. Observe that:
 
 - the final Architect envelope includes `documentation=`;
 - any required documentation closure is staged exactly once;
 - pending documentation survives restart and cannot be bypassed;
 - `COMPLETE` clears the gate;
 - no duplicate Executor/result transport occurs;
-- deliberate `HUMAN_REQUIRED` remains safe.
+- deliberate `HUMAN_REQUIRED` remains safe;
+- if F9 is used during a real Executor task, that Executor may finish while its result remains locally held;
+- while paused, the Architect conversation receives no new Orchestrator result/bootstrap traffic;
+- F10 resumes the existing durable state without rerunning the completed task or changing roadmap authority.
 
 ## Next project after successful real proof: universal template
 
 After one real post-5G AFFOTECH milestone completes successfully through the final protocol, the next Orchestrator engineering objective is to create a **universal Orchestrator template for new projects**.
 
-Goal: a new project should start from the proven runtime instead of spending weeks rebuilding transport, recovery, state, logging, worktree, rollover and documentation-governance behavior.
+Goal: a new project should start from the proven runtime instead of spending weeks rebuilding transport, recovery, state, logging, worktree, rollover, documentation-governance and human-discussion-pause behavior.
 
 The universalization work must extract configuration from project-specific assumptions while preserving this accepted state machine and safety behavior. At minimum, it should parameterize project repository/branch, Architect conversation, Executor session identity, workspace/worktree roots, role/bootstrap context and project-specific validation hooks.
 
@@ -308,12 +362,14 @@ Do not begin universalization before the next real milestone proves the current 
 
 ## Git source synchronization rule
 
-A source-maintenance milestone is complete only when the bounded change is committed, pushed, fetched/read back, and local/remote authority is synchronized. Never force-push and never claim PASS when a required push fails.
+A source-maintenance milestone is complete only when the bounded change is committed, pushed, fetched/read back, and local/remote authority is synchronized. Never force-push and never claim PASS when a required push failed.
 
 ## Permanent design principle
 
 Keep the Orchestrator boring:
 
 `recover -> run one task -> capture one result -> deliver once -> wait -> stage one next action`
+
+Human discussion pause only gates new outbound/launch actions around that loop; it does not create a parallel workflow.
 
 Everything else exists only to preserve that loop.
