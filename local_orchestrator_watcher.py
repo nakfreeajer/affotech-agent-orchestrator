@@ -710,6 +710,9 @@ class ArchitectSessionRollover:
     """Small crash-safe state machine with memory-first rollover policy."""
     def __init__(self, watcher: "LocalWatcher"):
         self.watcher = watcher
+        self._last_logged_memory_bytes: int | None = None
+        self._last_sampled_memory_bytes: int | None = None
+        self._last_memory_error: str | None = None
 
     def initialize_current_session(self) -> None:
         self.watcher.state["architectResponseCount"] = 0
@@ -732,16 +735,31 @@ class ArchitectSessionRollover:
             return None
         try:
             memory_bytes = reader()
-        except RuntimeError as error:
+            if not isinstance(memory_bytes, int) or memory_bytes < 0:
+                raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_INVALID")
+        except Exception as error:
+            candidate = str(error)
+            reason = candidate if re.fullmatch(r"[A-Z0-9_]+", candidate) else f"ARCHITECT_MEMORY_SAMPLE_{type(error).__name__.upper()}"
             self.watcher.state["architectMemoryOwnership"] = "INCONCLUSIVE"
-            self.watcher.state["architectMemoryError"] = str(error)
+            self.watcher.state["architectMemoryError"] = reason
             self.watcher.save()
+            if reason != self._last_memory_error:
+                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_FAILED", self.watcher.state, error=reason)
+                self._last_memory_error = reason
             return None
-        if not isinstance(memory_bytes, int) or memory_bytes < 0:
-            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_INVALID")
+        self._last_memory_error = None
         self.watcher.state["architectMemoryBytes"] = memory_bytes
         self.watcher.state["architectMemoryMiB"] = round(memory_bytes / (1024 * 1024), 2)
+        memory_mib = self.watcher.state["architectMemoryMiB"]
+        if (self._last_logged_memory_bytes is None
+                or abs(memory_bytes - self._last_logged_memory_bytes) >= 64 * 1024 * 1024):
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE", self.watcher.state, memoryMiB=memory_mib, thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB)
+            self._last_logged_memory_bytes = memory_bytes
+        previous_memory_bytes = self._last_sampled_memory_bytes
+        self._last_sampled_memory_bytes = memory_bytes
         trigger = self.rollover_trigger(memory_bytes, int(self.watcher.state.get("architectResponseCount", 0)))
+        if memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES and (previous_memory_bytes is None or previous_memory_bytes < ARCHITECT_MEMORY_THRESHOLD_BYTES):
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_THRESHOLD", self.watcher.state, memoryMiB=memory_mib, thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB, trigger="MEMORY_THRESHOLD")
         if trigger and not self.watcher.state.get("rolloverPending"):
             self.watcher.state["rolloverPending"] = True
             self.watcher.state["rolloverTrigger"] = trigger
@@ -799,14 +817,22 @@ class ArchitectSessionRollover:
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_READY", self.watcher.state)
         old_page = bridge.page
+        new_page = None
+        committed = False
         try:
             new_page = bridge.open_fresh_with_handover(response)
-            current_id = getattr(new_page, "url", "")
-            current_id = current_id() if callable(current_id) else current_id
-            conversation_id = architect_conversation_id_from_url(current_id)
-            bridge.page = new_page
-            if hasattr(old_page, "close"):
-                old_page.close()
+            deadline = time.monotonic() + 15.0
+            conversation_id = None
+            while time.monotonic() < deadline:
+                current_url = getattr(new_page, "url", "")
+                current_url = current_url() if callable(current_url) else current_url
+                try:
+                    conversation_id = architect_conversation_id_from_url(current_url)
+                    break
+                except RuntimeError:
+                    time.sleep(0.1)
+            if conversation_id is None:
+                raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ID_TIMEOUT")
             self.watcher.state["architectConversationId"] = conversation_id
             self.watcher.state.pop("currentArchitectConversationId", None)
             self.watcher.state["architectResponseCount"] = 0
@@ -816,12 +842,28 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverTrigger", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
+            committed = True
+            bridge.page = new_page
+            if hasattr(old_page, "close"):
+                try:
+                    old_page.close()
+                except Exception:
+                    pass
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_NEW_CONVERSATION_CREATED", self.watcher.state, conversationId=conversation_id)
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_SWITCHED", self.watcher.state, conversationId=conversation_id)
             emit("ARCHITECT_SESSION_ROLLOVER_COMPLETE")
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_SESSION_ROLLOVER_COMPLETE", self.watcher.state)
             return True
-        except Exception:
+        except Exception as error:
+            if not committed and new_page is not None and new_page is not old_page and hasattr(new_page, "close"):
+                try:
+                    new_page.close()
+                except Exception:
+                    pass
+            candidate = str(error)
+            code = candidate if re.fullmatch(r"[A-Z0-9_:]+", candidate) else "ARCHITECT_SESSION_ROLLOVER_FAILED"
+            emit(code)
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_SESSION_ROLLOVER_FAILED", self.watcher.state, error=code)
             emit("STATE=ROLLOVER_PENDING")
             return False
 
@@ -1574,10 +1616,15 @@ class ArchitectPlaywright:
     def open_fresh_with_handover(self, handover: str) -> Any:
         """Create one fresh authenticated-context tab and submit unchanged handover."""
         new_page = self.page.context.new_page()
-        new_page.goto("https://chatgpt.com/")
-        composer = new_page.get_by_role("textbox").last
-        composer.fill(handover)
-        composer.press("Enter")
+        try:
+            new_page.goto("https://chatgpt.com/")
+            ArchitectPlaywright(new_page).submit_result_bounded(handover)
+        except Exception:
+            try:
+                new_page.close()
+            except Exception:
+                pass
+            raise
         return new_page
 
     @staticmethod

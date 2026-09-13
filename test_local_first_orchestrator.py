@@ -653,6 +653,104 @@ def test_localfirst_has_governed_memory_rollover_at_safe_boundary(tmp_path):
     assert len(messages) == 1
 
 
+class _RolloverPage:
+    def __init__(self, urls):
+        self.urls = iter(urls)
+        self.closed = False
+
+    @property
+    def url(self):
+        return next(self.urls)
+
+    def close(self):
+        self.closed = True
+
+
+def test_rollover_waits_for_new_conversation_url_before_switching(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "handoverReady": False,
+                          "architectConversationId": "OLD", "pending_handover": "private handover"})
+    watcher.save()
+    old_page = _RolloverPage(iter(()))
+    new_page = _RolloverPage(["https://chatgpt.com/", "https://chatgpt.com/", "https://chatgpt.com/c/NEW_ID"])
+    class Bridge:
+        page = old_page
+        def open_fresh_with_handover(self, handover):
+            assert handover.endswith("ARCHITECT_HANDOVER_READY")
+            return new_page
+    ticks = iter(range(100))
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    assert watcher.session_rollover.complete_from_response(Bridge(), "private handover\nARCHITECT_HANDOVER_READY") is True
+    assert watcher.state["architectConversationId"] == "NEW_ID"
+    assert not watcher.state.get("pending_handover")
+    assert new_page.closed is False
+    assert old_page.closed is True
+
+
+def test_rollover_timeout_closes_only_fresh_page_and_preserves_authority(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "handoverRequested": True, "rolloverPending": True,
+                          "handoverReady": False, "architectConversationId": "OLD", "pending_handover": "private handover"})
+    watcher.save()
+    old_page = _RolloverPage(iter(()))
+    new_page = _RolloverPage(["https://chatgpt.com/"] * 20)
+    class Bridge:
+        page = old_page
+        def open_fresh_with_handover(self, _handover): return new_page
+    ticks = iter(range(100))
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    assert watcher.session_rollover.complete_from_response(Bridge(), "private handover\nARCHITECT_HANDOVER_READY") is False
+    assert new_page.closed is True
+    assert old_page.closed is False
+    assert watcher.state["architectConversationId"] == "OLD"
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+
+
+def test_fresh_handover_submission_failure_closes_fresh_page(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD",
+                          "pending_handover": "private handover"})
+    watcher.save()
+    old_page = FakeComposerPage()
+    fresh_page = FakeComposerPage(available=False)
+    fresh_page.goto = lambda _url: None
+    fresh_page.close = lambda: setattr(fresh_page, "closed", True)
+    fresh_page.closed = False
+    old_page.context = type("Context", (), {"new_page": lambda _self: fresh_page})()
+    bridge = ArchitectPlaywright(old_page)
+    assert watcher.session_rollover.complete_from_response(bridge, "private handover\nARCHITECT_HANDOVER_READY") is False
+    assert fresh_page.closed is True
+    assert bridge.page is old_page
+    assert watcher.state["architectConversationId"] == "OLD"
+    assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
+
+
+def test_memory_telemetry_is_throttled_deduplicated_and_recovers(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    logger, run_id, log_path = watcher_module.initialize_runtime_logging(watcher.state_dir)
+    watcher.runtime_logger, watcher.runtime_run_id = logger, run_id
+    mib = 1024 * 1024
+    samples = iter([100 * mib, 110 * mib, 174 * mib, 1025 * mib])
+    for _ in range(4):
+        watcher.session_rollover.sample_memory(lambda: next(samples))
+    failures = iter([RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_TIMEOUT"),
+                     RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_TIMEOUT"), 120 * mib])
+    for _ in range(3):
+        watcher.session_rollover.sample_memory(lambda: next(failures))
+    for handler in logger.handlers:
+        handler.flush()
+    log = Path(log_path).read_text(encoding="utf-8")
+    assert log.count("event=ARCHITECT_MEMORY_SAMPLE ") == 4
+    assert "memoryMiB=100" in log and "memoryMiB=174" in log and "memoryMiB=1025" in log and "memoryMiB=120" in log
+    assert log.count("event=ARCHITECT_MEMORY_THRESHOLD ") == 1
+    assert log.count("event=ARCHITECT_MEMORY_SAMPLE_FAILED ") == 1
+
+
 def test_localfirst_samples_explicit_governed_architect_root_pid(tmp_path, monkeypatch):
     observed = []
     monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "4242")
