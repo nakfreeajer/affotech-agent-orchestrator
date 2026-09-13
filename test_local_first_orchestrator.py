@@ -908,6 +908,8 @@ def test_legacy_provisional_identity_recovers_one_handover_page_and_preserves_re
 def test_legacy_provisional_identity_caller_adopts_persisted_id_before_canonicalization(tmp_path, monkeypatch):
     from playwright import sync_api
     watcher, provisional, result = _legacy_identity_fixture(tmp_path)
+    watcher.state.update({"rolloverPending": True, "rolloverTrigger": "MEMORY_THRESHOLD"})
+    watcher.save()
     canonical = "6aa6d480-f628-83ec-a617-51fbea5a592a"
     page = _AckPage("https://chatgpt.com/c/" + canonical, [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}])
     monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([page]))
@@ -940,6 +942,8 @@ def test_legacy_provisional_identity_caller_adopts_persisted_id_before_canonical
         assert watcher.state["executorResultPath"] == str(result)
         assert watcher.state["architectSendState"] == "FAILED"
         assert watcher.state["architectDeliveryFailureClass"] == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+        assert watcher.state["rolloverPending"] is False
+        assert "rolloverTrigger" not in watcher.state
     finally:
         if bridge is not None:
             bridge.close()
@@ -970,6 +974,9 @@ def test_legacy_provisional_identity_rejects_new_chat_non_web_idle_and_active_ex
     watcher.state["state"] = "RESULT_READY"
     watcher.state["codexPid"] = 1234
     monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    assert not watcher_module.legacy_provisional_architect_recovery_allowed(watcher, provisional)
+    watcher.state["codexPid"] = None
+    watcher.state["handoverRequested"] = True
     assert not watcher_module.legacy_provisional_architect_recovery_allowed(watcher, provisional)
 
 

@@ -346,13 +346,12 @@ def legacy_provisional_architect_recovery_allowed(watcher: Any, requested_id: st
     return bool(
         isinstance(requested_id, str)
         and requested_id.startswith("WEB:")
-        and state.get("state") in {"RESULT_READY", "HUMAN_REQUIRED"}
+        and state.get("state") == "RESULT_READY"
         and task_id
         and task_id == str(state.get("lastCompletedTaskId") or "")
         and result_exists
         and not executor_active
-        and not state.get("rolloverPending")
-        and not state.get("handoverRequested")
+        and state.get("handoverRequested") is False
     )
 
 
@@ -389,9 +388,12 @@ def attach_legacy_provisional_architect(endpoint: str, requested_id: str, watche
             latest = next((entry.get("text") for entry in reversed(entries) if isinstance(entry, dict) and isinstance(entry.get("text"), str) and entry.get("text")), None)
             if latest is None or not architect_handover_ready(latest):
                 raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+        stale_rollover_pending = watcher.state.get("rolloverPending") is True
         watcher.state["architectConversationId"] = actual_id
+        watcher.state["rolloverPending"] = False
+        watcher.state.pop("rolloverTrigger", None)
         watcher.save()
-        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_PROVISIONAL_CONVERSATION_RECOVERED", watcher.state, **{"from": requested_id, "to": actual_id})
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_PROVISIONAL_CONVERSATION_RECOVERED", watcher.state, **{"from": requested_id, "to": actual_id, "staleRolloverPendingCleared": stale_rollover_pending})
         bridge._runtime = runtime
         bridge._browser = browser
         return bridge
