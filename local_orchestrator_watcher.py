@@ -289,6 +289,14 @@ def architect_conversation_id_from_url(url: str) -> str:
     return match.group(1)
 
 
+def architect_handover_ready(response: str) -> bool:
+    """Recognize only a terminal Architect handover protocol marker."""
+    candidate = str(response or "").rstrip()
+    if candidate.endswith(COMPLETE):
+        candidate = candidate[:-len(COMPLETE)].rstrip()
+    return candidate.endswith(HANDOVER_READY) or candidate.endswith(r"ARCHITECT\_HANDOVER\_READY")
+
+
 def resolve_architect_browser_root_pid(endpoint: str) -> int:
     """Resolve the unique Windows listener owner for the governed CDP endpoint."""
     parts = urlsplit(endpoint)
@@ -812,7 +820,7 @@ class ArchitectSessionRollover:
             return False
 
     def complete_from_response(self, bridge: "ArchitectPlaywright", response: str, emit: Callable[[str], None] = print) -> bool:
-        if not self.watcher.state.get("handoverRequested") or not response.rstrip().endswith(HANDOVER_READY):
+        if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
             return False
         self.watcher.state["handoverReady"] = True
         self.watcher.state["pending_handover"] = response
@@ -2551,6 +2559,51 @@ class LocalFirstOrchestrator:
             return True
         return False
 
+    def reject_invalid_handover_response(self) -> None:
+        self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_HANDOVER_RESPONSE_INVALID"})
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_HANDOVER_RESPONSE_INVALID", self.state)
+
+    def process_pending_handover_response(self, bridge: Any, response: str) -> bool:
+        """Keep pending handover responses out of ordinary task decision parsing."""
+        if not self.state.get("handoverRequested"):
+            return False
+        if self.session_rollover.complete_from_response(bridge, response):
+            return True
+        self.reject_invalid_handover_response()
+        return False
+
+    def recover_pending_rollover_handover(self, bridge: Any) -> bool:
+        """Recover one already-generated handover after the known format-recovery incident."""
+        task_id = str(self.state.get("taskId") or "")
+        result_path = self.state.get("executorResultPath")
+        result_ready = isinstance(result_path, str) and Path(result_path).is_file() and Path(result_path).read_text(encoding="utf-8", errors="replace").strip()
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        executor_active = bool(active_pid and LocalWatcher.process_alive(int(active_pid))) if active_pid else False
+        eligible = (
+            self.state.get("state") == "HUMAN_REQUIRED"
+            and self.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED"
+            and self.state.get("handoverRequested") is True
+            and self.state.get("rolloverPending") is True
+            and task_id
+            and task_id == str(self.state.get("lastCompletedTaskId") or "")
+            and result_ready
+            and not executor_active
+        )
+        if not eligible:
+            return False
+        entries = bridge._assistant_entries()
+        handover = next((entry.get("text") for entry in reversed(entries) if isinstance(entry, dict) and isinstance(entry.get("text"), str) and architect_handover_ready(entry["text"])), None)
+        if not handover:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_HANDOVER_RESPONSE_INVALID", self.state, reason="ARCHITECT_HANDOVER_NOT_FOUND")
+            return False
+        if not self.session_rollover.complete_from_response(bridge, handover):
+            return False
+        self.state.update({"state": "RESULT_READY", "taskId": task_id, "lastCompletedTaskId": task_id, "executorResultPath": result_path, "humanRequiredReason": None})
+        self.save()
+        self.deliver_result(bridge)
+        return True
+
     def _fail_closed_idle_envelope(self, response: str, fingerprint: str | None) -> str:
         self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ENVELOPE_INVALID"})
         self.save()
@@ -3705,6 +3758,18 @@ def main() -> None:
                 print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
+                if watcher.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED":
+                    conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+                    runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+                    try:
+                        recovery_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
+                        if watcher.recover_pending_rollover_handover(recovery_bridge):
+                            recovery_bridge.close()
+                            continue
+                        recovery_bridge.close()
+                    except Exception as error:
+                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
@@ -3784,18 +3849,22 @@ def main() -> None:
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                         time.sleep(1.0)
                         continue
-                    if watcher.state.get("handoverRequested") and rollover is not None and rollover.complete_from_response(bridge, observed["text"]):
-                        baseline = bridge.assistant_baseline()
-                        if watcher.state.get("state") == "RESULT_READY":
-                            bridge = watcher.deliver_result_with_recovery(
-                                lambda: ArchitectPlaywright.attach(endpoint, watcher.state.get("architectConversationId") or conversation_id),
-                                initial_bridge=bridge,
-                            )
-                            if bridge is None:
-                                print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
-                                return
-                            baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
-                        continue
+                    if watcher.state.get("handoverRequested") and rollover is not None:
+                        if watcher.process_pending_handover_response(bridge, observed["text"]):
+                            baseline = bridge.assistant_baseline()
+                            if watcher.state.get("state") == "RESULT_READY":
+                                bridge = watcher.deliver_result_with_recovery(
+                                    lambda: ArchitectPlaywright.attach(endpoint, watcher.state.get("architectConversationId") or conversation_id),
+                                    initial_bridge=bridge,
+                                )
+                                if bridge is None:
+                                    print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
+                                    return
+                                baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
+                            continue
+                        watcher.reject_invalid_handover_response()
+                        print("STATE=HUMAN_REQUIRED reason=ARCHITECT_HANDOVER_RESPONSE_INVALID")
+                        return
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
                             decision = watcher.consume_idle_architect_response(observed["text"], launch)

@@ -730,6 +730,83 @@ def test_fresh_handover_submission_failure_closes_fresh_page(tmp_path):
     assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
 
 
+def test_architect_handover_ready_accepts_plain_and_escaped_terminal_markers():
+    assert watcher_module.architect_handover_ready("handover\nARCHITECT_HANDOVER_READY")
+    assert watcher_module.architect_handover_ready(r"handover\nARCHITECT\_HANDOVER\_READY")
+    assert watcher_module.architect_handover_ready("handover\nARCHITECT_HANDOVER_READY\nARCHITECT_RESPONSE_COMPLETE")
+    assert watcher_module.architect_handover_ready("handover\nARCHITECT\\_HANDOVER\\_READY\nARCHITECT_RESPONSE_COMPLETE")
+
+
+def test_architect_handover_ready_requires_terminal_marker():
+    assert not watcher_module.architect_handover_ready("ARCHITECT_HANDOVER_READY\nmore content")
+    assert not watcher_module.architect_handover_ready("body ARCHITECT\\_HANDOVER\\_READY more")
+
+
+def test_pending_handover_invalid_response_never_enters_format_recovery(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "rolloverTrigger": "MEMORY_THRESHOLD",
+                          "taskId": "000040", "lastCompletedTaskId": "000040"})
+    watcher.save()
+    monkeypatch.setattr(watcher.session_rollover, "complete_from_response", lambda *_: False)
+    monkeypatch.setattr(watcher, "request_format_recovery", lambda *_: (_ for _ in ()).throw(AssertionError("format recovery forbidden")))
+    assert watcher.process_pending_handover_response(object(), "not a handover") is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_HANDOVER_RESPONSE_INVALID"
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
+
+
+def test_incident_recovery_uses_newest_valid_handover_and_ignores_stop(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "task-000040.txt"
+    result.write_text("captured task 000040 result", encoding="utf-8")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED",
+                          "handoverRequested": True, "rolloverPending": True, "rolloverTrigger": "MEMORY_THRESHOLD",
+                          "taskId": "000040", "lastCompletedTaskId": "000040", "executorResultPath": str(result)})
+    watcher.save()
+    escaped = r"complete handover\nARCHITECT\_HANDOVER\_READY"
+    contaminated_stop = "<ORCHESTRATOR_RESULT>\naction=STOP\ntaskId=000040\n</ORCHESTRATOR_RESULT>"
+    class Bridge:
+        def _assistant_entries(self):
+            return [{"id": "handover", "text": escaped}, {"id": "stop", "text": contaminated_stop}]
+    complete_calls, deliveries = [], []
+    def complete(_bridge, response):
+        complete_calls.append(response)
+        watcher.state.update({"handoverRequested": False, "rolloverPending": False})
+        return True
+    monkeypatch.setattr(watcher.session_rollover, "complete_from_response", complete)
+    monkeypatch.setattr(watcher, "deliver_result", lambda bridge: deliveries.append(bridge))
+    assert watcher.recover_pending_rollover_handover(Bridge()) is True
+    assert complete_calls == [escaped]
+    assert len(deliveries) == 1
+    assert watcher.state["taskId"] == "000040"
+    assert watcher.state["lastCompletedTaskId"] == "000040"
+    assert Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8") == "captured task 000040 result"
+    assert watcher.state["state"] == "RESULT_READY"
+
+
+def test_incident_recovery_without_valid_handover_stays_human_required(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "task-000040.txt"
+    result.write_text("captured task 000040 result", encoding="utf-8")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED",
+                          "handoverRequested": True, "rolloverPending": True, "taskId": "000040",
+                          "lastCompletedTaskId": "000040", "executorResultPath": str(result)})
+    watcher.save()
+    class Bridge:
+        def _assistant_entries(self):
+            return [{"id": "stop", "text": "<ORCHESTRATOR_RESULT> action=STOP taskId=000040 </ORCHESTRATOR_RESULT>"}]
+    called = []
+    monkeypatch.setattr(watcher.session_rollover, "complete_from_response", lambda *_: called.append(1))
+    monkeypatch.setattr(watcher, "launch_next", lambda *_: (_ for _ in ()).throw(AssertionError("executor forbidden")))
+    assert watcher.recover_pending_rollover_handover(Bridge()) is False
+    assert called == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED"
+    assert watcher.state["taskId"] == "000040"
+
+
 def test_memory_telemetry_is_throttled_deduplicated_and_recovers(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     logger, run_id, log_path = watcher_module.initialize_runtime_logging(watcher.state_dir)
