@@ -747,11 +747,13 @@ class ArchitectSessionRollover:
                 runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_FAILED", self.watcher.state, error=reason)
                 self._last_memory_error = reason
             return None
+        recovering_from_error = self._last_memory_error is not None
         self._last_memory_error = None
         self.watcher.state["architectMemoryBytes"] = memory_bytes
         self.watcher.state["architectMemoryMiB"] = round(memory_bytes / (1024 * 1024), 2)
         memory_mib = self.watcher.state["architectMemoryMiB"]
         if (self._last_logged_memory_bytes is None
+                or recovering_from_error
                 or abs(memory_bytes - self._last_logged_memory_bytes) >= 64 * 1024 * 1024):
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE", self.watcher.state, memoryMiB=memory_mib, thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB)
             self._last_logged_memory_bytes = memory_bytes

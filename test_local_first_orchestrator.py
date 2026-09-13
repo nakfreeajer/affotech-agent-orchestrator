@@ -735,18 +735,17 @@ def test_memory_telemetry_is_throttled_deduplicated_and_recovers(tmp_path):
     logger, run_id, log_path = watcher_module.initialize_runtime_logging(watcher.state_dir)
     watcher.runtime_logger, watcher.runtime_run_id = logger, run_id
     mib = 1024 * 1024
-    samples = iter([100 * mib, 110 * mib, 174 * mib, 1025 * mib])
-    for _ in range(4):
+    samples = iter([100 * mib, 110 * mib,
+                    RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_TIMEOUT"),
+                    RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_TIMEOUT"),
+                    115 * mib, 180 * mib, 1025 * mib])
+    for _ in range(7):
         watcher.session_rollover.sample_memory(lambda: next(samples))
-    failures = iter([RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_TIMEOUT"),
-                     RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_TIMEOUT"), 120 * mib])
-    for _ in range(3):
-        watcher.session_rollover.sample_memory(lambda: next(failures))
     for handler in logger.handlers:
         handler.flush()
     log = Path(log_path).read_text(encoding="utf-8")
     assert log.count("event=ARCHITECT_MEMORY_SAMPLE ") == 4
-    assert "memoryMiB=100" in log and "memoryMiB=174" in log and "memoryMiB=1025" in log and "memoryMiB=120" in log
+    assert "memoryMiB=100" in log and "memoryMiB=115" in log and "memoryMiB=180" in log and "memoryMiB=1025" in log
     assert log.count("event=ARCHITECT_MEMORY_THRESHOLD ") == 1
     assert log.count("event=ARCHITECT_MEMORY_SAMPLE_FAILED ") == 1
 
