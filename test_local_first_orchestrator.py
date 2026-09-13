@@ -790,6 +790,164 @@ class _RolloverPage:
     def close(self):
         self.closed = True
 
+    def evaluate(self, script):
+        if "stop-button" in script:
+            return False
+        return [{"id": "ack", "text": "ARCHITECT_HANDOVER_READY"}]
+
+
+class _AckPage(_RolloverPage):
+    def __init__(self, url, entries=None, generating=False):
+        super().__init__([url])
+        self.entries = entries or []
+        self.generating = generating
+
+    def evaluate(self, script):
+        if "stop-button" in script:
+            return self.generating
+        return self.entries
+
+
+def _rollover_bridge(old_page, new_page):
+    class Bridge:
+        page = old_page
+        def open_fresh_with_handover(self, _response):
+            return new_page
+    return Bridge()
+
+
+def test_new_conversation_url_alone_does_not_authorize_result_delivery(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[])
+    ticks = iter(range(100))
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert new_page.closed is True
+    assert old_page.closed is False
+    assert watcher.state["architectConversationId"] == "OLD"
+
+
+def test_new_architect_handover_ack_must_finish_before_delivery_ready(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": r"handover accepted\nARCHITECT\_HANDOVER\_READY"}])
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is True
+    assert watcher.state["architectConversationId"] == "NEW"
+    assert old_page.closed is True
+
+
+def test_generation_visible_new_architect_blocks_handover_ack_until_timeout(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "ARCHITECT_HANDOVER_READY"}], generating=True)
+    ticks = iter(range(1000))
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert new_page.closed is True
+    assert old_page.closed is False
+    assert watcher.state["architectConversationId"] == "OLD"
+
+
+def test_invalid_new_architect_ack_fails_closed_before_authority_commit(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "not the handover acknowledgement"}])
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert new_page.closed is True
+    assert old_page.closed is False
+    assert watcher.state["architectConversationId"] == "OLD"
+
+
+def test_generation_visible_new_architect_blocks_result_delivery(tmp_path):
+    watcher = ready(tmp_path)
+    sends = []
+    class Bridge:
+        def generation_visible(self): return True
+        def submit_result_bounded(self, payload): sends.append(payload)
+    watcher.deliver_result(Bridge())
+    assert sends == []
+    assert watcher.state["state"] == "RESULT_READY"
+
+
+def test_exact_unsent_payload_is_replaced_and_sent_once(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    page = FakeComposerPage()
+    page.content = payload
+    page_bridge = ArchitectPlaywright(page)
+    watcher.state.update({"architectDeliveryPayloadHash": payload_hash, "architectSendState": "FAILED",
+                          "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"})
+    watcher.save()
+    class Bridge:
+        def generation_visible(self): return False
+        def assistant_baseline(self): return {"count": 1, "text_hash": "baseline"}
+        def _live_composer(self): return page_bridge._live_composer()
+        def submit_result_bounded(self, value): return page_bridge.submit_result_bounded(value, timeout=1)
+    watcher.deliver_result(Bridge())
+    assert page.sent == [payload]
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+
+
+def test_recovery_bridge_closes_on_success_false_and_exception():
+    class Bridge:
+        def __init__(self): self.close_count = 0
+        def close(self): self.close_count += 1
+    successful = Bridge()
+    assert watcher_module.run_owned_recovery_bridge(successful, lambda _bridge: True) is True
+    assert successful.close_count == 1
+    false_result = Bridge()
+    assert watcher_module.run_owned_recovery_bridge(false_result, lambda _bridge: False) is False
+    assert false_result.close_count == 1
+    raised = Bridge()
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        watcher_module.run_owned_recovery_bridge(raised, lambda _bridge: (_ for _ in ()).throw(RuntimeError("recovery failed")))
+    assert raised.close_count == 1
+
+
+def test_same_payload_pre_send_failure_is_retryable_and_confirms_delivery(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"architectDeliveryPayloadHash": payload_hash, "architectSendState": "FAILED",
+                          "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"})
+    watcher.save()
+    sends = []
+    class Bridge:
+        def generation_visible(self): return False
+        def assistant_baseline(self): return {"count": 1, "text_hash": "baseline"}
+        def submit_result_bounded(self, value): sends.append(value)
+    watcher.deliver_result(Bridge())
+    assert sends == [payload]
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+
+
+def test_ambiguous_delivery_failure_does_not_retry_without_evidence(tmp_path):
+    watcher = ready(tmp_path)
+    _payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"architectDeliveryPayloadHash": payload_hash, "architectSendState": "FAILED",
+                          "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
+    watcher.save()
+    sends = []
+    class Bridge:
+        def generation_visible(self): return False
+        def latest_user_message(self): return None
+        def submit_result_bounded(self, value): sends.append(value)
+    with pytest.raises(ResultSubmissionError) as error:
+        watcher.deliver_result(Bridge())
+    assert error.value.code == "ARCHITECT_DELIVERY_AMBIGUOUS"
+    assert sends == []
+
 
 def test_rollover_waits_for_new_conversation_url_before_switching(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")

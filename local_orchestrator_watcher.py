@@ -62,6 +62,17 @@ def runtime_log(logger: logging.Logger | None, run_id: str | None, event: str, s
     safe = {"runId": run_id or "UNKNOWN", "state": current.get("state", "UNKNOWN"), "taskId": current.get("taskId") or current.get("nextTaskId") or "NONE", "event": event}
     safe.update({key: str(value).replace("\n", " ") for key, value in fields.items() if value is not None})
     logger.log(level, " ".join(f"{key}={value}" for key, value in fields.items() if value is not None), extra=safe)
+
+
+def run_owned_recovery_bridge(bridge: Any, operation: Callable[[Any], Any]) -> Any:
+    """Run one recovery operation and always disconnect its owned bridge."""
+    try:
+        return operation(bridge)
+    finally:
+        try:
+            bridge.close()
+        except Exception:
+            pass
 AFFOTECH_CHILD_PROJECT_DIR = r"C:\Users\nitro\affotech-system-v2-hybrid"
 AFFOTECH_CHILD_REMOTE = "https://github.com/nakfreeajer/affotech-system-v2-hybrid.git"
 DOCUMENTATION_KINDS = frozenset({"IMPLEMENTATION", "BUG_FIX", "REPAIR", "RECOVERY", "ARCHITECTURE_CHANGE", "GOVERNANCE_CHANGE", "INCIDENT_CLOSURE"})
@@ -845,6 +856,23 @@ class ArchitectSessionRollover:
                     time.sleep(0.1)
             if conversation_id is None:
                 raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ID_TIMEOUT")
+            phase = "WAIT_NEW_CONVERSATION_ACK"
+            ack_deadline = time.monotonic() + 30.0
+            new_bridge = ArchitectPlaywright(new_page)
+            while time.monotonic() < ack_deadline:
+                if new_bridge.generation_visible():
+                    time.sleep(0.25)
+                    continue
+                entries = new_bridge._assistant_entries()
+                if entries:
+                    latest = entries[-1].get("text", "") if isinstance(entries[-1], dict) else ""
+                    if architect_handover_ready(latest):
+                        break
+                    if latest.strip():
+                        raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ACK_INVALID")
+                time.sleep(0.25)
+            else:
+                raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ACK_TIMEOUT")
             phase = "COMMIT_NEW_CONVERSATION_AUTHORITY"
             self.watcher.state["architectConversationId"] = conversation_id
             self.watcher.state.pop("currentArchitectConversationId", None)
@@ -3135,6 +3163,8 @@ class LocalFirstOrchestrator:
             raise RuntimeError("RESULT_NOT_READY")
         if self.discussion_pause_active():
             return
+        if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
+            return
         path = Path(self.state["executorResultPath"])
         payload, payload_hash = self._result_delivery_payload()
         task_id = str(self.state["taskId"])
@@ -3147,9 +3177,18 @@ class LocalFirstOrchestrator:
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash, disposition="ALREADY_DELIVERED")
             return
         ambiguous_history = self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_AMBIGUOUS"
+        pre_send_failure = (delivery_state == "FAILED" and self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE")
         delivery_probe = getattr(bridge, "latest_user_message", None)
         can_reconcile_delivery = callable(delivery_probe)
-        if prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
+        if prior_hash == payload_hash and pre_send_failure:
+            if self._delivery_evidence_advanced(bridge, payload):
+                baseline = self.state.get("architectDeliveryBaseline")
+                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
+                self.save()
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
+                self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
+                return
+        elif prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
             if self._delivery_evidence_advanced(bridge, payload):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
@@ -3791,27 +3830,33 @@ def main() -> None:
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+                    recovery_bridge = None
                     try:
                         recovery_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
-                        if watcher.recover_pending_rollover_handover(recovery_bridge):
-                            recovery_bridge.close()
+                        try:
+                            recovered = run_owned_recovery_bridge(recovery_bridge, watcher.recover_pending_rollover_handover)
+                        except Exception as error:
+                            runtime_log(logger, run_id, "ARCHITECT_PENDING_ROLLOVER_RECOVERY_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error))
+                            recovered = False
+                        if recovered:
                             continue
-                        recovery_bridge.close()
                     except Exception as error:
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+                    recovery_bridge = None
                     try:
                         recovery_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
-                        if watcher.reconcile_exhausted_result_delivery(recovery_bridge):
-                            recovery_bridge.close()
+                        if run_owned_recovery_bridge(recovery_bridge, watcher.reconcile_exhausted_result_delivery):
                             continue
-                        recovery_bridge.close()
                     except Exception as error:
-                        runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
+                        if recovery_bridge is None:
+                            runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
+                        else:
+                            runtime_log(logger, run_id, "ARCHITECT_RESULT_DELIVERY_RECOVERY_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 state = run_human_required_startup_once(watcher, launch)
                 if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY"}:
                     continue
