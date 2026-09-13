@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestrator,
                                         LocalWatcher,
@@ -515,6 +516,50 @@ def test_transient_population_timeout_retries_with_fresh_composer_and_sends_once
     assert page.composer_calls >= 5
     assert len({id(composer) for composer in page.composers}) == len(page.composers)
     assert bridge.sendActionAttempted is True
+
+
+def test_real_playwright_timeout_is_transient_and_reacquires_composer():
+    class PlaywrightRetryPage(FakeComposerPage):
+        def __init__(self):
+            super().__init__()
+            self.composer_calls = 0
+            self.composers = []
+            self.bridge = None
+
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                self.composer_calls += 1
+                composer = FakeComposer(self)
+                if self.composer_calls == 2:
+                    def fail(**_):
+                        assert self.bridge.sendActionAttempted is False
+                        raise PlaywrightTimeoutError("transient focus")
+                    composer.focus = fail
+                self.composers.append(composer)
+                return composer
+            return super().get_by_role(role, **kwargs)
+
+    page = PlaywrightRetryPage()
+    bridge = ArchitectPlaywright(page)
+    page.bridge = bridge
+    bridge.submit_result_bounded("playwright timeout payload", timeout=1)
+    assert page.sent == ["playwright timeout payload"]
+    assert page.composer_calls >= 5
+    assert len({id(composer) for composer in page.composers}) == len(page.composers)
+
+
+def test_non_timeout_population_exception_fails_closed_as_input_rejected():
+    class RejectingPage(FakeComposerPage):
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                composer = FakeComposer(self)
+                composer.focus = lambda **_: (_ for _ in ()).throw(ValueError("not transient"))
+                return composer
+            return super().get_by_role(role, **kwargs)
+
+    with pytest.raises(ResultSubmissionError) as error:
+        ArchitectPlaywright(RejectingPage()).submit_result_bounded("rejected payload", timeout=1)
+    assert error.value.code == "ARCHITECT_COMPOSER_INPUT_REJECTED"
 
 
 def test_population_timeout_does_not_mark_send_attempted_before_retry_succeeds():
