@@ -1,200 +1,319 @@
 # AFFOTECH Local Orchestrator Runtime
 
-## Role model
+## Current authority
 
-For this repository, the Architect also performs Documentation Curator duties. Runtime/source/test mutations remain Maintainer/Executor work. The Architect may verify implementation evidence and maintain governance/history documentation directly.
+Repository: `nakfreeajer/affotech-agent-orchestrator`
+
+Branch authority: remote `main`
+
+Current accepted Orchestrator source checkpoint: `e5b47ffc7892a208679dd1a9c54983e19e5982d8` (`fix(orchestrator): complete documentation envelope template`).
+
+For this repository, the Architect also performs Documentation Curator duties. Runtime/source/test mutations remain bounded Maintainer/Executor work. The Architect independently verifies implementation evidence and may directly maintain Orchestrator governance/history documentation.
 
 ## Purpose
 
-The Local Orchestrator automates the relay:
+The Local Orchestrator automates the durable loop:
 
-Project Architect -> Orchestrator -> Executor/Curator -> Orchestrator -> Project Architect
+`Project Architect -> Orchestrator -> one visible Executor/Documentation task -> Orchestrator -> Project Architect`
 
 GitHub is source/history/release authority. GitHub is not runtime message transport.
 
-The Orchestrator must remain a simple durable relay rather than becoming a second project-management system.
+The Orchestrator is deliberately project-generic. Project architecture, roadmap choices, document names, milestone meaning, and business policy remain with the configured Project Architect.
 
-## Canonical production state machine
+The permanent invariant is:
 
-Normal states:
+`recover where stopped -> run one task -> capture one result -> give Architect once -> wait -> stage one next action -> repeat`
 
-- IDLE
-- NEXT_PROMPT_READY
-- EXECUTOR_RUNNING
-- RESULT_READY
-- ARCHITECT_RUNNING
-- HUMAN_REQUIRED
+## Production status
 
-Canonical sequence:
+The core local Orchestrator is production-qualified for the behavior already exercised in real AFFOTECH work:
 
-WATCHER START -> recover durable state -> determine exactly where execution stopped -> NEXT_PROMPT_READY -> launch exactly one Executor -> EXECUTOR_RUNNING -> wait for child completion -> capture exactly one result -> RESULT_READY -> deliver result to Architect exactly once -> ARCHITECT_RUNNING -> wait for completed Architect decision -> stage next action -> NEXT_PROMPT_READY / HUMAN_REQUIRED / IDLE -> repeat.
+- resident watcher startup/recovery;
+- one visible Codex child at a time;
+- persistent logical Codex session;
+- Orchestrator-owned isolated task worktrees;
+- sequential task allocation;
+- exactly-once result delivery with ambiguous-send reconciliation;
+- Architect response observation and next-task staging;
+- durable runtime logging;
+- IDLE continuation;
+- Architect browser rollover foundation;
+- deliberate `HUMAN_REQUIRED` stopping;
+- documentation-closure governance protocol.
 
-Only the production main state dispatcher may perform NEXT_PROMPT_READY -> EXECUTOR_RUNNING. Parsing, recovery, transport, and rollover helpers may inspect, validate, and restore state, but must not directly launch project work.
+Latest full regression count after documentation-protocol closure: `247 passed / 0 failed`; Python compile PASS; `git diff --check` PASS.
 
-## Architect decision rule
+The live AFFOTECH orchestration boundary after Receipt OCR 5G is intentional:
 
-A completed task N reviewed by Architect with action=EXECUTE always creates a new sequential task. Example: reviewed task 000021 -> next task 000022.
+- `state=HUMAN_REQUIRED`
+- `taskId=000025`
+- `lastCompletedTaskId=000025`
+- `humanRequiredReason=ARCHITECT_DECISION_HUMAN_REQUIRED`
 
-The reviewed/completed task ID must never be reused for the next milestone. Architect decision interpretation must be identical whether observed during normal operation, IDLE recovery, or watcher restart.
+Receipt OCR 5G is accepted, stable-tagged and documentation-complete. The watcher is not blocked by transport; it is waiting for fresh final-human roadmap authority for the next AFFOTECH direction.
+
+## Canonical states
+
+Normal durable states:
+
+- `IDLE`
+- `NEXT_PROMPT_READY`
+- `EXECUTOR_RUNNING`
+- `RESULT_READY`
+- `ARCHITECT_RUNNING`
+- `HUMAN_REQUIRED`
+
+Exceptional state retained by runtime:
+
+- `EXECUTOR_CRASHED`
+
+Only the production main dispatcher may perform `NEXT_PROMPT_READY -> EXECUTOR_RUNNING`. Recovery, parsing, transport, documentation governance and rollover helpers may inspect/restore state but must not directly launch project work.
+
+## Canonical sequence
+
+1. Start watcher and acquire the single-instance lock.
+2. Load durable state/configuration and recover exactly where execution stopped.
+3. `NEXT_PROMPT_READY`: validate the owned task worktree and launch exactly one visible Executor child.
+4. `EXECUTOR_RUNNING`: observe the existing child; no wall-clock timeout and no duplicate launch.
+5. Child completion with a non-empty result -> `RESULT_READY`.
+6. Deliver the result to the Project Architect exactly once.
+7. Confirm or reconcile Architect delivery -> `ARCHITECT_RUNNING`.
+8. Wait for one completed Architect decision.
+9. Interpret that decision into exactly one of:
+   - next sequential task -> `NEXT_PROMPT_READY`;
+   - deliberate human boundary -> `HUMAN_REQUIRED`;
+   - no current work -> `IDLE`.
+10. Repeat.
+
+A reviewed task ID is never reused. If task `000021` is reviewed and the Architect returns `EXECUTE`, the next task is `000022`.
+
+## Canonical Architect envelope
+
+New production Architect prompts advertise this schema:
+
+```text
+<ORCHESTRATOR_RESULT>
+classification=ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT
+action=EXECUTE|HUMAN_REQUIRED|STOP
+taskId=<completed task id>
+documentation=NOT_REQUIRED|REQUIRED|COMPLETE
+promptBegin
+<complete next bounded prompt only when action=EXECUTE>
+promptEnd
+</ORCHESTRATOR_RESULT>
+```
+
+The envelope must be the final authoritative content of the Architect response.
+
+Legacy envelopes without `documentation=` remain parseable as `NOT_REQUIRED` only for backward compatibility with historical responses. All new production Architect-facing instructions include the documentation field.
+
+## Documentation closure governance
+
+Documentation is now an explicit governed milestone disposition rather than an informal reminder.
+
+`documentation=NOT_REQUIRED`
+
+- the current decision is not a milestone/release documentation closure;
+- no documentation gate is opened.
+
+`documentation=REQUIRED`
+
+- valid only with an accepted decision and `action=EXECUTE` carrying one complete bounded documentation-closure prompt;
+- the Orchestrator stages that closure through the normal sequential task path;
+- durable `documentationClosurePending=true` prevents ordinary project advancement until completion;
+- the Orchestrator does not know project-specific document names.
+
+`documentation=COMPLETE`
+
+- required documentation has already been synchronized and verified;
+- clears the durable pending gate;
+- then ordinary `EXECUTE`, `HUMAN_REQUIRED` or `STOP` semantics apply.
+
+The Project Architect decides whether documentation is needed, which documents are authoritative, and whether the Architect itself performs the documentation mutation or delegates one bounded documentation task.
+
+A pending documentation closure cannot be bypassed by a missing or `NOT_REQUIRED` disposition. Format recovery explicitly preserves the existing documentation obligation.
 
 ## Recovery rules
 
-- EXECUTOR_RUNNING + PID alive -> observe existing Executor only.
-- EXECUTOR_RUNNING + PID dead + usable result -> RESULT_READY.
-- EXECUTOR_RUNNING + PID dead + no result -> HUMAN_REQUIRED.
-- RESULT_READY restart -> resume result delivery; never rerun Executor.
-- ARCHITECT_RUNNING restart with confirmed delivery -> wait for Architect; never resend confirmed report.
-- NEXT_PROMPT_READY restart -> main launches exactly one Executor.
-- No blind post-launch retry.
-- Explicit human-authorized retry may restore NEXT_PROMPT_READY but must not launch from the recovery helper.
+- `EXECUTOR_RUNNING` + live PID -> observe only.
+- `EXECUTOR_RUNNING` + dead PID + usable result -> `RESULT_READY`.
+- `EXECUTOR_RUNNING` + dead PID + no usable result -> `HUMAN_REQUIRED`.
+- `RESULT_READY` restart -> resume/reconcile result transport; never rerun Executor.
+- `ARCHITECT_RUNNING` restart after confirmed delivery -> observe Architect; never resend confirmed result.
+- `NEXT_PROMPT_READY` restart -> main dispatcher launches exactly one Executor.
+- no blind post-launch retry.
+- human-authorized recovery may restore `NEXT_PROMPT_READY`, but recovery helpers do not launch directly.
+- deliberate Architect `HUMAN_REQUIRED` uses `humanRequiredReason=ARCHITECT_DECISION_HUMAN_REQUIRED` and must not enter transport-exhaustion recovery.
 
-## Exactly-once result delivery
+## Exactly-once Architect result transport
 
-Executor result delivery uses durable payload identity.
+Executor-result delivery has durable task and payload identity.
 
-Once Architect delivery is CONFIRMED, the same result must never be resent.
+Before send, user/assistant baselines are persisted. Confirmation may be proven by accepted composer transition, user-turn advancement, Architect generation, assistant advancement, or exact/normalized visible user payload evidence.
 
-Ambiguous send -> reconcile against the visible Architect user message.
+If a send action was attempted but acknowledgement is uncertain:
 
-Transport failure -> bounded transport recovery only.
+- state becomes ambiguous;
+- automatic recovery is reconciliation-only;
+- the same payload is not automatically repopulated or resent;
+- inability to prove delivery is not proof of non-delivery;
+- unprovable ambiguity eventually becomes `HUMAN_REQUIRED`.
 
-Transport exhaustion -> HUMAN_REQUIRED.
+If delivery is independently proven, any stale composer is cleared only when its content exactly/normalizes to the known payload. Unrelated human-authored text is never cleared.
 
 Transport recovery must never rerun completed project work.
 
-## Architect session rollover
+## HUMAN_REQUIRED reason hygiene
 
-Architect browser memory threshold: 1073741824 bytes (1 GiB).
+`humanRequiredReason` describes only the current authority boundary.
 
-When threshold is reached during Executor activity, mark rollover pending and do not interrupt the Executor.
+Successful Executor completion, successful transport recovery, Architect `EXECUTE`, and Architect `STOP` clear stale failure reasons.
 
-Before the next pending Executor result is delivered:
+Architect `HUMAN_REQUIRED` replaces any previous reason with `ARCHITECT_DECISION_HUMAN_REQUIRED`.
 
-1. Request handover from the old Architect.
-2. Wait for HANDOVER_READY.
-3. Open a fresh authenticated Architect conversation.
-4. Send the handover.
-5. Capture and persist the new architectConversationId.
-6. Verify future attachment resolves the new conversation.
-7. Close the old page.
-8. Resume the same durable orchestration state.
-9. Deliver the pending result exactly once to the new Architect.
+Historical transport reason `ARCHITECT_RESULT_TRANSPORT_EXHAUSTED` must never survive into later healthy task states.
 
-Rollover must never launch Executor work, regenerate a result, renumber completed tasks, resend completed work, or require a manual NEW_ARCHITECT_ID update after successful rollover.
+## Persistent Executor model
+
+AFFOTECH logical Codex session:
+
+`019f842e-98bc-7672-a619-51441d91be00`
+
+Normal operation uses a persistent logical Codex session with a short-lived OS child per bounded task via `codex exec resume`.
+
+Rules:
+
+- one writer/project/task;
+- one visible child at a time;
+- task-owned isolated Git worktree;
+- no AFFOTECH mutation in the Orchestrator repository/base checkout;
+- no Executor wall-clock timeout;
+- child exit/result evidence determines completion;
+- manually opened interactive Codex must not hold the same writer authority during automated execution.
 
 ## Executor visibility
 
-Production Executor execution must be visibly identifiable. The watcher must expose task identity, Executor running state, live Codex activity, completion, and exit code.
+Production launches print a visible task banner and allow live Codex activity to remain visible. Runtime captures stderr evidence without hiding all meaningful execution from the user.
 
-A blank node.exe console is not accepted as visible execution.
+`CREATE_NEW_CONSOLE` remains part of the Windows launch path, so an auxiliary console may still appear. This is a presentation caveat, not authority for a second Executor.
 
-Persistent logical Codex session:
+## Durable runtime logging
 
-019f842e-98bc-7672-a619-51441d91be00
+Durable logging is implemented and accepted.
 
-One writer only. Task-owned isolated worktree required. No Executor wall-clock timeout.
+Canonical log:
+
+`.agent-work/orchestrator/logs/orchestrator.log`
+
+Current design:
+
+- Python standard logging;
+- rotating file, 5 MiB active file with 5 backups;
+- unique `runId=YYYYMMDD-HHMMSS-PID` per watcher invocation;
+- local timestamp;
+- lifecycle/state transition/task/transport/rollover/human-boundary events;
+- traceback for unhandled watcher exceptions;
+- hashes/identifiers rather than complete prompt/report bodies;
+- no credentials, tokens, cookies or private customer payloads.
+
+Important event families include:
+
+- `WATCHER_STARTED`, `STATE_RECOVERED`, `STATE_TRANSITION`, `WATCHER_STOPPED`, `WATCHER_EXCEPTION`;
+- `NEXT_PROMPT_READY`, `CODEX_STARTING`, `CODEX_STARTED`, `CODEX_FINISHED`, `EXECUTOR_RESULT_FOUND`, `RESULT_READY`;
+- `ARCHITECT_ATTACH_START`, `ARCHITECT_ATTACH_SUCCESS`, `ARCHITECT_GENERATION_STARTED`, `ARCHITECT_GENERATION_FINISHED`, `ARCHITECT_RESPONSE_ACCEPTED`;
+- `RESULT_DELIVERY_ATTEMPT`, `RESULT_DELIVERY_CONFIRMED`, `RESULT_DELIVERY_AMBIGUOUS`, `RESULT_DELIVERY_RECONCILED`, `RESULT_DELIVERY_EXHAUSTED`;
+- `ARCHITECT_STALE_COMPOSER_CLEARED`;
+- `HUMAN_REQUIRED`;
+- `DOCUMENTATION_CLOSURE_REQUIRED`, `DOCUMENTATION_CLOSURE_TASK_STAGED`, `DOCUMENTATION_CLOSURE_ACCEPTED`, `DOCUMENTATION_CLOSURE_BYPASS_BLOCKED`;
+- rollover lifecycle events.
+
+Accepted logging closure: `b5ed8dcde5de92c5b7fe8df08b84243dc3a6dd98`.
+
+## IDLE continuation
+
+Accepted closure: `06a743f986d462f5f6de246dac9292bd47800f0b`.
+
+Consumed result-review responses may request exactly one continuation bootstrap. A bootstrap-origin STOP remains quietly IDLE and cannot recursively bootstrap itself. Ambiguous legacy consumed responses fail closed unless they satisfy the qualified migration conditions.
+
+## Architect browser rollover
+
+Architect browser memory threshold: `1073741824` bytes (1 GiB).
+
+At a safe point, rollover may:
+
+1. request handover from the old Architect;
+2. wait for handover completion;
+3. create a fresh authenticated Architect conversation;
+4. send the handover;
+5. persist the new conversation ID;
+6. verify future attachment to the new conversation;
+7. close the old page;
+8. resume the same durable orchestration state;
+9. deliver any pending result exactly once to the new Architect.
+
+Rollover must never launch project work, regenerate results, renumber completed tasks, or resend already-confirmed work.
+
+## Accepted repair chain
+
+Do not re-audit these milestones absent regression evidence:
+
+- `3e6efeb8b886ec377110c1c5d1740070483df4f9` — canonical state-machine consolidation closure.
+- `b5ed8dcde5de92c5b7fe8df08b84243dc3a6dd98` — runtime logging lifecycle accepted.
+- `06a743f986d462f5f6de246dac9292bd47800f0b` — IDLE continuation gate accepted.
+- `cdd49f2a9f79a3ff62d5a5cc5945583fcafa7c0b` — ambiguous Architect delivery reconciliation closed.
+- `944597152bdbb2872ca7941ac674ca745973f69d` — stale HUMAN_REQUIRED reason hygiene accepted.
+- `cfd673e3f278c4269fe252f40210b935eb3fb622` — milestone documentation governance implemented.
+- `38b3aeca711b36f19f1ad612b6ec223eea1691c3` — documentation disposition propagated to production Architect prompts.
+- `e5b47ffc7892a208679dd1a9c54983e19e5982d8` — canonical IDLE documentation envelope template completed.
+
+Earlier accepted foundations also include Orchestrator-owned worktrees, persistent session identity, postlaunch retry fencing, human recovery/single-instance locking, post-result worktree inheritance, and cross-task transport/state hygiene.
+
+## Production lessons
+
+The month-long stabilization exposed permanent lessons:
+
+1. recovery must restore canonical state, not implement an alternate workflow;
+2. ambiguous post-send transport must reconcile, not blindly resend;
+3. state reasons must describe current authority only;
+4. browser/composer state is evidence, not a reason to duplicate actions;
+5. project documentation closure must be explicit and durable;
+6. the generic Orchestrator must not contain project-specific roadmap/document knowledge;
+7. production prompts must advertise the same protocol the parser enforces;
+8. a completed task/result must never be rerun simply because transport failed;
+9. visible execution and durable logs are operational requirements, not optional diagnostics;
+10. human authority remains the boundary for new product direction.
+
+## Next qualification gate
+
+Do not manufacture another Orchestrator-only milestone merely to exercise the final protocol.
+
+The next real AFFOTECH roadmap milestone should be used as the production proof of the final documentation-governance protocol. Observe that:
+
+- the final Architect envelope includes `documentation=`;
+- any required documentation closure is staged exactly once;
+- pending documentation survives restart and cannot be bypassed;
+- `COMPLETE` clears the gate;
+- no duplicate Executor/result transport occurs;
+- deliberate `HUMAN_REQUIRED` remains safe.
+
+## Next project after successful real proof: universal template
+
+After one real post-5G AFFOTECH milestone completes successfully through the final protocol, the next Orchestrator engineering objective is to create a **universal Orchestrator template for new projects**.
+
+Goal: a new project should start from the proven runtime instead of spending weeks rebuilding transport, recovery, state, logging, worktree, rollover and documentation-governance behavior.
+
+The universalization work must extract configuration from project-specific assumptions while preserving this accepted state machine and safety behavior. At minimum, it should parameterize project repository/branch, Architect conversation, Executor session identity, workspace/worktree roots, role/bootstrap context and project-specific validation hooks.
+
+Do not begin universalization before the next real milestone proves the current final protocol in production.
 
 ## Git source synchronization rule
 
-A successful Orchestrator source-maintenance milestone is not complete until:
-
-1. git fetch origin
-2. validate working/source state
-3. commit bounded changes
-4. git push origin main
-5. git fetch origin
-6. git rev-parse HEAD
-7. git rev-parse origin/main
-8. require HEAD == origin/main
-
-Never force-push. Never claim PASS when a required push failed.
-
-Required reporting should include sourceBase, implementationCommit, localHeadAfter, remoteMainAfter, and localRemoteSynchronized.
-
-## Consolidation history
-
-### ORCH.SINGLE.STATE.MACHINE.CONSOLIDATION.1A
-
-Commit: 7c7a75c37b991d38ddb9e34b8fc61cfcb6012c3a
-
-Status: BLOCKED / NOT ACCEPTED.
-
-Verified improvements:
-
-- canonical Architect decision staging;
-- sequential next-task allocation;
-- helper direct launches removed in major recovery paths;
-- startup recovery diagnostics;
-- null-safe main bridge cleanup.
-
-Verified remaining defects after 1A:
-
-- production visible Executor path still blank;
-- rollover did not yet block pending result delivery until fresh Architect was established;
-- old tests still encoded superseded helper-direct-launch behavior.
-
-### ORCH.SINGLE.STATE.MACHINE.CONSOLIDATION.1B.CLOSURE
-
-Commit: 3e6efeb8b886ec377110c1c5d1740070483df4f9
-
-Status: ACCEPTED by Architect after independent GitHub verification.
-
-Verified:
-
-- main-owned Executor launch sequence preserved;
-- helper/recovery direct launch removed from the canonical path;
-- sequential next-task staging;
-- rollover blocks pending RESULT_READY delivery to the old Architect;
-- after successful rollover the pending result resumes against the new Architect;
-- null-safe transport exhaustion handling;
-- visible Executor stderr tee added;
-- focused tests 207 passed / 0 failed;
-- full tests 213 passed / 0 failed;
-- Python compile PASS;
-- git diff --check PASS;
-- no live Architect contact, no live Codex launch, no AFFOTECH source mutation during maintenance.
-
-## Runtime logging requirement
-
-Durable watcher logging is REQUIRED but is not yet implemented as of commit 3e6efeb8b886ec377110c1c5d1740070483df4f9.
-
-Target canonical log path:
-
-.agent-work/orchestrator/logs/orchestrator.log
-
-Required design:
-
-- Python standard logging;
-- rotating file, recommended 5 MiB x 5 backups;
-- unique runId per watcher invocation;
-- local timestamp with seconds;
-- lifecycle/state-transition logging;
-- Executor task/PID/start/finish/result evidence;
-- Architect attach/delivery/generation/decision evidence;
-- rollover old/new conversation evidence;
-- HUMAN_REQUIRED reason;
-- complete traceback for unhandled watcher exceptions;
-- no complete prompts, reports, handover bodies, credentials, tokens, cookies, or private customer data.
-
-Important events should include WATCHER_STARTED, STATE_RECOVERED, STATE_TRANSITION, NEXT_PROMPT_READY, CODEX_STARTING, CODEX_STARTED, CODEX_FINISHED, EXECUTOR_RESULT_FOUND, EXECUTOR_RESULT_MISSING, RESULT_READY, ARCHITECT_ATTACH_START, ARCHITECT_ATTACH_SUCCESS, RESULT_DELIVERY_ATTEMPT, RESULT_DELIVERY_CONFIRMED, RESULT_DELIVERY_AMBIGUOUS, RESULT_DELIVERY_RECONCILED, RESULT_DELIVERY_EXHAUSTED, ARCHITECT_RESPONSE_ACCEPTED, ARCHITECT_RESPONSE_DUPLICATE, HUMAN_REQUIRED, ROLLOVER_PENDING, ARCHITECT_HANDOVER_REQUESTED, ARCHITECT_HANDOVER_READY, ARCHITECT_CONVERSATION_SWITCHED, ARCHITECT_SESSION_ROLLOVER_COMPLETE, WATCHER_STOPPED, and WATCHER_EXCEPTION.
-
-Do not restart production as fully qualified until the runtime logging milestone is implemented and independently verified.
-
-## Incident lessons - 2026-09-12
-
-Observed production failures included:
-
-1. blank node.exe Executor consoles because meaningful stderr was redirected away from the visible console;
-2. Architect result transport exhaustion followed by AttributeError: 'NoneType' object has no attribute 'close';
-3. alternate Architect/IDLE paths interpreting and launching next work differently from the normal state-machine path;
-4. helper/recovery functions directly launching project work instead of restoring NEXT_PROMPT_READY;
-5. rollover integration requesting handover while still allowing pending result delivery before rollover completion;
-6. obsolete tests preserving superseded direct-launch behavior.
-
-Primary lesson: recovery mechanisms must protect the canonical state machine and must never become alternate workflow implementations.
+A source-maintenance milestone is complete only when the bounded change is committed, pushed, fetched/read back, and local/remote authority is synchronized. Never force-push and never claim PASS when a required push fails.
 
 ## Permanent design principle
 
-Recover where we stopped -> run one task -> capture one result -> give it to Architect once -> wait for Architect -> stage one next task -> repeat.
+Keep the Orchestrator boring:
 
-Additional recovery mechanisms exist only to preserve this loop. They must never replace it.
+`recover -> run one task -> capture one result -> deliver once -> wait -> stage one next action`
+
+Everything else exists only to preserve that loop.
