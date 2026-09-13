@@ -330,6 +330,76 @@ def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requ
     return actual_id
 
 
+def legacy_provisional_architect_recovery_allowed(watcher: Any, requested_id: str | None) -> bool:
+    """Permit only the narrowly bounded recovery for pre-final-URL state."""
+    state = getattr(watcher, "state", {})
+    task_id = str(state.get("taskId") or "")
+    result_path = state.get("executorResultPath")
+    result_exists = False
+    if isinstance(result_path, str) and result_path.strip():
+        try:
+            result_exists = Path(result_path).is_file() and bool(Path(result_path).read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            result_exists = False
+    active_pid = state.get("codexPid") or state.get("active_codex_pid")
+    executor_active = bool(active_pid and LocalWatcher.process_alive(int(active_pid))) if active_pid else False
+    return bool(
+        isinstance(requested_id, str)
+        and requested_id.startswith("WEB:")
+        and state.get("state") in {"RESULT_READY", "HUMAN_REQUIRED"}
+        and task_id
+        and task_id == str(state.get("lastCompletedTaskId") or "")
+        and result_exists
+        and not executor_active
+        and not state.get("rolloverPending")
+        and not state.get("handoverRequested")
+    )
+
+
+def attach_legacy_provisional_architect(endpoint: str, requested_id: str, watcher: Any) -> "ArchitectPlaywright":
+    """Recover one stale WEB: identity only at the interrupted-result boundary."""
+    if not legacy_provisional_architect_recovery_allowed(watcher, requested_id):
+        raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+    from playwright.sync_api import sync_playwright
+
+    runtime = sync_playwright().start()
+    try:
+        browser = runtime.chromium.connect_over_cdp(endpoint, timeout=10000)
+        pages = [page for context in browser.contexts for page in context.pages]
+        eligible = []
+        for page in pages:
+            url = str(getattr(page, "url", "") or "")
+            parsed = urlsplit(url)
+            if parsed.scheme != "https" or parsed.netloc.lower() != "chatgpt.com" or not parsed.path.startswith("/c/"):
+                continue
+            try:
+                actual_id = architect_conversation_id_from_url(url)
+            except RuntimeError:
+                continue
+            eligible.append((page, actual_id))
+        if len(eligible) != 1:
+            raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+        page, actual_id = eligible[0]
+        bridge = ArchitectPlaywright(page)
+        try:
+            entries = bridge._assistant_entries()
+        except Exception:
+            entries = None
+        if entries is not None:
+            latest = next((entry.get("text") for entry in reversed(entries) if isinstance(entry, dict) and isinstance(entry.get("text"), str) and entry.get("text")), None)
+            if latest is None or not architect_handover_ready(latest):
+                raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+        watcher.state["architectConversationId"] = actual_id
+        watcher.save()
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_PROVISIONAL_CONVERSATION_RECOVERED", watcher.state, **{"from": requested_id, "to": actual_id})
+        bridge._runtime = runtime
+        bridge._browser = browser
+        return bridge
+    except Exception:
+        runtime.stop()
+        raise
+
+
 def architect_handover_ready(response: str) -> bool:
     """Recognize only a terminal Architect handover protocol marker."""
     candidate = str(response or "").rstrip()
@@ -3929,7 +3999,16 @@ def main() -> None:
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
             bridge = None
             try:
-                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                try:
+                    bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                except Exception as attach_error:
+                    if (
+                        watcher.state.get("state") == "RESULT_READY"
+                        and str(attach_error) == "ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"
+                    ):
+                        bridge = attach_legacy_provisional_architect(endpoint, conversation_id, watcher)
+                    else:
+                        raise
                 conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
             except Exception as error:
                 if bridge is not None:

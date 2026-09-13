@@ -875,6 +875,73 @@ def test_attach_rejects_unrelated_conversation_page(monkeypatch):
         ArchitectPlaywright.attach("http://127.0.0.1:9333", "WEB:22222222-2222-2222-2222-222222222222")
 
 
+def _legacy_identity_fixture(tmp_path, state="RESULT_READY"):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "000040.txt"
+    result.write_text("captured task 000040 result", encoding="utf-8")
+    provisional = "WEB:7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    watcher.state.update({
+        "state": state, "architectConversationId": provisional, "taskId": "000040",
+        "lastCompletedTaskId": "000040", "executorResultPath": str(result),
+        "codexPid": None, "rolloverPending": False, "handoverRequested": False,
+        "architectSendState": "FAILED", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_PRE_SEND_FAILURE",
+    })
+    watcher.save()
+    return watcher, provisional, result
+
+
+def test_legacy_provisional_identity_recovers_one_handover_page_and_preserves_result(tmp_path, monkeypatch):
+    from playwright import sync_api
+    watcher, provisional, result = _legacy_identity_fixture(tmp_path)
+    canonical = "6aa6d480-f628-83ec-a617-51fbea5a592a"
+    page = _AckPage("https://chatgpt.com/c/" + canonical, [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}])
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([page]))
+    bridge = watcher_module.attach_legacy_provisional_architect("http://127.0.0.1:9333", provisional, watcher)
+    assert bridge.page is page
+    assert watcher.state["architectConversationId"] == canonical
+    assert watcher.state["taskId"] == watcher.state["lastCompletedTaskId"] == "000040"
+    assert watcher.state["executorResultPath"] == str(result)
+    assert watcher.state["architectDeliveryFailureClass"] == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+    bridge.close()
+
+
+@pytest.mark.parametrize("pages", [[], [
+    _AckPage("https://chatgpt.com/c/11111111-1111-1111-1111-111111111111", [{"id": "a", "text": "ARCHITECT_HANDOVER_READY"}]),
+    _AckPage("https://chatgpt.com/c/22222222-2222-2222-2222-222222222222", [{"id": "b", "text": "ARCHITECT_HANDOVER_READY"}]),
+]])
+def test_legacy_provisional_identity_requires_exactly_one_candidate(tmp_path, monkeypatch, pages):
+    from playwright import sync_api
+    watcher, provisional, _result = _legacy_identity_fixture(tmp_path)
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime(pages))
+    with pytest.raises(RuntimeError, match="ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"):
+        watcher_module.attach_legacy_provisional_architect("http://127.0.0.1:9333", provisional, watcher)
+    assert watcher.state["architectConversationId"] == provisional
+
+
+def test_legacy_provisional_identity_rejects_new_chat_non_web_idle_and_active_executor(tmp_path, monkeypatch):
+    from playwright import sync_api
+    watcher, provisional, _result = _legacy_identity_fixture(tmp_path)
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: (_ for _ in ()).throw(AssertionError("fallback must not attach")))
+    watcher.state["architectConversationId"] = "canonical-id"
+    assert not watcher_module.legacy_provisional_architect_recovery_allowed(watcher, "canonical-id")
+    watcher.state["architectConversationId"] = provisional
+    watcher.state["state"] = "IDLE"
+    assert not watcher_module.legacy_provisional_architect_recovery_allowed(watcher, provisional)
+    watcher.state["state"] = "RESULT_READY"
+    watcher.state["codexPid"] = 1234
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    assert not watcher_module.legacy_provisional_architect_recovery_allowed(watcher, provisional)
+
+
+def test_legacy_provisional_identity_rejects_blank_or_unmarked_page(tmp_path, monkeypatch):
+    from playwright import sync_api
+    watcher, provisional, _result = _legacy_identity_fixture(tmp_path)
+    page = _AckPage("https://chatgpt.com/", [{"id": "a", "text": "ARCHITECT_HANDOVER_READY"}])
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([page]))
+    with pytest.raises(RuntimeError, match="ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"):
+        watcher_module.attach_legacy_provisional_architect("http://127.0.0.1:9333", provisional, watcher)
+
+
 def test_rollover_persists_final_canonical_url_identity(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
