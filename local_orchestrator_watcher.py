@@ -829,8 +829,10 @@ class ArchitectSessionRollover:
         old_page = bridge.page
         new_page = None
         committed = False
+        phase = "OPEN_FRESH_WITH_HANDOVER"
         try:
             new_page = bridge.open_fresh_with_handover(response)
+            phase = "WAIT_NEW_CONVERSATION_ID"
             deadline = time.monotonic() + 15.0
             conversation_id = None
             while time.monotonic() < deadline:
@@ -843,6 +845,7 @@ class ArchitectSessionRollover:
                     time.sleep(0.1)
             if conversation_id is None:
                 raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ID_TIMEOUT")
+            phase = "COMMIT_NEW_CONVERSATION_AUTHORITY"
             self.watcher.state["architectConversationId"] = conversation_id
             self.watcher.state.pop("currentArchitectConversationId", None)
             self.watcher.state["architectResponseCount"] = 0
@@ -872,8 +875,9 @@ class ArchitectSessionRollover:
                     pass
             candidate = str(error)
             code = candidate if re.fullmatch(r"[A-Z0-9_:]+", candidate) else "ARCHITECT_SESSION_ROLLOVER_FAILED"
-            emit(code)
-            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_SESSION_ROLLOVER_FAILED", self.watcher.state, error=code)
+            error_message = candidate.replace("\r", " ").replace("\n", " ")[:500]
+            emit(f"{code} phase={phase} errorClass={type(error).__name__}")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_SESSION_ROLLOVER_FAILED", self.watcher.state, error=code, errorClass=type(error).__name__, errorMessage=error_message, phase=phase)
             emit("STATE=ROLLOVER_PENDING")
             return False
 

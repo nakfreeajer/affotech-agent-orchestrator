@@ -730,6 +730,48 @@ def test_fresh_handover_submission_failure_closes_fresh_page(tmp_path):
     assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
 
 
+def test_rollover_failure_logs_phase_class_and_bounded_flattened_message(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    logger, run_id, log_path = watcher_module.initialize_runtime_logging(watcher.state_dir)
+    watcher.runtime_logger, watcher.runtime_run_id = logger, run_id
+    class Bridge:
+        page = _RolloverPage(iter(()))
+        def open_fresh_with_handover(self, _response):
+            raise RuntimeError("some detailed rollover failure\nwith a second line" + "x" * 700)
+    events = []
+    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY", emit=events.append) is False
+    for handler in logger.handlers:
+        handler.flush()
+    log = Path(log_path).read_text(encoding="utf-8")
+    assert "event=ARCHITECT_SESSION_ROLLOVER_FAILED" in log
+    assert "error=ARCHITECT_SESSION_ROLLOVER_FAILED" in log
+    assert "errorClass=RuntimeError" in log
+    assert "phase=OPEN_FRESH_WITH_HANDOVER" in log
+    assert "errorMessage=some detailed rollover failure with a second linex" in log
+    error_message = log.split("errorMessage=", 1)[1].split(" phase=", 1)[0]
+    assert len(error_message) == 500
+    assert "\n" not in error_message and "\r" not in error_message
+    assert any(event.startswith("ARCHITECT_SESSION_ROLLOVER_FAILED phase=OPEN_FRESH_WITH_HANDOVER") for event in events)
+
+
+def test_rollover_timeout_preserves_stable_error_code(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    class Bridge:
+        page = _RolloverPage(iter(()))
+        def open_fresh_with_handover(self, _response):
+            return _RolloverPage(["https://chatgpt.com/"] * 20)
+    ticks = iter(range(100))
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    events = []
+    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY", emit=events.append) is False
+    assert any(event.startswith("ARCHITECT_NEW_CONVERSATION_ID_TIMEOUT ") for event in events)
+
+
 def test_architect_handover_ready_accepts_plain_and_escaped_terminal_markers():
     assert watcher_module.architect_handover_ready("handover\nARCHITECT_HANDOVER_READY")
     assert watcher_module.architect_handover_ready(r"handover\nARCHITECT\_HANDOVER\_READY")
