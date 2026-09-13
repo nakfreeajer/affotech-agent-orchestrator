@@ -905,6 +905,46 @@ def test_legacy_provisional_identity_recovers_one_handover_page_and_preserves_re
     bridge.close()
 
 
+def test_legacy_provisional_identity_caller_adopts_persisted_id_before_canonicalization(tmp_path, monkeypatch):
+    from playwright import sync_api
+    watcher, provisional, result = _legacy_identity_fixture(tmp_path)
+    canonical = "6aa6d480-f628-83ec-a617-51fbea5a592a"
+    page = _AckPage("https://chatgpt.com/c/" + canonical, [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}])
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([page]))
+    attach_calls = []
+
+    def unavailable_attach(_endpoint, _conversation_id):
+        attach_calls.append(_conversation_id)
+        raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(unavailable_attach))
+    conversation_id = watcher.state["architectConversationId"]
+    bridge = None
+    legacy_recovery_used = False
+    try:
+        try:
+            bridge = ArchitectPlaywright.attach("http://127.0.0.1:9333", conversation_id)
+        except Exception as error:
+            if str(error) == "ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND":
+                bridge = watcher_module.attach_legacy_provisional_architect("http://127.0.0.1:9333", conversation_id, watcher)
+                legacy_recovery_used = True
+            else:
+                raise
+        if legacy_recovery_used:
+            conversation_id = watcher.state["architectConversationId"]
+        conversation_id = watcher_module.canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
+        assert conversation_id == canonical
+        assert bridge.page is page
+        assert attach_calls == [provisional]
+        assert watcher.state["taskId"] == watcher.state["lastCompletedTaskId"] == "000040"
+        assert watcher.state["executorResultPath"] == str(result)
+        assert watcher.state["architectSendState"] == "FAILED"
+        assert watcher.state["architectDeliveryFailureClass"] == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+    finally:
+        if bridge is not None:
+            bridge.close()
+
+
 @pytest.mark.parametrize("pages", [[], [
     _AckPage("https://chatgpt.com/c/11111111-1111-1111-1111-111111111111", [{"id": "a", "text": "ARCHITECT_HANDOVER_READY"}]),
     _AckPage("https://chatgpt.com/c/22222222-2222-2222-2222-222222222222", [{"id": "b", "text": "ARCHITECT_HANDOVER_READY"}]),

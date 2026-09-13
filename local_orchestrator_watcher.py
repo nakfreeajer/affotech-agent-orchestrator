@@ -3999,6 +3999,7 @@ def main() -> None:
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
             bridge = None
             try:
+                legacy_recovery_used = False
                 try:
                     bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                 except Exception as attach_error:
@@ -4007,8 +4008,11 @@ def main() -> None:
                         and str(attach_error) == "ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"
                     ):
                         bridge = attach_legacy_provisional_architect(endpoint, conversation_id, watcher)
+                        legacy_recovery_used = True
                     else:
                         raise
+                if legacy_recovery_used:
+                    conversation_id = watcher.state.get("architectConversationId") or conversation_id
                 conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
             except Exception as error:
                 if bridge is not None:
