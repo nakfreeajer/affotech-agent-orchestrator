@@ -1501,20 +1501,45 @@ class ArchitectPlaywright:
         # locator.fill even when it is visible/editable.  Use the native
         # keyboard route after explicit focus; this updates the same editor
         # state as user typing/pasting and handles multiline Markdown.
-        try:
-            composer = self._live_composer()
-            composer.focus(timeout=1000)
-            composer.press("ControlOrMeta+A", timeout=1000)
-            keyboard = getattr(self.page, "keyboard", None)
-            if keyboard is None:
-                raise RuntimeError("KEYBOARD_INPUT_UNAVAILABLE")
-            keyboard.insert_text(result)
-            populated = True
-        except Exception as error:
-            code = "ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
-            if populated and not self.sendActionAttempted:
-                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
-            raise ResultSubmissionError(code, type(error).__name__) from error
+        while time.monotonic() < deadline:
+            try:
+                # Re-resolve on every attempt because the rich editor can be
+                # replaced while the fresh page hydrates.
+                composer = self._live_composer()
+                visible = getattr(composer, "is_visible", lambda **_: True)(timeout=1000)
+                editable = getattr(composer, "is_editable", lambda **_: True)(timeout=1000)
+                if not visible or not editable:
+                    raise TimeoutError("ARCHITECT_COMPOSER_NOT_ACTIONABLE")
+                composer.focus(timeout=1000)
+                composer.press("ControlOrMeta+A", timeout=1000)
+                keyboard = getattr(self.page, "keyboard", None)
+                if keyboard is None:
+                    raise RuntimeError("KEYBOARD_INPUT_UNAVAILABLE")
+                keyboard.insert_text(result)
+                populated = True
+                break
+            except TimeoutError as error:
+                last_error = error
+                # A timed-out input may have left a partial unsent draft.  A
+                # fresh composer reference and select-all/backspace keep the
+                # next attempt replacement-safe without sending anything.
+                try:
+                    retry_composer = self._live_composer()
+                    retry_composer.focus(timeout=1000)
+                    retry_composer.press("ControlOrMeta+A", timeout=1000)
+                    retry_composer.press("Backspace", timeout=1000)
+                except Exception:
+                    pass
+                if time.monotonic() < deadline:
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            except Exception as error:
+                code = "ARCHITECT_COMPOSER_INPUT_REJECTED"
+                if populated and not self.sendActionAttempted:
+                    self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
+                raise ResultSubmissionError(code, type(error).__name__) from error
+        else:
+            detail = type(last_error).__name__ if last_error else None
+            raise ResultSubmissionError("ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT", detail) from last_error
 
         try:
             composer = self._live_composer()

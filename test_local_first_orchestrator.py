@@ -490,6 +490,86 @@ def test_current_composer_receives_exact_text_and_is_confirmed():
     assert page.sent == [result]
 
 
+def test_transient_population_timeout_retries_with_fresh_composer_and_sends_once():
+    class RetryPage(FakeComposerPage):
+        def __init__(self):
+            super().__init__()
+            self.composer_calls = 0
+            self.composers = []
+
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                self.composer_calls += 1
+                composer = FakeComposer(self)
+                if self.composer_calls == 2:
+                    composer.focus = lambda **_: (_ for _ in ()).throw(TimeoutError("transient focus"))
+                self.composers.append(composer)
+                return composer
+            return super().get_by_role(role, **kwargs)
+
+    page = RetryPage()
+    bridge = ArchitectPlaywright(page)
+    result = "fresh handover payload"
+    bridge.submit_result_bounded(result, timeout=1)
+    assert page.sent == [result]
+    assert page.composer_calls >= 5
+    assert len({id(composer) for composer in page.composers}) == len(page.composers)
+    assert bridge.sendActionAttempted is True
+
+
+def test_population_timeout_does_not_mark_send_attempted_before_retry_succeeds():
+    class ObservingPage(FakeComposerPage):
+        def __init__(self):
+            super().__init__()
+            self.bridge = None
+            self.calls = 0
+
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                self.calls += 1
+                composer = FakeComposer(self)
+                if self.calls == 2:
+                    def fail(**_):
+                        assert self.bridge.sendActionAttempted is False
+                        raise TimeoutError("transient focus")
+                    composer.focus = fail
+                return composer
+            return super().get_by_role(role, **kwargs)
+
+    page = ObservingPage()
+    bridge = ArchitectPlaywright(page)
+    page.bridge = bridge
+    bridge.submit_result_bounded("safe payload", timeout=1)
+    assert page.sent == ["safe payload"]
+
+
+def test_partial_population_is_cleared_before_retry_without_duplicate_text():
+    class PartialKeyboard(FakeKeyboard):
+        def __init__(self, page):
+            super().__init__(page)
+            self.calls = 0
+
+        def insert_text(self, value):
+            self.calls += 1
+            if self.calls == 1:
+                self.page.content = value[:7]
+                raise TimeoutError("input interrupted")
+            super().insert_text(value)
+
+    page = FakeComposerPage()
+    page.keyboard = PartialKeyboard(page)
+    ArchitectPlaywright(page).submit_result_bounded("handover payload", timeout=1)
+    assert page.sent == ["handover payload"]
+
+
+def test_repeated_population_timeout_preserves_bounded_failure_code():
+    page = FakeComposerPage()
+    page.focus = False
+    with pytest.raises(ResultSubmissionError) as error:
+        ArchitectPlaywright(page).submit_result_bounded("never populated", timeout=0.1)
+    assert error.value.code == "ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT"
+
+
 def test_hidden_prompt_textarea_does_not_override_visible_semantic_composer():
     page = FakeComposerPage()
 
