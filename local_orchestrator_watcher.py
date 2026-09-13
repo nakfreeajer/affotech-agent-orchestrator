@@ -300,6 +300,36 @@ def architect_conversation_id_from_url(url: str) -> str:
     return match.group(1)
 
 
+ARCHITECT_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def canonical_architect_conversation_id(identity: str) -> str:
+    """Remove only the supported WEB: presentation prefix from UUID IDs."""
+    value = str(identity or "")
+    suffix = value[4:] if value.startswith("WEB:") else value
+    return suffix if ARCHITECT_UUID_RE.fullmatch(suffix) else value
+
+
+def architect_conversation_ids_equivalent(left: str, right: str) -> bool:
+    """Compare Architect IDs exactly, with only WEB:<uuid> compatibility."""
+    return str(left or "") == str(right or "") or canonical_architect_conversation_id(left) == canonical_architect_conversation_id(right)
+
+
+def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requested_id: str | None) -> str:
+    """Validate an attached page and persist its actual URL representation."""
+    page = getattr(bridge, "page", None)
+    if page is None:
+        return requested_id or ""
+    actual_id = architect_conversation_id_from_url(page.url)
+    if requested_id and not architect_conversation_ids_equivalent(requested_id, actual_id):
+        raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+    if requested_id and requested_id != actual_id:
+        watcher.state["architectConversationId"] = actual_id
+        watcher.save()
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_ID_CANONICALIZED", watcher.state, **{"from": requested_id, "to": actual_id})
+    return actual_id
+
+
 def architect_handover_ready(response: str) -> bool:
     """Recognize only a terminal Architect handover protocol marker."""
     candidate = str(response or "").rstrip()
@@ -873,6 +903,9 @@ class ArchitectSessionRollover:
                 time.sleep(0.25)
             else:
                 raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ACK_TIMEOUT")
+            final_url = getattr(new_page, "url", "")
+            final_url = final_url() if callable(final_url) else final_url
+            conversation_id = architect_conversation_id_from_url(final_url)
             phase = "COMMIT_NEW_CONVERSATION_AUTHORITY"
             self.watcher.state["architectConversationId"] = conversation_id
             self.watcher.state.pop("currentArchitectConversationId", None)
@@ -1706,7 +1739,28 @@ class ArchitectPlaywright:
             raise RuntimeError("ARCHITECT_CDP_WEBSOCKET_ATTACHMENT_TIMEOUT") from error
         pages = [p for context in browser.contexts for p in context.pages]
         if conversation_id:
-            pages = [p for p in pages if f"/c/{conversation_id}" in p.url]
+            candidates = []
+            for page in pages:
+                try:
+                    actual_id = architect_conversation_id_from_url(page.url)
+                except RuntimeError:
+                    continue
+                if architect_conversation_ids_equivalent(conversation_id, actual_id):
+                    candidates.append((page, actual_id))
+            distinct_ids = {actual_id for _page, actual_id in candidates}
+            if len(distinct_ids) > 1:
+                runtime.stop()
+                raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+            exact = [page for page, actual_id in candidates if actual_id == conversation_id]
+            if exact:
+                pages = exact
+            elif len(candidates) == 1:
+                pages = [candidates[0][0]]
+            elif candidates:
+                runtime.stop()
+                raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+            else:
+                pages = []
         if not pages:
             runtime.stop()
             raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND") if conversation_id else RuntimeError("ARCHITECT_PAGE_NOT_FOUND")
@@ -3510,7 +3564,8 @@ class RemoteDiscussionControlMonitor:
 
     def establish_startup_baseline(self, bridge: Any | None = None) -> None:
         self.bridge = bridge or self.bridge_factory()
-        self._conversation_id = self.watcher.state.get("architectConversationId")
+        requested_id = self.watcher.state.get("architectConversationId")
+        self._conversation_id = canonicalize_attached_architect_conversation(self.watcher, self.bridge, requested_id)
         messages = self._messages(self.bridge)
         self._cursor = self._identity(messages[-1], len(messages) - 1) if messages else None
         atomic_write(self.watcher.state_dir / "remote-control.json", json.dumps({"cursor": self._cursor, "count": len(messages)}).encode("utf-8"))
@@ -3798,7 +3853,11 @@ def main() -> None:
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
                     try:
                         idle_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                        conversation_id = canonicalize_attached_architect_conversation(watcher, idle_bridge, conversation_id)
                     except Exception as error:
+                        if idle_bridge is not None:
+                            idle_bridge.close()
+                            idle_bridge = None
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                         raise
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
@@ -3868,9 +3927,13 @@ def main() -> None:
 
             conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
+            bridge = None
             try:
                 bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
             except Exception as error:
+                if bridge is not None:
+                    bridge.close()
                 runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 raise
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)

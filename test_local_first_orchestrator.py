@@ -799,13 +799,135 @@ class _RolloverPage:
 class _AckPage(_RolloverPage):
     def __init__(self, url, entries=None, generating=False):
         super().__init__([url])
+        self._url = url
         self.entries = entries or []
         self.generating = generating
+
+    @property
+    def url(self):
+        return self._url
 
     def evaluate(self, script):
         if "stop-button" in script:
             return self.generating
         return self.entries
+
+
+class _ChangingAckPage:
+    def __init__(self, urls, entries=None, generating=False):
+        self.urls = iter(urls)
+        self.entries = entries or [{"id": "ack", "text": "ARCHITECT_HANDOVER_READY"}]
+        self.generating = generating
+        self.closed = False
+
+    @property
+    def url(self):
+        return next(self.urls)
+
+    def evaluate(self, script):
+        if "stop-button" in script:
+            return self.generating
+        return self.entries
+
+    def close(self):
+        self.closed = True
+
+
+def test_architect_conversation_identity_equivalence_is_exact():
+    identity = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    assert watcher_module.architect_conversation_ids_equivalent("WEB:" + identity, identity)
+    assert watcher_module.architect_conversation_ids_equivalent(identity, "WEB:" + identity)
+    assert not watcher_module.architect_conversation_ids_equivalent("WEB:" + identity, "different-uuid")
+
+
+def _fake_attach_runtime(pages):
+    class Browser:
+        contexts = [type("Context", (), {"pages": pages})()]
+
+    class Chromium:
+        def connect_over_cdp(self, _endpoint, timeout): return Browser()
+
+    class Runtime:
+        chromium = Chromium()
+        def stop(self): self.stopped = True
+
+    class Factory:
+        def start(self): return Runtime()
+    return Factory()
+
+
+def test_attach_resolves_both_compatible_identity_representations(monkeypatch):
+    from playwright import sync_api
+    identity = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    page = _AckPage("https://chatgpt.com/c/" + identity)
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([page]))
+    assert ArchitectPlaywright.attach("http://127.0.0.1:9333", "WEB:" + identity).page is page
+    reverse = _AckPage("https://chatgpt.com/c/WEB:" + identity)
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([reverse]))
+    assert ArchitectPlaywright.attach("http://127.0.0.1:9333", identity).page is reverse
+
+
+def test_attach_rejects_unrelated_conversation_page(monkeypatch):
+    from playwright import sync_api
+    page = _AckPage("https://chatgpt.com/c/11111111-1111-1111-1111-111111111111")
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _fake_attach_runtime([page]))
+    with pytest.raises(RuntimeError, match="ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"):
+        ArchitectPlaywright.attach("http://127.0.0.1:9333", "WEB:22222222-2222-2222-2222-222222222222")
+
+
+def test_rollover_persists_final_canonical_url_identity(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    provisional = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _ChangingAckPage(["https://chatgpt.com/c/WEB:" + provisional, "https://chatgpt.com/c/" + provisional])
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is True
+    assert watcher.state["architectConversationId"] == provisional
+
+
+def test_rollover_final_identity_failure_closes_page_before_commit(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
+    watcher.save()
+    provisional = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _ChangingAckPage(["https://chatgpt.com/c/WEB:" + provisional, "https://chatgpt.com/"])
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert new_page.closed is True
+    assert old_page.closed is False
+    assert watcher.state["architectConversationId"] == "OLD"
+
+
+def test_attached_identity_self_heals_once_without_changing_task_state(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    identity = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    result = tmp_path / "000040.txt"
+    result.write_text("result", encoding="utf-8")
+    watcher.state.update({"architectConversationId": "WEB:" + identity, "state": "RESULT_READY", "taskId": "000040", "executorResultPath": str(result)})
+    watcher.save()
+    saves = []
+    original_save = watcher.save
+    monkeypatch.setattr(watcher, "save", lambda: (saves.append(1), original_save())[1])
+    attached = type("Attached", (), {"page": _AckPage("https://chatgpt.com/c/" + identity)})()
+    assert watcher_module.canonicalize_attached_architect_conversation(watcher, attached, "WEB:" + identity) == identity
+    assert watcher.state["architectConversationId"] == identity
+    assert watcher.state["state"] == "RESULT_READY"
+    assert watcher.state["taskId"] == "000040"
+    assert len(saves) == 1
+
+
+def test_remote_control_startup_accepts_compatible_identity_and_self_heals(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    identity = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
+    watcher.state["architectConversationId"] = "WEB:" + identity
+    watcher.save()
+    class Bridge:
+        page = _AckPage("https://chatgpt.com/c/" + identity)
+        def control_user_messages(self): return []
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: Bridge())
+    monitor.establish_startup_baseline()
+    assert watcher.state["architectConversationId"] == identity
 
 
 def _rollover_bridge(old_page, new_page):
@@ -955,7 +1077,7 @@ def test_rollover_waits_for_new_conversation_url_before_switching(tmp_path, monk
                           "architectConversationId": "OLD", "pending_handover": "private handover"})
     watcher.save()
     old_page = _RolloverPage(iter(()))
-    new_page = _RolloverPage(["https://chatgpt.com/", "https://chatgpt.com/", "https://chatgpt.com/c/NEW_ID"])
+    new_page = _RolloverPage(["https://chatgpt.com/", "https://chatgpt.com/", "https://chatgpt.com/c/NEW_ID", "https://chatgpt.com/c/NEW_ID"])
     class Bridge:
         page = old_page
         def open_fresh_with_handover(self, handover):
