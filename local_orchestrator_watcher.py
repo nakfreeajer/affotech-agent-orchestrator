@@ -2312,8 +2312,9 @@ class LocalFirstOrchestrator:
     def discussion_pause_active(self) -> bool:
         marker = self.state_dir / "discussion-pause.marker"
         try:
-            if marker.read_text(encoding="ascii").strip() == "PAUSED":
-                return True
+            value = marker.read_text(encoding="ascii").strip()
+            if value in {"PAUSED", "RESUMED"}:
+                return value == "PAUSED"
         except OSError:
             pass
         return bool(self.state.get("discussionPauseActive"))
@@ -2340,6 +2341,18 @@ class LocalFirstOrchestrator:
         task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
         print(f"ORCHESTRATOR RESUMED BY HUMAN state={self.state.get('state')} taskId={task_id}")
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_RESUME_REQUESTED", self.state, taskId=task_id)
+
+    def request_remote_discussion_pause(self) -> None:
+        if self.discussion_pause_active():
+            return
+        self._write_discussion_pause_marker(True)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "REMOTE_DISCUSSION_PAUSE_REQUESTED", self.state)
+
+    def request_remote_discussion_resume(self) -> None:
+        if not self.discussion_pause_active():
+            return
+        self._write_discussion_pause_marker(False)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "REMOTE_DISCUSSION_RESUME_REQUESTED", self.state)
 
 
     def _result_path(self, task_id: str) -> Path:
@@ -3200,6 +3213,9 @@ class RemoteDiscussionControlMonitor:
         self._cursor = None
         self._conversation_id = None
         self._consumed_command_ids: list[str] = []
+        self._ready = threading.Event()
+        self._stop_event = threading.Event()
+        self._startup_ok = False
 
     @staticmethod
     def _identity(message: dict[str, Any], index: int) -> str:
@@ -3241,12 +3257,9 @@ class RemoteDiscussionControlMonitor:
                         continue
                     runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_OBSERVED", self.watcher.state, command=command, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
                     if command == "ORCH:PAUSE":
-                        self.watcher.request_discussion_pause()
-                        event = "REMOTE_DISCUSSION_PAUSE_REQUESTED"
+                        self.watcher.request_remote_discussion_pause()
                     else:
-                        self.watcher.request_discussion_resume()
-                        event = "REMOTE_DISCUSSION_RESUME_REQUESTED"
-                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), event, self.watcher.state, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
+                        self.watcher.request_remote_discussion_resume()
                     self._consumed_command_ids.append(identity)
                     self._consumed_command_ids = self._consumed_command_ids[-32:]
                     observed += 1
@@ -3257,46 +3270,52 @@ class RemoteDiscussionControlMonitor:
         return observed
 
     def start(self) -> bool:
-        try:
-            self.establish_startup_baseline()
-            self.active = True
-            self.emit("REMOTE CONTROL ACTIVE")
-            self.emit("ORCH:PAUSE = pause Architect relay")
-            self.emit("ORCH:RESUME = resume Orchestrator")
-            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_STARTED", self.watcher.state)
-        except Exception as error:
-            self.emit(f"REMOTE_CONTROL_UNAVAILABLE error={type(error).__name__}")
-            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_ERROR", self.watcher.state, errorClass=type(error).__name__)
-            return False
-
         def run() -> None:
-            while self.active:
-                try:
+            try:
+                self.establish_startup_baseline()
+                self._startup_ok = True
+                self.active = True
+                self._ready.set()
+                while not self._stop_event.is_set():
                     current = self.watcher.state.get("architectConversationId")
                     if current and self._conversation_id and current != self._conversation_id:
                         self.bridge.close()
+                        self.bridge = None
                         self.establish_startup_baseline()
                     self.poll_once()
-                except Exception as error:
-                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_ERROR", self.watcher.state, errorClass=type(error).__name__)
-                    self.active = False
-                    break
-                time.sleep(1.0)
+                    self._stop_event.wait(1.0)
+            except Exception as error:
+                self._startup_ok = False
+                self._ready.set()
+                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_ERROR", self.watcher.state, errorClass=type(error).__name__)
+            finally:
+                self.active = False
+                if self.bridge is not None:
+                    try:
+                        self.bridge.close()
+                    except Exception:
+                        pass
+                    self.bridge = None
 
+        self._ready.clear()
+        self._stop_event.clear()
+        self._startup_ok = False
         self._thread = threading.Thread(target=run, name="orchestrator-remote-control", daemon=True)
         self._thread.start()
+        if not self._ready.wait(2.0) or not self._startup_ok:
+            self.emit("REMOTE_CONTROL_UNAVAILABLE")
+            return False
+        self.emit("REMOTE CONTROL ACTIVE")
+        self.emit("ORCH:PAUSE = pause Architect relay")
+        self.emit("ORCH:RESUME = resume Orchestrator")
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_MONITOR_STARTED", self.watcher.state)
         return True
 
     def stop(self) -> None:
+        self._stop_event.set()
         self.active = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
-        if self.bridge is not None:
-            try:
-                self.bridge.close()
-            except Exception:
-                pass
-            self.bridge = None
 
 
 def visible_executor_launcher(project: str, watcher: LocalFirstOrchestrator) -> Callable[[str, Path], Any]:

@@ -2,6 +2,7 @@ import json
 import hashlib
 import inspect
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -2521,6 +2522,86 @@ def test_remote_monitor_failure_isolated_and_rollover_target_follows_state(tmp_p
     watcher.state["architectConversationId"] = "NEW"
     assert monitor._conversation_id == "OLD"
     monitor.stop()
+
+
+def test_remote_monitor_playwright_bridge_is_created_used_and_closed_on_worker_thread(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    caller = threading.get_ident()
+    factory_threads, use_threads, close_threads = [], [], []
+
+    class Bridge:
+        def control_user_messages(self):
+            use_threads.append(threading.get_ident())
+            return []
+        def close(self):
+            close_threads.append(threading.get_ident())
+
+    def factory():
+        factory_threads.append(threading.get_ident())
+        return Bridge()
+
+    monitor = RemoteDiscussionControlMonitor(watcher, factory, emit=lambda _message: None)
+    assert monitor.start() is True
+    monitor.stop()
+    assert factory_threads and factory_threads[0] != caller
+    assert set(factory_threads + use_threads + close_threads) == {factory_threads[0]}
+
+
+def test_remote_monitor_startup_failure_isolated_from_workflow_state(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "000025", "codexPid": 4321})
+    before = dict(watcher.state)
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: (_ for _ in ()).throw(RuntimeError("no bridge")), emit=lambda _message: None)
+    assert monitor.start() is False
+    assert watcher.state == before
+
+
+def test_remote_commands_write_only_canonical_marker_from_worker_path(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    monkeypatch.setattr(watcher, "save", lambda: (_ for _ in ()).throw(AssertionError("remote must not save state.json")))
+    watcher.request_remote_discussion_pause()
+    assert watcher.discussion_pause_active() is True
+    watcher.request_remote_discussion_resume()
+    assert watcher.discussion_pause_active() is False
+
+
+def test_explicit_pause_marker_overrides_legacy_state_flag(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state["discussionPauseActive"] = False
+    watcher._write_discussion_pause_marker(True)
+    assert watcher.discussion_pause_active() is True
+    watcher.state["discussionPauseActive"] = True
+    watcher._write_discussion_pause_marker(False)
+    assert watcher.discussion_pause_active() is False
+
+
+def test_remote_monitor_rollover_reattach_stays_on_worker_thread(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state["architectConversationId"] = "OLD"
+    caller = threading.get_ident()
+    factory_threads, close_threads = [], []
+    bridges = []
+
+    class Bridge:
+        def control_user_messages(self): return []
+        def close(self): close_threads.append(threading.get_ident())
+
+    def factory():
+        factory_threads.append(threading.get_ident())
+        bridge = Bridge()
+        bridges.append(bridge)
+        return bridge
+
+    monitor = RemoteDiscussionControlMonitor(watcher, factory, emit=lambda _message: None)
+    assert monitor.start() is True
+    watcher.state["architectConversationId"] = "NEW"
+    deadline = time.monotonic() + 3.0
+    while len(factory_threads) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    monitor.stop()
+    assert len(factory_threads) == 2
+    assert factory_threads[0] != caller
+    assert set(factory_threads + close_threads) == {factory_threads[0]}
 
 
 def test_result_review_instruction_advertises_documentation_disposition(tmp_path):
