@@ -2462,6 +2462,28 @@ class LocalFirstOrchestrator:
         match = ORCHESTRATOR_RESULT_RE.search(candidate)
         return match.group(3).strip() if match else None
 
+    def _architect_response_attempts_authority(self, response: str) -> bool:
+        """Recognize only the canonical opening marker, not ordinary prose."""
+        return "<ORCHESTRATOR_RESULT>" in response
+
+    def _idle_invalid_envelope(self, response: str) -> bool:
+        if not self._architect_response_attempts_authority(response):
+            return False
+        if not str(self.state.get("taskId") or ""):
+            return False
+        try:
+            parse_orchestrator_result(response, str(self.state.get("taskId") or ""))
+        except ValueError:
+            return True
+        return False
+
+    def _fail_closed_idle_envelope(self, response: str, fingerprint: str | None) -> str:
+        self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ENVELOPE_INVALID"})
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_INVALID", self.state, hash=fingerprint)
+        print("IDLE_GATE=invalid_architect_envelope taskId=%s responseHash=%s correctionRequired=True" % (self.state.get("taskId"), fingerprint))
+        return "HUMAN_REQUIRED"
+
     def consume_idle_architect_response(self, response: str, launcher: Callable[[str, Path], Any] | None = None) -> str:
         """Use the canonical Architect decision staging path after IDLE recovery."""
         return self.accept_architect_response(response)["action"]
@@ -2676,6 +2698,8 @@ class LocalFirstOrchestrator:
         response_has_envelope = bool(self._architect_response_task_id(response)) if response else False
         consumed = self.state.setdefault("consumedArchitectResponses", {})
         response_consumed = bool(response_fingerprint and response_fingerprint in consumed)
+        if response and not response_consumed and self._idle_invalid_envelope(response):
+            return self._fail_closed_idle_envelope(response, response_fingerprint)
         continuation_eligible = not response_has_envelope and not response_consumed and response_fingerprint != self.state.get("lastContinuationSourceFingerprint")
         if response:
             consumed_record = consumed.get(response_fingerprint, {}) if response_fingerprint else {}
@@ -2746,6 +2770,8 @@ class LocalFirstOrchestrator:
                 response_fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest() if response else None
                 response_has_envelope = bool(self._architect_response_task_id(response)) if response else False
                 response_consumed = bool(response_fingerprint and response_fingerprint in consumed)
+                if response and not response_consumed and self._idle_invalid_envelope(response):
+                    return self._fail_closed_idle_envelope(response, response_fingerprint)
                 continuation_eligible = not response_has_envelope and not response_consumed and response_fingerprint != self.state.get("lastContinuationSourceFingerprint")
         self.state["continuationSourceFingerprint"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
         sent = self.request_architect_bootstrap(bridge)

@@ -1778,6 +1778,31 @@ def test_malformed_idle_architect_response_bootstraps_once_without_result_replay
     assert len(bridge.messages) == 1
 
 
+@pytest.mark.parametrize("response", [
+    "<ORCHESTRATOR_RESULT>\nclassification=ACCEPTED\naction=EXECUTE\npromptBegin\nnext\npromptEnd\n</ORCHESTRATOR_RESULT>",
+    "<ORCHESTRATOR_RESULT>\nclassification=INVALID\naction=EXECUTE\ntaskId=000025\npromptBegin\nnext\npromptEnd\n</ORCHESTRATOR_RESULT>",
+    "<ORCHESTRATOR_RESULT>\nclassification=ACCEPTED\naction=INVALID\ntaskId=000025\npromptBegin\nnext\npromptEnd\n</ORCHESTRATOR_RESULT>",
+    "<ORCHESTRATOR_RESULT>\nclassification=ACCEPTED\naction=EXECUTE\ntaskId=000025\npromptBegin\nnext\n</ORCHESTRATOR_RESULT>",
+    envelope("000024", prompt="next"),
+])
+def test_idle_intended_invalid_envelope_fails_closed_without_bootstrap(tmp_path, response):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "IDLE", "taskId": "000025", "lastCompletedTaskId": "000025"})
+    bridge = IdleArchitectBridge(response)
+    calls = []
+    assert watcher.inspect_idle_architect(bridge, lambda *_: calls.append(1)) == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_ENVELOPE_INVALID"
+    assert bridge.messages == []
+    assert calls == []
+    assert watcher.state["taskId"] == "000025"
+    assert watcher.state["lastCompletedTaskId"] == "000025"
+
+
+def test_idle_intended_envelope_marker_is_not_triggered_by_ordinary_prose(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert watcher._architect_response_attempts_authority("mentioning orchestrator in discussion") is False
+
+
 def test_bootstrap_execute_response_uses_same_architect_task_once(tmp_path):
     worktree = tmp_path / "affotech-worktree"
     worktree.mkdir()
