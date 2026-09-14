@@ -3138,7 +3138,7 @@ def test_false_result_reconciliation_recovery_restores_only_proven_corruption(tm
         "state": "IDLE", "lastCompletedTaskId": "task-1", "architectDeliveryPayloadHash": payload_hash,
         "architectSendState": "CONFIRMED", "architectResultFingerprint": invalid,
         "consumedArchitectResponses": {invalid: {"taskId": "task-1", "action": "STOP"}},
-        "nextPromptPath": None, "nextTaskId": None, "documentationClosureFingerprint": invalid,
+        "nextPromptPath": None, "nextTaskId": "task-1", "documentationClosureFingerprint": invalid,
         "documentationClosureCompletedTaskId": "task-1",
     })
     watcher.save()
@@ -3153,6 +3153,22 @@ def test_false_result_reconciliation_recovery_restores_only_proven_corruption(tm
     assert invalid not in watcher.state["consumedArchitectResponses"]
     assert watcher.state["documentationClosureFingerprint"] is None
     assert watcher.state["documentationClosureCompletedTaskId"] is None
+
+
+@pytest.mark.parametrize("field_update", [{"nextTaskId": "task-2"}, {"nextPromptPath": "staged-prompt.txt"}])
+def test_false_result_reconciliation_rejects_future_staged_work(tmp_path, field_update):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    invalid = "invalid-stop"
+    watcher.state.update({"state": "IDLE", "lastCompletedTaskId": "task-1", "architectDeliveryPayloadHash": payload_hash,
+                          "architectSendState": "CONFIRMED", "architectResultFingerprint": invalid,
+                          "consumedArchitectResponses": {invalid: {"taskId": "task-1", "action": "STOP"}},
+                          "nextTaskId": None, "nextPromptPath": None})
+    watcher.state.update(field_update)
+    watcher.save()
+    request = "Your previous response for task task-1 was received successfully. Return only the machine-readable envelope."
+    assert watcher.recover_false_result_reconciliation(_DeliveryEvidenceBridge(user_messages=[request])) is False
+    assert watcher.state["state"] == "IDLE"
 
 
 def test_false_result_reconciliation_preserves_legitimate_stop_when_payload_exists(tmp_path):

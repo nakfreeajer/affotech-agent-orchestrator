@@ -3357,7 +3357,9 @@ class LocalFirstOrchestrator:
                 or not result_ready or self.state.get("architectSendState") != "CONFIRMED"
                 or not isinstance(fingerprint, str) or not isinstance(record, dict)
                 or record.get("taskId") != task_id or record.get("action") != "STOP"
-                or self.state.get("nextPromptPath") or self.state.get("nextTaskId") or executor_active):
+                or self.state.get("nextPromptPath")
+                or (self.state.get("nextTaskId") and self.state.get("nextTaskId") not in {task_id, str(self.state.get("lastCompletedTaskId") or "")})
+                or executor_active):
             return False
         payload, payload_hash = self._result_delivery_payload()
         if self.state.get("architectDeliveryPayloadHash") != payload_hash:
