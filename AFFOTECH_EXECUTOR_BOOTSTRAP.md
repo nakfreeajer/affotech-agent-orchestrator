@@ -4,6 +4,14 @@
 
 This file provides durable AFFOTECH Executor context for the Local Orchestrator. It is a context/non-regression guard only. The current Architect task always controls scope and mutation authority.
 
+This bootstrap is **AFFOTECH-specific**. It is not the future universal Executor bootstrap and must not be copied unchanged into another project.
+
+The current Orchestrator is a production-mature reference implementation and is ready for universal-template extraction, but project-specific repository, branch, session, browser and bootstrap values still need to be parameterized. See:
+
+`docs/ORCHESTRATOR_UNIVERSAL_TEMPLATE_READINESS.md`
+
+During universalization, this file should remain the AFFOTECH project profile/bootstrap reference while the generic runtime learns to consume a configured project bootstrap path.
+
 Normal production execution is **not** a fresh disconnected Codex session. The Local Orchestrator uses the persistent logical Codex session below and launches one short-lived visible OS child per bounded task.
 
 Persistent AFFOTECH Codex session:
