@@ -6,57 +6,67 @@ Repository: `nakfreeajer/affotech-agent-orchestrator`
 
 Branch authority: remote `main`
 
-Current accepted Orchestrator runtime checkpoint: `9e56d5655a1e40050269245c1b35996f67ddd709` (`feat(orchestrator): add remote discussion control`).
+Current accepted Orchestrator runtime checkpoint:
 
-For this repository, the Architect also performs Documentation Curator duties. Runtime/source/test mutations remain bounded Maintainer/Executor work. The Architect independently verifies implementation evidence and may directly maintain Orchestrator governance/history documentation.
+`57a3a914b35ed0c715aaaf0267ed0bd36a39cc78` — `fix(orchestrator): keep human decisions resident`
+
+Parent:
+
+`26f6644af1703abd2068198708ae7dbe54544f6a`
+
+Accepted deterministic qualification for `57a3a914...`:
+
+- Python compile: PASS
+- full regression: `244 passed / 0 failed`
+- `git diff --check`: PASS
+- resident HUMAN_REQUIRED regression: PASS
+- ordinary human/Architect discussion regression: PASS
+- later same-task EXECUTE envelope regression: PASS
+- repeated HUMAN_REQUIRED regression: PASS
+- STOP-remains-resident regression: PASS
+- temporary Architect attach retry regression: PASS
+- single-next-task launch regression: PASS
+- no-format-recovery-during-discussion regression: PASS
+- existing recovery, rollover and durable receipt regressions: PASS
+
+Runtime/source/test authority is GitHub. Local `.agent-work/orchestrator/` state is durable workflow state and is not source/history authority.
+
+For this repository, the Architect also performs Documentation Curator duties. Runtime/source/test mutation remains bounded Maintainer/Executor work. The Architect independently verifies implementation evidence and may directly synchronize Orchestrator governance/history Markdown after acceptance.
 
 ## Purpose
 
 The Local Orchestrator automates the durable loop:
 
-`Project Architect -> Orchestrator -> one visible Executor/Documentation task -> Orchestrator -> Project Architect`
+`Project Architect -> Orchestrator -> one visible Executor task -> Orchestrator -> Project Architect`
 
-GitHub is source/history/release authority. GitHub is not runtime message transport.
+The Orchestrator is deliberately project-generic. It transports and supervises authority; it does not become the product Architect.
 
-The Orchestrator is deliberately project-generic. Project architecture, roadmap choices, document names, milestone meaning, and business policy remain with the configured Project Architect.
+Project architecture, roadmap, business policy, permission decisions, document ownership and milestone meaning remain with the configured Project Architect and final human authority.
 
-The permanent invariant is:
+Permanent workflow invariant:
 
-`recover where stopped -> run one task -> capture one result -> give Architect once -> wait -> stage one next action -> repeat`
+`recover where stopped -> run one task -> capture one result -> deliver once -> wait -> stage one next action -> repeat`
 
-## Production status
+Rollover, browser recovery, discussion pause and HUMAN_REQUIRED handling exist only to preserve this loop. They must never become an alternate workflow authority.
 
-The core local Orchestrator is production-qualified for the behavior already exercised or independently regression-qualified in AFFOTECH work:
+## Current AFFOTECH production boundary
 
-- resident watcher startup/recovery;
-- one visible Codex child at a time;
-- persistent logical Codex session;
-- Orchestrator-owned isolated task worktrees;
-- sequential task allocation;
-- exactly-once result delivery with ambiguous-send reconciliation;
-- Architect response observation and next-task staging;
-- durable runtime logging;
-- IDLE continuation;
-- Architect browser rollover foundation;
-- deliberate `HUMAN_REQUIRED` stopping;
-- documentation-closure governance protocol;
-- durable human discussion pause with global F9/F10 controls on Windows;
-- remote discussion pause/resume from the configured Project Architect conversation.
-
-Latest full regression count after remote-discussion-control closure: `257 passed / 0 failed`; Python compile PASS; `git diff --check` PASS.
-
-The last preserved AFFOTECH boundary before the next roadmap direction is:
+The latest observed AFFOTECH boundary before resident HUMAN_REQUIRED production requalification is:
 
 - `state=HUMAN_REQUIRED`
-- `taskId=000025`
-- `lastCompletedTaskId=000025`
+- `taskId=000043`
+- `lastCompletedTaskId=000043`
 - `humanRequiredReason=ARCHITECT_DECISION_HUMAN_REQUIRED`
+- task `000043` is completed, accepted and documented
+- its Executor work must not be rerun and its result must not be resent
 
-Task `000025` is completed and confirmed. It must never be rerun or resent.
+The Project Architect is waiting for Rony's next narrow quotation-permission business decision.
 
-## Canonical states
+The runtime repair at `57a3a914...` is deterministically regression-qualified for keeping this state resident. A fresh real production run through the full remote human-decision continuation path is still required before that path should be called end-to-end production-proven.
 
-Normal durable states:
+## Canonical durable states
+
+Normal states:
 
 - `IDLE`
 - `NEXT_PROMPT_READY`
@@ -65,92 +75,35 @@ Normal durable states:
 - `ARCHITECT_RUNNING`
 - `HUMAN_REQUIRED`
 
-Exceptional state retained by runtime:
+Exceptional retained state:
 
 - `EXECUTOR_CRASHED`
 
-There is deliberately no `PAUSED` state. Human discussion pause is a durable overlay and never replaces the truthful underlying workflow state.
+There is deliberately no `PAUSED` workflow state. Human discussion pause is a durable overlay and never replaces the truthful underlying workflow state.
 
-Only the production main dispatcher may perform `NEXT_PROMPT_READY -> EXECUTOR_RUNNING`. Recovery, parsing, transport, documentation governance, pause controls and rollover helpers may inspect/restore state but must not directly launch project work.
+Only the production main dispatcher may perform `NEXT_PROMPT_READY -> EXECUTOR_RUNNING`. Recovery, transport, parsing, documentation, rollover and pause helpers may restore or inspect state but must not directly create an alternate launch path.
 
 ## Canonical sequence
 
 1. Start watcher and acquire the single-instance lock.
-2. Load durable state/configuration and recover exactly where execution stopped.
+2. Load durable state and recover exactly where execution stopped.
 3. `NEXT_PROMPT_READY`: validate the owned task worktree and launch exactly one visible Executor child.
-4. `EXECUTOR_RUNNING`: observe the existing child; no wall-clock timeout and no duplicate launch.
+4. `EXECUTOR_RUNNING`: observe that child; no wall-clock timeout and no duplicate launch.
 5. Child completion with a non-empty result -> `RESULT_READY`.
 6. Deliver the result to the Project Architect exactly once.
-7. Confirm or reconcile Architect delivery -> `ARCHITECT_RUNNING`.
-8. Wait for one completed Architect decision.
-9. Interpret that decision into exactly one of:
-   - next sequential task -> `NEXT_PROMPT_READY`;
-   - deliberate human boundary -> `HUMAN_REQUIRED`;
-   - no current work -> `IDLE`.
-10. Repeat.
+7. Confirm or reconcile result delivery -> `ARCHITECT_RUNNING`.
+8. Observe the Project Architect decision.
+9. Interpret the decision into exactly one of:
+   - `EXECUTE` -> stage exactly one next sequential task -> `NEXT_PROMPT_READY`;
+   - `HUMAN_REQUIRED` -> preserve the completed task and enter resident human-decision wait;
+   - `STOP` -> no currently authorized work; return to resident `IDLE` semantics.
+10. Repeat without reusing a reviewed task ID.
 
-A reviewed task ID is never reused. If task `000021` is reviewed and the Architect returns `EXECUTE`, the next task is `000022`.
-
-## Human discussion pause
-
-The discussion pause exists so the final human authority can use the Project Architect conversation for ideas, brainstorming or roadmap/document updates without the Orchestrator injecting an Executor report or starting another task in the middle of that discussion.
-
-Local Windows controls while the watcher is running:
-
-- `F9` = pause for Architect discussion;
-- `F10` = resume Orchestrator.
-
-Remote controls from the configured Project Architect conversation:
-
-- exact USER message `ORCH:PAUSE` = activate the same durable discussion pause;
-- exact USER message `ORCH:RESUME` = clear only that same durable discussion pause.
-
-Remote commands are exact-match only after outer trim. Ordinary discussion, fuzzy wording, assistant-authored text, and unknown `ORCH:*` text have zero machine authority.
-
-The pause authority is backed by the canonical durable helper/marker under `.agent-work/orchestrator/` and remains backward-compatible with `discussionPauseActive=true` in `state.json`. This prevents a main-thread state reload/save from silently losing a pause requested by the remote monitor.
-
-Pause semantics:
-
-- an already-running Executor is not killed, cancelled or modified;
-- `EXECUTOR_RUNNING` continues to be observed normally;
-- if that Executor completes successfully, the underlying state may advance to `RESULT_READY` while the pause remains active;
-- `RESULT_READY` is held locally and must not be delivered to the Architect;
-- `NEXT_PROMPT_READY` is held and must not launch another Executor;
-- `IDLE` must not bootstrap/contact the Architect or consume new inbox work;
-- an already-in-flight `ARCHITECT_RUNNING` transaction may finish and be captured, but newly staged work is held at the next safe boundary;
-- existing Executor crash/no-result recovery remains authoritative and is not hidden by pause;
-- `HUMAN_REQUIRED` remains `HUMAN_REQUIRED` when pause is cleared;
-- resume clears only the pause authority and does not synthesize a task, milestone, Architect prompt or human authorization.
-
-The intended normal human workflow is:
-
-`Executor running -> pause -> Executor may finish -> result waits -> human/Architect discussion -> resume -> normal exactly-once relay resumes`
-
-Discussion content itself is not machine authority.
-
-## Remote discussion control
-
-Accepted implementation: `9e56d5655a1e40050269245c1b35996f67ddd709`.
-
-The remote monitor is read-only with respect to Architect conversation content. It observes only USER-message identities/text required to identify exact control commands.
-
-Important rules:
-
-- monitor starts with a baseline so an old pre-existing command is not executed as fresh;
-- commands are consumed at most once;
-- a bounded persisted cursor/fingerprint prevents restart replay;
-- no acknowledgement is injected into the Architect conversation;
-- remote control remains available while `EXECUTOR_RUNNING`, so Rony can pause from the mobile ChatGPT app while away from home;
-- remote-monitor attach/read failure is isolated to remote control and must not terminate the Executor or mutate the project task;
-- local F9/F10 controls remain available if remote monitoring is unavailable;
-- successful Architect conversation rollover causes the monitor to follow the new canonical conversation identity;
-- remote control does not add `ORCH:STOP`, `ORCH:ABORT`, task killing, milestone switching, or any other project authority.
-
-The remote monitor uses the same accepted Playwright Architect-browser authority. ChatGPT is never controlled through RAW-CDP.
+If task `000043` is reviewed and a later same-task Architect envelope authorizes `EXECUTE`, the Orchestrator allocates the next sequential task. The Architect must not invent the next task ID.
 
 ## Canonical Architect envelope
 
-New production Architect prompts advertise this schema:
+Production Architect machine authority is:
 
 ```text
 <ORCHESTRATOR_RESULT>
@@ -164,243 +117,305 @@ promptEnd
 </ORCHESTRATOR_RESULT>
 ```
 
-The envelope must be the final authoritative content of the Architect response.
+The envelope is the final machine-authoritative content of the Architect response.
 
-Legacy envelopes without `documentation=` remain parseable as `NOT_REQUIRED` only for backward compatibility with historical responses. All new production Architect-facing instructions include the documentation field.
+The field order above is parser-significant in the current protocol. Legacy envelopes without `documentation=` remain supported only for backward compatibility.
 
-## Documentation closure governance
+Ordinary discussion text is not machine authority.
 
-Documentation is an explicit governed milestone disposition.
+Presence of the literal opening marker `<ORCHESTRATOR_RESULT>` means the response is attempting machine authority. An attempted but invalid envelope fails closed and must never be silently downgraded into ordinary prose.
 
-`documentation=NOT_REQUIRED`
+## Resident HUMAN_REQUIRED contract
 
-- the current decision is not a milestone/release documentation closure;
-- no documentation gate is opened.
+`HUMAN_REQUIRED` has more than one cause. Technical failure states remain fail-closed according to their reason. The special deliberate Project Architect decision boundary is:
 
-`documentation=REQUIRED`
+`humanRequiredReason=ARCHITECT_DECISION_HUMAN_REQUIRED`
 
-- valid only with an accepted decision and `action=EXECUTE` carrying one complete bounded documentation-closure prompt;
-- the Orchestrator stages that closure through the normal sequential task path;
-- durable `documentationClosurePending=true` prevents ordinary project advancement until completion;
-- the Orchestrator does not know project-specific document names.
+For this reason, `57a3a914...` changes supervision semantics:
 
-`documentation=COMPLETE`
+- project execution pauses;
+- the watcher process remains resident;
+- no Executor launches while authority is missing;
+- the completed task is preserved;
+- the completed result is not resent;
+- the watcher stays attached to the current authoritative Architect conversation;
+- ordinary Architect discussion prose is expected and does not trigger format recovery;
+- the observation baseline advances after ordinary discussion;
+- a later valid envelope for the same completed task is consumed through the normal parser and staging path;
+- a later `EXECUTE` stages exactly one next task;
+- a later `HUMAN_REQUIRED` remains resident;
+- a later `STOP` means no currently authorized work and returns to resident no-work/IDLE semantics rather than terminating supervision;
+- temporary Architect attach/read failure preserves HUMAN_REQUIRED, disconnects safely, waits, and retries instead of killing the watcher.
 
-- required documentation has already been synchronized and verified;
-- clears the durable pending gate;
-- then ordinary `EXECUTE`, `HUMAN_REQUIRED` or `STOP` semantics apply.
+The watcher does not interpret Rony's business discussion. It waits for the Project Architect to convert resolved human authority into a valid same-task envelope.
 
-The Project Architect decides whether documentation is needed, which documents are authoritative, and whether the Architect itself performs the documentation mutation or delegates one bounded documentation task.
+This creates the intended remote workflow:
 
-A pending documentation closure cannot be bypassed by a missing or `NOT_REQUIRED` disposition. Format recovery explicitly preserves the existing documentation obligation.
+`Architect asks Rony -> watcher remains resident -> Rony discusses remotely -> Architect resolves authority -> Architect emits same-task envelope -> watcher continues automatically`
 
-## Recovery rules
+No special human command such as “generate the envelope” is supposed to be necessary once the Project Architect's own governance adopts that continuation rule.
 
-- `EXECUTOR_RUNNING` + live PID -> observe only.
-- `EXECUTOR_RUNNING` + dead PID + usable result -> `RESULT_READY`.
-- `EXECUTOR_RUNNING` + dead PID + no usable result -> `HUMAN_REQUIRED`.
-- `RESULT_READY` restart -> resume/reconcile result transport unless discussion pause is active; never rerun Executor.
-- `ARCHITECT_RUNNING` restart after confirmed delivery -> observe Architect; never resend confirmed result.
-- `NEXT_PROMPT_READY` restart -> main dispatcher launches exactly one Executor unless discussion pause is active.
-- `IDLE` restart -> normal continuation behavior unless discussion pause is active.
-- no blind post-launch retry.
-- human-authorized recovery may restore `NEXT_PROMPT_READY`, but recovery helpers do not launch directly.
-- deliberate Architect `HUMAN_REQUIRED` uses `humanRequiredReason=ARCHITECT_DECISION_HUMAN_REQUIRED` and must not enter transport-exhaustion recovery.
-- restart never clears an active discussion pause silently.
-- restart never replays an already-consumed remote pause/resume command.
+## Project Architect / Orchestrator authority boundary
 
-## Exactly-once Architect result transport
+The Project Architect owns:
 
-Executor-result delivery has durable task and payload identity.
+- project/product architecture;
+- business decisions and permission semantics;
+- milestone selection;
+- independent verification of Executor evidence;
+- ACCEPTED/BLOCKED/INCONCLUSIVE/NO_NEW_REPORT classification;
+- complete next bounded Executor prompt;
+- project documentation synchronization according to that project's governance;
+- deciding when human authority is sufficient to continue.
 
-Before send, user/assistant baselines are persisted. Confirmation may be proven by accepted composer transition, user-turn advancement, Architect generation, assistant advancement, or exact/normalized visible user payload evidence.
+The Orchestrator owns:
 
-If a send action was attempted but acknowledgement is uncertain:
+- durable workflow state;
+- one-at-a-time task numbering and dispatch;
+- worktree/session transport mechanics;
+- exactly-once result delivery/reconciliation;
+- observing a valid Architect envelope;
+- resident waiting while human authority is unresolved;
+- discussion pause transport controls;
+- browser/session rollover maintenance.
 
-- state becomes ambiguous;
-- automatic recovery is reconciliation-only;
-- the same payload is not automatically repopulated or resent;
-- inability to prove delivery is not proof of non-delivery;
-- unprovable ambiguity eventually becomes `HUMAN_REQUIRED`.
+The Orchestrator must not infer business authority from discussion prose, independently accept project milestones, broaden permissions, invent roadmap decisions, or replace Architect judgment.
 
-If delivery is independently proven, any stale composer is cleared only when its content exactly/normalizes to the known payload. Unrelated human-authored text is never cleared.
+## Exactly-once result transport
 
-Transport recovery must never rerun completed project work.
+Executor result delivery has durable task and payload identity.
 
-Discussion pause is an additional outbound gate: while pause is active, a waiting `RESULT_READY` payload is not sent. Resume re-enables the existing exactly-once delivery path; it does not create a new delivery identity or authorize a duplicate send.
-
-Remote-control/discussion traffic is excluded from workflow authority. After a human discussion, ordinary Architect workflow baselines must remain aligned so discussion answers cannot be misread as result review or continuation decisions.
-
-## HUMAN_REQUIRED reason hygiene
-
-`humanRequiredReason` describes only the current authority boundary.
-
-Successful Executor completion, successful transport recovery, Architect `EXECUTE`, and Architect `STOP` clear stale failure reasons.
-
-Architect `HUMAN_REQUIRED` replaces any previous reason with `ARCHITECT_DECISION_HUMAN_REQUIRED`.
-
-Historical transport reason `ARCHITECT_RESULT_TRANSPORT_EXHAUSTED` must never survive into later healthy task states.
-
-Discussion resume—whether F10 or `ORCH:RESUME`—does not clear, reinterpret or bypass `HUMAN_REQUIRED`.
-
-## Persistent Executor model
-
-AFFOTECH logical Codex session:
-
-`019f842e-98bc-7672-a619-51441d91be00`
-
-Normal operation uses a persistent logical Codex session with a short-lived OS child per bounded task via `codex exec resume`.
+Future marked payloads use durable SHA-256 delivery proof. Confirmation/reconciliation may use the known delivery marker and bounded browser evidence. A send that may have occurred is never blindly repeated.
 
 Rules:
 
-- one writer/project/task;
+- confirmed delivery is never resent;
+- ambiguous attempted delivery reconciles read-only first;
+- inability to prove delivery is not proof that delivery did not occur;
+- a completed project task is never rerun because result transport failed;
+- stale composer cleanup is allowed only when the Orchestrator can prove the text is its own exact known payload;
+- unrelated human-authored composer text is never cleared.
+
+Completed-confirmed workflow recovery is fact-based. Historical failure labels must not outweigh stronger durable evidence that the current task is completed, the result exists, delivery is confirmed, no newer prompt is staged and no Executor is active.
+
+## Recovery rules
+
+- `EXECUTOR_RUNNING` + live owned child -> observe only.
+- `EXECUTOR_RUNNING` + dead child + usable result -> `RESULT_READY`.
+- `EXECUTOR_RUNNING` + dead child + no usable result -> fail closed / `HUMAN_REQUIRED`.
+- `RESULT_READY` restart -> resume or reconcile result delivery; never rerun Executor.
+- `ARCHITECT_RUNNING` restart after confirmed delivery -> observe Architect; never resend confirmed result.
+- completed + confirmed + no active Executor + no newer staged work -> recover by facts, not stale historical reason labels.
+- `NEXT_PROMPT_READY` restart -> production dispatcher launches exactly one Executor unless discussion pause is active.
+- deliberate Architect `HUMAN_REQUIRED` restart -> reattach to the existing Architect conversation and remain resident.
+- discussion prose while deliberate HUMAN_REQUIRED -> update baseline, no format recovery, no task creation.
+- valid same-task EXECUTE envelope while deliberate HUMAN_REQUIRED -> ordinary parser/staging path -> one next task.
+- no blind post-launch retry.
+- restart never clears an active discussion pause silently.
+
+A stored PID by itself is not proof of a live Executor. Liveness must be checked and process ownership must not be inferred merely because Windows currently has the same numeric PID.
+
+## Human discussion pause
+
+Discussion pause is separate from `HUMAN_REQUIRED`.
+
+Local Windows controls:
+
+- `F9` = pause for Architect discussion
+- `F10` = resume Orchestrator
+
+Remote exact USER commands in the configured Architect conversation:
+
+- `ORCH:PAUSE`
+- `ORCH:RESUME`
+
+The commands are exact-match only. Fuzzy wording and assistant-authored text have no command authority.
+
+Pause semantics:
+
+- never kill an already-running Executor;
+- allow the running Executor to finish;
+- hold `RESULT_READY` locally instead of delivering it;
+- hold `NEXT_PROMPT_READY` instead of launching it;
+- suppress new IDLE bootstrap/contact;
+- preserve underlying HUMAN_REQUIRED truth;
+- resume only clears the pause overlay; it does not synthesize project authority.
+
+A deliberate `ARCHITECT_DECISION_HUMAN_REQUIRED` wait does not require Rony to issue `ORCH:PAUSE`; resident human-decision waiting is a normal workflow boundary of its own.
+
+## Documentation closure governance
+
+The envelope's `documentation=` disposition is durable workflow authority.
+
+`NOT_REQUIRED`
+
+- no documentation closure gate is opened.
+
+`REQUIRED`
+
+- valid only when the accepted Architect decision carries one complete bounded documentation-closure action;
+- ordinary project advancement is blocked until closure.
+
+`COMPLETE`
+
+- required project documentation has already been synchronized and verified;
+- clears the pending gate and permits the envelope's normal EXECUTE/HUMAN_REQUIRED/STOP semantics.
+
+The Project Architect decides what project documentation is authoritative. The Orchestrator is project-generic and must not hardcode project document names.
+
+## Persistent Executor model
+
+AFFOTECH logical Codex session currently configured:
+
+`019f842e-98bc-7672-a619-51441d91be00`
+
+Normal execution uses a persistent logical Codex session and a short-lived OS child per bounded task via `codex exec resume`.
+
+Rules:
+
+- one writer per project/task;
 - one visible child at a time;
-- task-owned isolated Git worktree;
-- no AFFOTECH mutation in the Orchestrator repository/base checkout;
+- Orchestrator-owned isolated task worktree;
+- no AFFOTECH mutation in the Orchestrator base checkout;
 - no Executor wall-clock timeout;
-- child exit/result evidence determines completion;
-- manually opened interactive Codex must not hold the same writer authority during automated execution.
+- child completion/result evidence determines task completion;
+- transport retry never reruns completed project work.
 
-## Executor visibility
+## Architect browser authority
 
-Production launches print a visible task banner and allow live Codex activity to remain visible. Runtime captures stderr evidence without hiding all meaningful execution from the user.
+The Orchestrator controls the dedicated ChatGPT Architect browser through Playwright.
 
-`CREATE_NEW_CONSOLE` remains part of the Windows launch path, so an auxiliary console may still appear. This is a presentation caveat, not authority for a second Executor.
+It does not use RAW-CDP as the ChatGPT mutation/control path.
 
-When discussion pause is active, the watcher visibly reports the underlying state/task and that Architect relay is blocked. It avoids repeated poll-cycle console spam for an unchanged paused state.
+RAW-CDP remains a separate AFFOTECH application validation mechanism and must not be confused with Project Architect browser control.
+
+Browser object ownership includes thread ownership. A Playwright Sync bridge must be created, used and closed on its owning thread.
+
+## Architect rollover
+
+Architect rollover is session maintenance only. It is not workflow authority.
+
+Memory threshold remains 1 GiB (`1073741824` bytes). Crossing the threshold records rollover due; it must not preempt result delivery, Architect decision processing, a recoverable human boundary, or other workflow authority.
+
+A qualified rollover may:
+
+1. request a complete handover from the old Project Architect;
+2. open a fresh authenticated Architect conversation;
+3. submit that handover;
+4. verify the new conversation identity;
+5. persist the new canonical Architect conversation ID;
+6. close the old page;
+7. resume the same durable workflow state.
+
+Rollover must never:
+
+- launch project work;
+- regenerate an Executor result;
+- renumber completed tasks;
+- resend confirmed work;
+- invent human/business authority;
+- turn a maintenance failure into a different workflow decision.
+
+If rollover maintenance fails, the intended invariant is: leave rollover due for later and preserve the workflow state.
+
+### Known rollover qualification gap
+
+The current deferred-rollover service is not yet end-to-end production-qualified after the recent repairs. Source-flow inspection shows the main production path waits inside Executor observation while the child is alive, while deferred rollover service is scheduled after that observation returns. Therefore the intended live-Executor maintenance boundary may remain unreachable in normal execution and `rolloverDue` may simply remain pending until a later safe opportunity.
+
+This limitation must not stop authorized AFFOTECH work. Do not redesign rollover inside unrelated product milestones. Rollover remains maintenance and must never halt the business workflow merely because maintenance is due.
 
 ## Durable runtime logging
 
-Canonical log:
+Canonical local log:
 
 `.agent-work/orchestrator/logs/orchestrator.log`
 
-Current design:
+Important event families include workflow state changes, Executor launch/completion, result delivery/reconciliation, Architect attach/generation/decision, pause control, documentation closure, rollover, and HUMAN_REQUIRED boundaries.
 
-- Python standard logging;
-- rotating file, 5 MiB active file with 5 backups;
-- unique `runId=YYYYMMDD-HHMMSS-PID` per watcher invocation;
-- local timestamp;
-- lifecycle/state transition/task/transport/rollover/human-boundary events;
-- traceback for unhandled watcher exceptions;
-- hashes/identifiers rather than complete prompt/report bodies;
-- no credentials, tokens, cookies or private customer payloads.
+Resident human-decision handling additionally uses events such as:
 
-Important event families include:
+- `ARCHITECT_HUMAN_WAIT_ATTACH_SUCCESS`
+- `ARCHITECT_HUMAN_WAIT_ATTACH_FAILED`
+- `ARCHITECT_HUMAN_WAIT_READ_FAILED`
+- `ARCHITECT_HUMAN_DECISION_RESPONSE_INVALID`
 
-- `WATCHER_STARTED`, `STATE_RECOVERED`, `STATE_TRANSITION`, `WATCHER_STOPPED`, `WATCHER_EXCEPTION`;
-- `NEXT_PROMPT_READY`, `CODEX_STARTING`, `CODEX_STARTED`, `CODEX_FINISHED`, `EXECUTOR_RESULT_FOUND`, `RESULT_READY`;
-- `ARCHITECT_ATTACH_START`, `ARCHITECT_ATTACH_SUCCESS`, `ARCHITECT_GENERATION_STARTED`, `ARCHITECT_GENERATION_FINISHED`, `ARCHITECT_RESPONSE_ACCEPTED`;
-- `RESULT_DELIVERY_ATTEMPT`, `RESULT_DELIVERY_CONFIRMED`, `RESULT_DELIVERY_AMBIGUOUS`, `RESULT_DELIVERY_RECONCILED`, `RESULT_DELIVERY_EXHAUSTED`;
-- `ARCHITECT_STALE_COMPOSER_CLEARED`;
-- `HUMAN_REQUIRED`;
-- `HUMAN_DISCUSSION_PAUSE_REQUESTED`, `HUMAN_DISCUSSION_PAUSE_ACTIVE`, `HUMAN_DISCUSSION_RESUME_REQUESTED`;
-- `HUMAN_DISCUSSION_HOTKEY_REGISTRATION_FAILED`;
-- `REMOTE_CONTROL_MONITOR_STARTED`, `REMOTE_CONTROL_COMMAND_OBSERVED`, `REMOTE_DISCUSSION_PAUSE_REQUESTED`, `REMOTE_DISCUSSION_RESUME_REQUESTED`, `REMOTE_CONTROL_COMMAND_DUPLICATE_IGNORED`, `REMOTE_CONTROL_MONITOR_ERROR`;
-- `DOCUMENTATION_CLOSURE_REQUIRED`, `DOCUMENTATION_CLOSURE_TASK_STAGED`, `DOCUMENTATION_CLOSURE_ACCEPTED`, `DOCUMENTATION_CLOSURE_BYPASS_BLOCKED`;
-- rollover lifecycle events.
-
-Accepted logging closure: `b5ed8dcde5de92c5b7fe8df08b84243dc3a6dd98`.
-
-## IDLE continuation
-
-Accepted closure: `06a743f986d462f5f6de246dac9292bd47800f0b`.
-
-Consumed result-review responses may request exactly one continuation bootstrap. A bootstrap-origin STOP remains quietly IDLE and cannot recursively bootstrap itself. Ambiguous legacy consumed responses fail closed unless they satisfy the qualified migration conditions.
-
-Discussion pause takes precedence over new IDLE bootstrap/contact. Resuming simply restores the ordinary IDLE continuation rules.
-
-## Architect browser rollover
-
-Architect browser memory threshold: `1073741824` bytes (1 GiB).
-
-At a safe point, rollover may:
-
-1. request handover from the old Architect;
-2. wait for handover completion;
-3. create a fresh authenticated Architect conversation;
-4. send the handover;
-5. persist the new conversation ID;
-6. verify future attachment to the new conversation;
-7. close the old page;
-8. resume the same durable orchestration state;
-9. deliver any pending result exactly once to the new Architect.
-
-Rollover must never launch project work, regenerate results, renumber completed tasks, or resend already-confirmed work.
-
-A human discussion pause prevents starting new rollover/result-delivery outbound activity at held safe states. It does not corrupt an already-in-flight Architect transaction. After a successful conversation switch, the remote-control monitor follows the new canonical `architectConversationId` and establishes a fresh startup baseline there.
+Logs must prefer hashes/identifiers over prompt/report bodies and must not contain credentials, cookies, private customer payloads or other secrets.
 
 ## Accepted repair chain
 
-Do not re-audit these milestones absent regression evidence:
+Do not re-audit these accepted milestones absent direct regression evidence:
 
-- `3e6efeb8b886ec377110c1c5d1740070483df4f9` — canonical state-machine consolidation closure.
-- `b5ed8dcde5de92c5b7fe8df08b84243dc3a6dd98` — runtime logging lifecycle accepted.
-- `06a743f986d462f5f6de246dac9292bd47800f0b` — IDLE continuation gate accepted.
-- `cdd49f2a9f79a3ff62d5a5cc5945583fcafa7c0b` — ambiguous Architect delivery reconciliation closed.
-- `944597152bdbb2872ca7941ac674ca745973f69d` — stale HUMAN_REQUIRED reason hygiene accepted.
-- `cfd673e3f278c4269fe252f40210b935eb3fb622` — milestone documentation governance implemented.
-- `38b3aeca711b36f19f1ad612b6ec223eea1691c3` — documentation disposition propagated to production Architect prompts.
-- `e5b47ffc7892a208679dd1a9c54983e19e5982d8` — canonical IDLE documentation envelope template completed.
-- `78ba0a5d8f56bae2dece6ba1a07fa70594cc21de` — durable human discussion pause with F9/F10 controls accepted.
-- `9e56d5655a1e40050269245c1b35996f67ddd709` — remote discussion pause/resume through exact mobile Architect commands accepted.
+- `3e6efeb8b886ec377110c1c5d1740070483df4f9` — canonical state-machine consolidation.
+- `b5ed8dcde5de92c5b7fe8df08b84243dc3a6dd98` — durable runtime logging.
+- `06a743f986d462f5f6de246dac9292bd47800f0b` — IDLE continuation gate.
+- `cdd49f2a9f79a3ff62d5a5cc5945583fcafa7c0b` — ambiguous Architect delivery reconciliation.
+- `944597152bdb2872ca7941ac674ca745973f69d` — HUMAN_REQUIRED reason hygiene.
+- `e5b47ffc7892a208679dd1a9c54983e19e5982d8` — canonical documentation envelope closure.
+- `78ba0a5d8f56bae2dece6ba1a07fa70594cc21de` — durable F9/F10 human discussion pause.
+- `9e56d5655a1e40050269245c1b35996f67ddd709` — remote discussion control.
+- `1ec880e7d2bede1d56078cab433f3d2793ec008b` — Playwright thread-affinity repair.
+- `54a82e81be99eb1a85831cf27ccf37a634082191` — Architect bridge startup/composer hardening.
+- `216a57d0635bfa0e6342f276ab880b250afe4003` — fail closed on invalid intended Architect envelope.
+- `fce038e29698f18e13c7f9624bf6a80337b2cdc6` — exact result-delivery proof and false-reconciliation recovery foundation.
+- `87a214fe98a190827dd06f0456e0d34a687410d5` — same-task false-reconciliation correction.
+- `9bc1d9cc030d0e0279bc06b953f354c01533df30` — durable SHA-256 result-delivery receipt.
+- `ad29cca8b4eac1bf039c3e3b5a017a358fd57528` — rollover made non-preemptive maintenance.
+- `67d1a8d911f5bc839441eadeb69e2f20c16c4651` — confirmed-result recovery after rollover failure.
+- `26f6644af1703abd2068198708ae7dbe54544f6a` — fact-based completed-confirmed workflow recovery.
+- `57a3a914b35ed0c715aaaf0267ed0bd36a39cc78` — resident human-decision continuation.
 
-Earlier accepted foundations also include Orchestrator-owned worktrees, persistent session identity, postlaunch retry fencing, human recovery/single-instance locking, post-result worktree inheritance, and cross-task transport/state hygiene.
+Earlier accepted worktree/session/retry/locking foundations remain authoritative dependencies unless direct regression evidence proves otherwise.
 
-## Production lessons
+## Current qualification status
 
-Permanent lessons include:
+Already demonstrated in real production across the repair chain:
 
-1. recovery must restore canonical state, not implement an alternate workflow;
-2. ambiguous post-send transport must reconcile, not blindly resend;
-3. state reasons must describe current authority only;
-4. browser/composer state is evidence, not a reason to duplicate actions;
-5. project documentation closure must be explicit and durable;
-6. the generic Orchestrator must not contain project-specific roadmap/document knowledge;
-7. production prompts must advertise the same protocol the parser enforces;
-8. a completed task/result must never be rerun simply because transport failed;
-9. visible execution and durable logs are operational requirements;
-10. human authority remains the boundary for new product direction;
-11. the final human must be able to reserve the Architect conversation for discussion without aborting an already-authorized Executor or losing a completed result;
-12. remote human control must be exact, tiny, fail-closed and incapable of becoming project authority.
+- one Executor at a time;
+- result capture and exactly-once delivery/reconciliation;
+- Architect review and next-task staging;
+- documentation closure;
+- discussion pause/remote control foundations;
+- completed-result recovery through multiple transport/rollover incidents;
+- successful execution through task `000041` and later quotation milestones through `000043`.
 
-## Next qualification gate
+Deterministically regression-qualified at `57a3a914...`, but still requiring a fresh real production proof:
 
-Do not manufacture another Orchestrator-only milestone merely to exercise these controls.
+- watcher remains resident during a genuine `ARCHITECT_DECISION_HUMAN_REQUIRED` boundary;
+- ordinary remote human/Architect discussion does not trigger format recovery;
+- after Rony resolves the decision, the Project Architect emits a valid same-task envelope and the resident watcher consumes it without manual PC restart;
+- exactly one next sequential Executor task launches.
 
-The next real AFFOTECH roadmap milestone should be used as production proof of the final documentation-governance and discussion-pause behavior. Observe that:
+Separately still not qualified end-to-end:
 
-- the final Architect envelope includes `documentation=`;
-- any required documentation closure is staged exactly once;
-- pending documentation survives restart and cannot be bypassed;
-- `COMPLETE` clears the gate;
-- no duplicate Executor/result transport occurs;
-- deliberate `HUMAN_REQUIRED` remains safe;
-- F9/F10 can hold/resume a real task boundary;
-- `ORCH:PAUSE`/`ORCH:RESUME` can do the same from the mobile Architect conversation;
-- while paused, the Architect conversation receives no new Orchestrator result/bootstrap traffic;
-- resume continues the existing durable state without rerunning completed work or changing roadmap authority.
+- smooth deferred Architect rollover after the latest non-preemptive maintenance repairs.
 
-## Next project after successful real proof: universal template
+## Cross-project integration contract
 
-After one real post-5G AFFOTECH milestone completes successfully through the final protocol, the next Orchestrator engineering objective is to create a **universal Orchestrator template for new projects**.
+A Project Architect integrating with this Orchestrator should read this document as the current Orchestrator runtime contract.
 
-Goal: a new project should start from the proven runtime instead of spending weeks rebuilding transport, recovery, state, logging, worktree, rollover, documentation-governance, human-discussion-pause and remote-control behavior.
+The Project Architect must preserve its own project governance separately. In particular, the Orchestrator cannot decide when a human business question is resolved. The Project Architect must define its own standing rule for HUMAN_REQUIRED continuation:
 
-The universalization work must extract configuration from project-specific assumptions while preserving this accepted state machine and safety behavior. At minimum, it should parameterize project repository/branch, Architect conversation, Executor session identity, workspace/worktree roots, role/bootstrap context and project-specific validation hooks.
+- remain responsible for the same completed task;
+- allow natural discussion with the final human authority;
+- do not invent missing authority;
+- once authority is sufficient, emit a valid same-task ORCHESTRATOR_RESULT automatically;
+- let the Orchestrator allocate the next sequential task.
 
-Do not begin universalization before the next real milestone proves the current final protocol in production.
+That project-side rule belongs in the project's own canonical Architect governance/handover documentation, not in Orchestrator business logic.
 
-## Git source synchronization rule
+## Permanent design principles
 
-A source-maintenance milestone is complete only when the bounded change is committed, pushed, fetched/read back, and local/remote authority is synchronized. Never force-push and never claim PASS when a required push failed.
+1. Human authority remains final.
+2. The Project Architect decides project meaning; the Orchestrator transports and supervises.
+3. Completed work is preserved before transport/browser maintenance.
+4. Ambiguous external actions reconcile read-only before retry.
+5. Machine authority is explicit and literal; ordinary discussion is not executable authority.
+6. `HUMAN_REQUIRED` pauses project execution; for deliberate Architect decisions it must not unnecessarily kill supervision.
+7. Recovery should use current durable facts rather than stale historical error labels.
+8. Rollover is maintenance only and must never own workflow authority.
+9. One task, one Executor, one result, one Architect decision, one next action.
+10. Keep the Orchestrator boring.
 
-## Permanent design principle
-
-Keep the Orchestrator boring:
+Canonical loop:
 
 `recover -> run one task -> capture one result -> deliver once -> wait -> stage one next action`
-
-Human discussion pause—local or remote—only gates new outbound/launch actions around that loop. It never creates a parallel workflow or product authority.
-
-Everything else exists only to preserve that loop.
