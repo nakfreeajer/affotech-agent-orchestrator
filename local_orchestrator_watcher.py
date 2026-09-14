@@ -35,6 +35,7 @@ AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
 RUNTIME_LOGGER_NAME = "affotech.orchestrator.runtime"
+RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING = "DEFERRED_ARCHITECT_GENERATING"
 
 
 def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
@@ -3284,13 +3285,17 @@ class LocalFirstOrchestrator:
         self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
         return True
 
-    def deliver_result(self, bridge: Any) -> None:
+    def deliver_result(self, bridge: Any) -> str | None:
         if self.state.get("state") != "RESULT_READY":
             raise RuntimeError("RESULT_NOT_READY")
         if self.discussion_pause_active():
             return
         if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
-            return
+            if not getattr(self, "_result_delivery_deferred_logged", False):
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_DEFERRED", self.state, reason="ARCHITECT_GENERATING")
+                self._result_delivery_deferred_logged = True
+            return RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING
+        self._result_delivery_deferred_logged = False
         path = Path(self.state["executorResultPath"])
         payload, payload_hash = self._result_delivery_payload()
         task_id = str(self.state["taskId"])
@@ -3376,14 +3381,22 @@ class LocalFirstOrchestrator:
     def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
         """Reconcile or deliver one result without exiting the resident watcher."""
         bridge = initial_bridge
-        for attempt in range(max_attempts):
+        attempt = 0
+        while attempt < max_attempts:
             try:
                 if bridge is None:
                     bridge = bridge_factory()
+                if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
+                    self.deliver_result(bridge)
+                    time.sleep(0.25)
+                    continue
                 self.state["architectTransportRecoveryPayloadHash"] = self.state.get("architectDeliveryPayloadHash")
                 self.state["architectTransportRecoveryCount"] = attempt
                 self.save()
-                self.deliver_result(bridge)
+                disposition = self.deliver_result(bridge)
+                if disposition == RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING:
+                    time.sleep(0.25)
+                    continue
                 self.state["architectTransportRecoveryCount"] = 0
                 self.save()
                 return bridge
@@ -3393,8 +3406,9 @@ class LocalFirstOrchestrator:
                 except Exception:
                     pass
                 bridge = None
-                if attempt + 1 >= max_attempts:
-                    self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED", "architectTransportRecoveryCount": attempt + 1})
+                attempt += 1
+                if attempt >= max_attempts:
+                    self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED", "architectTransportRecoveryCount": attempt})
                     self.save()
                     runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_EXHAUSTED", self.state, reason="ARCHITECT_RESULT_TRANSPORT_EXHAUSTED")
                     runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_REQUIRED", self.state, reason="ARCHITECT_RESULT_TRANSPORT_EXHAUSTED")

@@ -1111,9 +1111,38 @@ def test_generation_visible_new_architect_blocks_result_delivery(tmp_path):
     class Bridge:
         def generation_visible(self): return True
         def submit_result_bounded(self, payload): sends.append(payload)
-    watcher.deliver_result(Bridge())
+    assert watcher.deliver_result(Bridge()) == watcher_module.RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING
     assert sends == []
     assert watcher.state["state"] == "RESULT_READY"
+
+
+def test_result_delivery_deferral_resumes_same_bridge_after_generation(tmp_path, monkeypatch):
+    watcher = ready(tmp_path)
+    sends = []
+    class Bridge:
+        def __init__(self):
+            self.generating = iter([True, True, False, False])
+            self.wait_called = False
+        def generation_visible(self): return next(self.generating)
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def user_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def submit_result_bounded(self, payload): sends.append(payload)
+        def wait_for_new_response(self, *_args, **_kwargs):
+            self.wait_called = True
+            raise AssertionError("decision wait is not part of delivery")
+        def close(self): pass
+    bridge = Bridge()
+    watcher.state["architectTransportRecoveryCount"] = 7
+    watcher.save()
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    result = watcher.deliver_result_with_recovery(lambda: (_ for _ in ()).throw(AssertionError("must retain bridge")), initial_bridge=bridge)
+    payload, _payload_hash = watcher._result_delivery_payload()
+    assert result is bridge
+    assert sends == [payload]
+    assert bridge.wait_called is False
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert watcher.state["architectTransportRecoveryCount"] == 0
 
 
 def test_exact_unsent_payload_is_replaced_and_sent_once(tmp_path):
