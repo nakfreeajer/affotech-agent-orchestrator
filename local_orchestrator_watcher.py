@@ -2876,21 +2876,22 @@ class LocalFirstOrchestrator:
                 or self.state.get("humanRequiredReason") not in {"ARCHITECT_HANDOVER_RESPONSE_INVALID", "ARCHITECT_NEW_CONVERSATION_ACK_INVALID", "ARCHITECT_NEW_CONVERSATION_ACK_TIMEOUT"}
                 or not task_id or task_id != str(self.state.get("lastCompletedTaskId") or "")
                 or not result_ready or not self.state.get("architectDeliveryPayloadHash")
-                or self.state.get("architectSendState") not in {"PENDING", "FAILED", "AMBIGUOUS"}
+                or self.state.get("architectSendState") not in {"PENDING", "FAILED", "AMBIGUOUS", "CONFIRMED"}
                 or self.state.get("nextPromptPath")
                 or (self.state.get("nextTaskId") and self.state.get("nextTaskId") not in {task_id, str(self.state.get("lastCompletedTaskId") or "")})
                 or executor_active):
             return False
+        confirmed = self.state.get("architectSendState") == "CONFIRMED"
         self.state.update({
-            "state": "HUMAN_REQUIRED",
-            "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED",
+            "state": "ARCHITECT_RUNNING" if confirmed else "HUMAN_REQUIRED",
+            "humanRequiredReason": None if confirmed else "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED",
             "handoverRequested": False,
             "handoverReady": False,
             "rolloverInProgress": False,
             "rolloverDue": True,
+            "rolloverPending": False,
         })
         self.state.pop("pending_handover", None)
-        self.state["rolloverPending"] = False
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_RECOVERY", self.state, taskId=task_id)
         return True

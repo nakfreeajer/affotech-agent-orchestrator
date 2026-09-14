@@ -1187,6 +1187,50 @@ def test_preempted_rollover_failure_restores_result_recovery_without_executor(tm
     assert Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8") == "executor report"
 
 
+def test_preempted_rollover_confirmed_delivery_restores_architect_without_resend(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-1", "lastCompletedTaskId": "task-1",
+                          "architectDeliveryPayloadHash": payload_hash, "architectSendState": "CONFIRMED",
+                          "humanRequiredReason": "ARCHITECT_HANDOVER_RESPONSE_INVALID",
+                          "rolloverPending": True, "rolloverDue": True, "rolloverInProgress": False,
+                          "handoverRequested": True, "pending_handover": "old handover", "nextPromptPath": None,
+                          "codexPid": None})
+    watcher.save()
+    class Bridge:
+        def submit_result_bounded(self, _message): raise AssertionError("confirmed result must not be resent")
+    bridge = Bridge()
+    assert watcher.recover_preempted_rollover_failure() is True
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert watcher.state["architectDeliveryPayloadHash"] == payload_hash
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverPending"] is False
+    assert watcher.state["handoverRequested"] is False
+    assert watcher.state["rolloverInProgress"] is False
+    assert "pending_handover" not in watcher.state
+    assert not hasattr(bridge, "sent")
+
+
+def test_preempted_rollover_confirmed_recovery_allows_normal_execute_envelope(tmp_path):
+    watcher, base, _worktree = recovery_fixture(tmp_path)
+    result = Path(watcher.state["executorResultPath"])
+    result.write_text("completed result", encoding="utf-8")
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "recovery-safety-task", "lastCompletedTaskId": "recovery-safety-task",
+                          "executorResultPath": str(result), "architectDeliveryPayloadHash": payload_hash,
+                          "architectSendState": "CONFIRMED", "humanRequiredReason": "ARCHITECT_HANDOVER_RESPONSE_INVALID",
+                          "rolloverDue": True, "rolloverPending": True, "handoverRequested": True, "nextPromptPath": None,
+                          "codexPid": None})
+    watcher.save()
+    assert watcher.recover_preempted_rollover_failure() is True
+    decision = watcher.accept_architect_response(envelope("recovery-safety-task", prompt=configured_project_prompt(base, subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip(), "next-task")))
+    assert decision["action"] == "EXECUTE"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000001"
+
+
 def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,
