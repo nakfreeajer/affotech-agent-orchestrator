@@ -769,7 +769,7 @@ def test_confirmed_identical_result_delivery_is_terminally_idempotent(tmp_path):
 def test_localfirst_has_governed_memory_rollover_at_safe_boundary(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
-    watcher.state.update({"state": "ARCHITECT_RUNNING", "architectResponseCount": 1})
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": os.getpid(), "architectResponseCount": 1})
     watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES)
     messages = []
     class Bridge:
@@ -1116,6 +1116,94 @@ def test_generation_visible_new_architect_blocks_result_delivery(tmp_path):
     assert watcher.deliver_result(Bridge()) == watcher_module.RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING
     assert sends == []
     assert watcher.state["state"] == "RESULT_READY"
+
+
+@pytest.mark.parametrize("workflow_state,reason", [
+    ("HUMAN_REQUIRED", "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"),
+    ("RESULT_READY", None),
+    ("ARCHITECT_RUNNING", None),
+    ("NEXT_PROMPT_READY", None),
+])
+def test_memory_due_does_not_preempt_workflow_state(tmp_path, workflow_state, reason):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": workflow_state, "taskId": "task-1", "humanRequiredReason": reason})
+    before = dict(watcher.state)
+    watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES)
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["state"] == workflow_state
+    assert watcher.state.get("humanRequiredReason") == reason
+    assert watcher.state.get("rolloverPending", False) is False
+    assert {key: watcher.state.get(key) for key in ("taskId", "state", "humanRequiredReason")} == {key: before.get(key) for key in ("taskId", "state", "humanRequiredReason")}
+
+
+def test_deferred_rollover_can_attempt_once_at_live_executor_boundary(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,
+                          "architectConversationId": "current", "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD"})
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    sent = []
+    class Bridge:
+        def submit_result_bounded(self, message): sent.append(message)
+    assert watcher.session_rollover.request_if_due(Bridge(), True, True) is True
+    assert sent and watcher.state["rolloverInProgress"] is True
+    assert watcher.session_rollover.request_if_due(Bridge(), True, True) is False
+
+
+def test_failed_rollover_preserves_executor_workflow_and_due_state(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,
+                          "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD"})
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    class Bridge:
+        page = _AckPage("https://chatgpt.com/c/OLD")
+        def submit_result_bounded(self, _response): pass
+        def open_fresh_with_handover(self, _response): raise RuntimeError("fresh page unavailable")
+    assert watcher.session_rollover.request_if_due(Bridge(), True, True) is True
+    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.state["state"] == "EXECUTOR_RUNNING"
+    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverInProgress"] is False
+
+
+def test_preempted_rollover_failure_restores_result_recovery_without_executor(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-1", "lastCompletedTaskId": "task-1",
+                          "executorResultPath": watcher.state["executorResultPath"],
+                          "architectDeliveryPayloadHash": payload_hash,
+                          "architectSendState": "AMBIGUOUS",
+                          "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS",
+                          "humanRequiredReason": "ARCHITECT_HANDOVER_RESPONSE_INVALID",
+                          "rolloverPending": True, "rolloverDue": True, "rolloverInProgress": False,
+                          "handoverRequested": True, "nextPromptPath": None, "codexPid": None})
+    watcher.save()
+    assert watcher.recover_preempted_rollover_failure() is True
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
+    assert watcher.state["handoverRequested"] is False
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["architectDeliveryPayloadHash"] == payload_hash
+    assert Path(watcher.state["executorResultPath"]).read_text(encoding="utf-8") == "executor report"
+
+
+def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,
+                          "architectConversationId": "current", "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD"})
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    closed = []
+    class Bridge:
+        page = _AckPage("https://chatgpt.com/c/current")
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def wait_for_new_response(self, *_args, **_kwargs): return {"state": "COMPLETED", "text": "handover"}
+        def close(self): closed.append(True)
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(lambda *_args: Bridge()))
+    monkeypatch.setattr(watcher.session_rollover, "request_if_due", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(watcher, "process_pending_handover_response", lambda *_args: True)
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False) is True
+    assert closed == [True]
 
 
 def test_result_delivery_deferral_resumes_same_bridge_after_generation(tmp_path, monkeypatch):

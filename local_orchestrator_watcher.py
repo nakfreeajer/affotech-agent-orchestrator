@@ -885,11 +885,11 @@ class ArchitectSessionRollover:
         trigger = self.rollover_trigger(memory_bytes, int(self.watcher.state.get("architectResponseCount", 0)))
         if memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES and (previous_memory_bytes is None or previous_memory_bytes < ARCHITECT_MEMORY_THRESHOLD_BYTES):
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_THRESHOLD", self.watcher.state, memoryMiB=memory_mib, thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB, trigger="MEMORY_THRESHOLD")
-        if trigger and not self.watcher.state.get("rolloverPending"):
-            self.watcher.state["rolloverPending"] = True
+        if trigger and not self.watcher.state.get("rolloverDue"):
+            self.watcher.state["rolloverDue"] = True
             self.watcher.state["rolloverTrigger"] = trigger
             self.watcher.save()
-            emit(f"ROLLOVER_PENDING trigger={trigger}")
+            emit(f"ROLLOVER_DUE trigger={trigger}")
         return trigger
 
     @staticmethod
@@ -912,13 +912,28 @@ class ArchitectSessionRollover:
         return True
 
     def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False) -> bool:
+        workflow_state = self.watcher.state.get("state", "IDLE")
+        if workflow_state == "IDLE":
+            if any(self.watcher.state.get(key) for key in ("taskId", "executorResultPath", "architectDeliveryPayloadHash", "handoverRequested")):
+                return False
+        elif workflow_state != "EXECUTOR_RUNNING":
+            return False
+        if workflow_state == "EXECUTOR_RUNNING" and self.watcher.state.get("architectSendState") in {"PENDING", "AMBIGUOUS", "FAILED"}:
+            return False
         count = int(self.watcher.state.get("architectResponseCount", 0))
         memory_bytes = int(self.watcher.state.get("architectMemoryBytes", 0))
         trigger = self.watcher.state.get("rolloverTrigger") or self.rollover_trigger(memory_bytes, count)
         if not trigger:
             return False
+        task_id = str(self.watcher.state.get("taskId") or "")
+        if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id:
+            return False
         if architect_generating or not latest_prompt_dispatched or not executor_running or self.watcher.state.get("handoverRequested"):
             return False
+        if task_id:
+            self.watcher.state["rolloverAttemptedForTaskId"] = task_id
+        self.watcher.state["rolloverDue"] = True
+        self.watcher.state["rolloverInProgress"] = True
         self.watcher.state["rolloverPending"] = True
         self.watcher.state["rolloverTrigger"] = trigger
         self.watcher.state["handoverRequested"] = True
@@ -931,6 +946,11 @@ class ArchitectSessionRollover:
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_REQUESTED", self.watcher.state)
             return True
         except Exception:
+            self.watcher.state["rolloverInProgress"] = False
+            self.watcher.state["handoverRequested"] = False
+            self.watcher.state["handoverReady"] = False
+            self.watcher.state["rolloverDue"] = True
+            self.watcher.save()
             emit("STATE=ROLLOVER_PENDING")
             return False
 
@@ -945,6 +965,11 @@ class ArchitectSessionRollover:
         new_page = None
         committed = False
         phase = "OPEN_FRESH_WITH_HANDOVER"
+        workflow_snapshot = {
+            key: self.watcher.state.get(key)
+            for key in ("state", "taskId", "lastCompletedTaskId", "executorResultPath", "humanRequiredReason", "architectSendState", "architectDeliveryFailureClass")
+        }
+        self.watcher.state["rolloverInProgress"] = True
         try:
             new_page = bridge.open_fresh_with_handover(response)
             phase = "WAIT_NEW_CONVERSATION_ID"
@@ -987,6 +1012,9 @@ class ArchitectSessionRollover:
             self.watcher.state["handoverRequested"] = False
             self.watcher.state["handoverReady"] = False
             self.watcher.state["rolloverPending"] = False
+            self.watcher.state["rolloverDue"] = False
+            self.watcher.state["rolloverInProgress"] = False
+            self.watcher.state.pop("rolloverAttemptedForTaskId", None)
             self.watcher.state.pop("rolloverTrigger", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
@@ -1008,6 +1036,16 @@ class ArchitectSessionRollover:
                     new_page.close()
                 except Exception:
                     pass
+            for key, value in workflow_snapshot.items():
+                if value is None:
+                    self.watcher.state.pop(key, None)
+                else:
+                    self.watcher.state[key] = value
+            self.watcher.state["rolloverInProgress"] = False
+            self.watcher.state["rolloverDue"] = True
+            self.watcher.state["rolloverPending"] = True
+            self.watcher.state["handoverReady"] = False
+            self.watcher.save()
             candidate = str(error)
             code = candidate if re.fullmatch(r"[A-Z0-9_:]+", candidate) else "ARCHITECT_SESSION_ROLLOVER_FAILED"
             error_message = candidate.replace("\r", " ").replace("\n", " ")[:500]
@@ -2771,12 +2809,22 @@ class LocalFirstOrchestrator:
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_HANDOVER_RESPONSE_INVALID", self.state)
 
+    def defer_failed_rollover(self, reason: str = "ARCHITECT_HANDOVER_RESPONSE_INVALID") -> None:
+        """Drop a failed maintenance attempt without changing workflow authority."""
+        self.state.update({"rolloverInProgress": False, "rolloverDue": True, "rolloverPending": True, "handoverRequested": False, "handoverReady": False})
+        self.state.pop("pending_handover", None)
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_FAILED", self.state, reason=reason)
+
     def process_pending_handover_response(self, bridge: Any, response: str) -> bool:
         """Keep pending handover responses out of ordinary task decision parsing."""
         if not self.state.get("handoverRequested"):
             return False
         if self.session_rollover.complete_from_response(bridge, response):
             return True
+        if self.state.get("rolloverInProgress") or (self.state.get("rolloverDue") and self.state.get("rolloverPending")):
+            self.defer_failed_rollover()
+            return False
         self.reject_invalid_handover_response()
         return False
 
@@ -2809,6 +2857,42 @@ class LocalFirstOrchestrator:
         self.state.update({"state": "RESULT_READY", "taskId": task_id, "lastCompletedTaskId": task_id, "executorResultPath": result_path, "humanRequiredReason": None})
         self.save()
         self.deliver_result(bridge)
+        return True
+
+    def recover_preempted_rollover_failure(self) -> bool:
+        """Remove only maintenance contamination from an interrupted result recovery."""
+        task_id = str(self.state.get("taskId") or "")
+        result_path = self.state.get("executorResultPath")
+        try:
+            result_ready = isinstance(result_path, str) and Path(result_path).is_file() and bool(Path(result_path).read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            result_ready = False
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        try:
+            executor_active = bool(active_pid and LocalWatcher.process_alive(int(active_pid))) if active_pid else False
+        except (TypeError, ValueError):
+            executor_active = True
+        if (self.state.get("state") != "HUMAN_REQUIRED"
+                or self.state.get("humanRequiredReason") not in {"ARCHITECT_HANDOVER_RESPONSE_INVALID", "ARCHITECT_NEW_CONVERSATION_ACK_INVALID", "ARCHITECT_NEW_CONVERSATION_ACK_TIMEOUT"}
+                or not task_id or task_id != str(self.state.get("lastCompletedTaskId") or "")
+                or not result_ready or not self.state.get("architectDeliveryPayloadHash")
+                or self.state.get("architectSendState") not in {"PENDING", "FAILED", "AMBIGUOUS"}
+                or self.state.get("nextPromptPath")
+                or (self.state.get("nextTaskId") and self.state.get("nextTaskId") not in {task_id, str(self.state.get("lastCompletedTaskId") or "")})
+                or executor_active):
+            return False
+        self.state.update({
+            "state": "HUMAN_REQUIRED",
+            "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED",
+            "handoverRequested": False,
+            "handoverReady": False,
+            "rolloverInProgress": False,
+            "rolloverDue": True,
+        })
+        self.state.pop("pending_handover", None)
+        self.state["rolloverPending"] = False
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_RECOVERY", self.state, taskId=task_id)
         return True
 
     def _fail_closed_idle_envelope(self, response: str, fingerprint: str | None) -> str:
@@ -3950,6 +4034,41 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
     return watcher.state.get("state", "IDLE")
 
 
+def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool]) -> bool:
+    """Service maintenance once at the live-executor boundary only."""
+    if paused() or watcher.state.get("state") != "EXECUTOR_RUNNING" or not watcher.state.get("rolloverDue"):
+        return False
+    pid = watcher.state.get("codexPid")
+    if not pid or not LocalWatcher.process_alive(int(pid)):
+        return False
+    bridge = None
+    try:
+        conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+        bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+        conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
+        baseline = bridge.assistant_baseline()
+        rollover = watcher.session_rollover
+        if not rollover.request_if_due(bridge, latest_prompt_dispatched=True, executor_running=True, architect_generating=bridge.generation_visible()):
+            return False
+        observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
+        if observed.get("state") != "COMPLETED" or not watcher.process_pending_handover_response(bridge, observed.get("text", "")):
+            if watcher.state.get("rolloverInProgress"):
+                watcher.defer_failed_rollover("ARCHITECT_HANDOVER_RESPONSE_INVALID")
+            return False
+        return True
+    except Exception as error:
+        if watcher.state.get("rolloverInProgress"):
+            watcher.defer_failed_rollover(type(error).__name__)
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_FAILED", watcher.state, errorClass=type(error).__name__)
+        return False
+    finally:
+        if bridge is not None:
+            try:
+                bridge.close()
+            except Exception:
+                pass
+
+
 def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -> bool:
     """Apply task-scoped format recovery from the resident main-loop path."""
     try:
@@ -4095,6 +4214,7 @@ def main() -> None:
             if state == "EXECUTOR_RUNNING":
                 state = run_executor_state_once(watcher, launch)
                 if state == "EXECUTOR_RUNNING":
+                    service_deferred_rollover_once(watcher, endpoint, discussion_paused)
                     continue
                 if state == "STOP":
                     return
@@ -4106,6 +4226,8 @@ def main() -> None:
                 print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
+                if watcher.recover_preempted_rollover_failure():
+                    continue
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
@@ -4177,16 +4299,8 @@ def main() -> None:
             try:
                 if rollover is not None:
                     rollover.sample_memory()
-                if rollover is not None and not discussion_paused() and watcher.state.get("state") in {"ARCHITECT_RUNNING", "RESULT_READY"}:
-                    executor_pid = watcher.state.get("codexPid")
-                    executor_active = bool(executor_pid and LocalWatcher.process_alive(executor_pid))
-                    rollover.request_if_due(
-                        bridge,
-                        latest_prompt_dispatched=bool(watcher.state.get("lastCompletedTaskId") or watcher.state.get("executorResultPath")),
-                        executor_running=not executor_active,
-                        architect_generating=bridge.generation_visible(),
-                    )
-                if watcher.state.get("state") == "RESULT_READY" and not discussion_paused() and not watcher.state.get("handoverRequested"):
+                if (watcher.state.get("state") == "RESULT_READY" and not discussion_paused()
+                        and (not watcher.state.get("handoverRequested", False) or not watcher.state.get("rolloverInProgress", False))):
                     bridge = watcher.deliver_result_with_recovery(
                         lambda: ArchitectPlaywright.attach(endpoint, conversation_id),
                         initial_bridge=bridge,
@@ -4220,7 +4334,7 @@ def main() -> None:
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                         time.sleep(1.0)
                         continue
-                    if watcher.state.get("handoverRequested") and rollover is not None:
+                    if watcher.state.get("handoverRequested") and watcher.state.get("rolloverInProgress") and rollover is not None:
                         if watcher.process_pending_handover_response(bridge, observed["text"]):
                             baseline = bridge.assistant_baseline()
                             if watcher.state.get("state") == "RESULT_READY":
@@ -4232,6 +4346,9 @@ def main() -> None:
                                     print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
                                     return
                                 baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
+                            continue
+                        if not watcher.state.get("handoverRequested"):
+                            baseline = bridge.assistant_baseline()
                             continue
                         watcher.reject_invalid_handover_response()
                         print("STATE=HUMAN_REQUIRED reason=ARCHITECT_HANDOVER_RESPONSE_INVALID")
