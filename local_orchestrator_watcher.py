@@ -36,6 +36,7 @@ VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
 RUNTIME_LOGGER_NAME = "affotech.orchestrator.runtime"
 RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING = "DEFERRED_ARCHITECT_GENERATING"
+ARCHITECT_DELIVERY_PROOF_VERSION = "SHA256_MARKER_V1"
 
 
 def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
@@ -3275,27 +3276,44 @@ class LocalFirstOrchestrator:
                 return True
         return False
 
-    def _exact_result_payload_observed(self, bridge: Any, payload: str) -> bool:
-        probe = getattr(bridge, "exact_user_message_payload_observed", None)
-        if callable(probe):
-            try:
-                return bool(probe(payload))
-            except Exception:
-                return False
+    @staticmethod
+    def _delivery_tokens(text: str) -> list[str]:
+        return re.findall(r"[A-Za-z0-9_]+", text)
+
+    def _result_delivery_wire_payload(self, payload: str, payload_hash: str) -> str:
+        return f"ORCHESTRATOR_DELIVERY_SHA256={payload_hash}\n\n{payload}"
+
+    def _result_payload_proof(self, bridge: Any, payload: str, payload_hash: str | None = None) -> bool:
+        """Prove delivery from a user message, using marker or legacy proof."""
+        expected_hash = payload_hash or hashlib.sha256(payload.encode("utf-8")).hexdigest()
         messages = getattr(bridge, "user_message_texts", None)
         if callable(messages):
             try:
-                return any(normalize_prompt(text) == normalize_prompt(payload) for text in messages())
+                observed_messages = messages()
             except Exception:
-                return False
-        latest = getattr(bridge, "latest_user_message", None)
-        if callable(latest):
+                observed_messages = []
+        else:
+            latest = getattr(bridge, "latest_user_message", None)
             try:
-                observed = latest()
+                observed = latest() if callable(latest) else None
             except Exception:
-                return False
-            return isinstance(observed, str) and normalize_prompt(observed) == normalize_prompt(payload)
-        return False
+                observed = None
+            observed_messages = [observed] if isinstance(observed, str) else []
+        observed_messages = [text for text in observed_messages if isinstance(text, str)]
+        if self.state.get("architectDeliveryProofVersion") == ARCHITECT_DELIVERY_PROOF_VERSION:
+            marker = f"ORCHESTRATOR_DELIVERY_SHA256={expected_hash}"
+            return any(any(line.strip() == marker for line in text.splitlines()) for text in observed_messages)
+        expected_tokens = self._delivery_tokens(payload)
+        expected_token_hash = hashlib.sha256(" ".join(expected_tokens).encode("utf-8")).hexdigest()
+        return any(
+            (tokens := self._delivery_tokens(text)) == expected_tokens
+            and len(tokens) == len(expected_tokens)
+            and hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest() == expected_token_hash
+            for text in observed_messages
+        )
+
+    def _exact_result_payload_observed(self, bridge: Any, payload: str) -> bool:
+        return self._result_payload_proof(bridge, payload)
 
     def _wait_for_exact_result_payload(self, bridge: Any, payload: str, timeout: float = 2.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -3420,8 +3438,6 @@ class LocalFirstOrchestrator:
             return
         ambiguous_history = self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_AMBIGUOUS"
         pre_send_failure = (delivery_state == "FAILED" and self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE")
-        delivery_probe = getattr(bridge, "latest_user_message", None)
-        can_reconcile_delivery = callable(delivery_probe)
         if prior_hash == payload_hash and pre_send_failure:
             if self._exact_result_payload_observed(bridge, payload):
                 baseline = self.state.get("architectDeliveryBaseline")
@@ -3430,23 +3446,8 @@ class LocalFirstOrchestrator:
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
                 self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
                 return
-        elif prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
+        elif prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and ambiguous_history)):
             if self._exact_result_payload_observed(bridge, payload):
-                baseline = self.state.get("architectDeliveryBaseline")
-                self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
-                self.save()
-                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
-                self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
-                return
-            observed = None
-            if can_reconcile_delivery:
-                observed = delivery_probe()
-            if observed is None:
-                self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_DELIVERY_AMBIGUOUS"})
-                self.save()
-                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode="ARCHITECT_DELIVERY_AMBIGUOUS")
-                raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
-            if observed == payload or normalize_prompt(observed) == normalize_prompt(payload):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
@@ -3469,9 +3470,14 @@ class LocalFirstOrchestrator:
             "state": "RESULT_READY",
         })
         self.save()
+        use_receipt = prior_hash != payload_hash or not prior_hash or self.state.get("architectDeliveryProofVersion") == ARCHITECT_DELIVERY_PROOF_VERSION
+        wire_payload = self._result_delivery_wire_payload(payload, payload_hash) if use_receipt else payload
+        if use_receipt:
+            self.state["architectDeliveryProofVersion"] = ARCHITECT_DELIVERY_PROOF_VERSION
+            self.save()
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
         try:
-            sender(payload)
+            sender(wire_payload)
         except Exception as error:
             code = getattr(error, "code", None) or type(error).__name__
             attempted = bool(getattr(bridge, "sendActionAttempted", False)) or bool(getattr(bridge, "last_send_method", None))

@@ -1141,7 +1141,7 @@ def test_result_delivery_deferral_resumes_same_bridge_after_generation(tmp_path,
     result = watcher.deliver_result_with_recovery(lambda: (_ for _ in ()).throw(AssertionError("must retain bridge")), initial_bridge=bridge)
     payload, _payload_hash = watcher._result_delivery_payload()
     assert result is bridge
-    assert sends == [payload]
+    assert sends == [watcher._result_delivery_wire_payload(payload, _payload_hash)]
     assert bridge.wait_called is False
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
     assert watcher.state["architectSendState"] == "CONFIRMED"
@@ -3110,6 +3110,44 @@ def test_architect_user_message_reader_excludes_button_controls():
     page = Page()
     assert ArchitectPlaywright(page).user_message_texts() == ["complete result"]
     assert "cloneNode" in page.script and "button,[role=\"button\"]" in page.script
+
+
+def test_legacy_delivery_token_proof_accepts_markdown_rendering_but_requires_order(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    rendered = "**" + payload.replace("\n", "  \n") + "**"
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(user_messages=[rendered]), payload, payload_hash)
+    tokens = watcher._delivery_tokens(payload)
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(user_messages=[" ".join(tokens[:-1])]), payload, payload_hash) is False
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(user_messages=[" ".join(reversed(tokens))]), payload, payload_hash) is False
+
+
+def test_receipt_marker_is_exact_authority_and_legacy_proof_is_not_used_for_marked_state(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state["architectDeliveryProofVersion"] = watcher_module.ARCHITECT_DELIVERY_PROOF_VERSION
+    marker = f"ORCHESTRATOR_DELIVERY_SHA256={payload_hash}"
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(user_messages=[marker]), payload, payload_hash)
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(user_messages=[payload]), payload, payload_hash) is False
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(assistant=marker), payload, payload_hash) is False
+    assert watcher._result_payload_proof(_DeliveryEvidenceBridge(user_messages=[f"ORCHESTRATOR_DELIVERY_SHA256={'0' * 64}"]), payload, payload_hash) is False
+
+
+def test_fresh_delivery_wire_payload_uses_base_hash_once(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    sent = []
+    class Bridge:
+        def assistant_baseline(self): return _baseline(0, "a" * 64)
+        def user_baseline(self): return _baseline(0, "b" * 64)
+        def submit_result_bounded(self, message): sent.append(message)
+        def user_message_texts(self): return list(sent)
+    watcher.deliver_result(Bridge())
+    expected = watcher._result_delivery_wire_payload(payload, payload_hash)
+    assert sent == [expected]
+    assert sent[0].count(f"ORCHESTRATOR_DELIVERY_SHA256={payload_hash}") == 1
+    assert watcher.state["architectDeliveryPayloadHash"] == payload_hash
+    assert watcher.state["architectDeliveryProofVersion"] == watcher_module.ARCHITECT_DELIVERY_PROOF_VERSION
 
 
 def test_sender_success_without_exact_result_proof_is_ambiguous(tmp_path, monkeypatch):
