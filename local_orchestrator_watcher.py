@@ -1462,6 +1462,27 @@ class ArchitectPlaywright:
         text = messages.nth(count - 1).inner_text() if count else ""
         return {"count": count, "text_hash": hashlib.sha256(text.encode()).hexdigest()}
 
+    def user_message_texts(self) -> list[str]:
+        """Read all user messages without including expandable UI controls."""
+        evaluate = getattr(self.page, "evaluate", None)
+        if evaluate is not None:
+            script = """
+            () => [...document.querySelectorAll('[data-message-author-role="user"]')].map(node => {
+              const clone = node.cloneNode(true);
+              clone.querySelectorAll('button,[role="button"]').forEach(control => control.remove());
+              return clone.innerText || clone.textContent || '';
+            })
+            """
+            result = evaluate(script)
+            if isinstance(result, list):
+                return [item for item in result if isinstance(item, str)]
+        messages = self.page.locator('[data-message-author-role="user"]')
+        return [messages.nth(index).inner_text() for index in range(messages.count())]
+
+    def exact_user_message_payload_observed(self, payload: str) -> bool:
+        target = normalize_prompt(payload)
+        return any(normalize_prompt(text) == target for text in self.user_message_texts())
+
     def control_user_messages(self) -> list[dict[str, str | None]]:
         """Read only user-message identities/text for the remote pause monitor."""
         messages = self.page.locator('[data-message-author-role="user"]')
@@ -3254,6 +3275,37 @@ class LocalFirstOrchestrator:
                 return True
         return False
 
+    def _exact_result_payload_observed(self, bridge: Any, payload: str) -> bool:
+        probe = getattr(bridge, "exact_user_message_payload_observed", None)
+        if callable(probe):
+            try:
+                return bool(probe(payload))
+            except Exception:
+                return False
+        messages = getattr(bridge, "user_message_texts", None)
+        if callable(messages):
+            try:
+                return any(normalize_prompt(text) == normalize_prompt(payload) for text in messages())
+            except Exception:
+                return False
+        latest = getattr(bridge, "latest_user_message", None)
+        if callable(latest):
+            try:
+                observed = latest()
+            except Exception:
+                return False
+            return isinstance(observed, str) and normalize_prompt(observed) == normalize_prompt(payload)
+        return False
+
+    def _wait_for_exact_result_payload(self, bridge: Any, payload: str, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._exact_result_payload_observed(bridge, payload):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
     def clear_confirmed_stale_composer(self, bridge: Any, payload: str, payload_hash: str) -> bool:
         composer = getattr(bridge, "_live_composer", lambda: None)()
         if composer is None:
@@ -3277,12 +3329,65 @@ class LocalFirstOrchestrator:
         if self.state.get("state") != "HUMAN_REQUIRED" or self.state.get("humanRequiredReason") != "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
             return False
         payload, payload_hash = self._result_delivery_payload()
-        if self.state.get("architectDeliveryPayloadHash") != payload_hash or not self._delivery_evidence_advanced(bridge, payload):
+        if self.state.get("architectDeliveryPayloadHash") != payload_hash or not self._exact_result_payload_observed(bridge, payload):
             return False
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectDeliveryFailureClass": None, "architectSendError": None, "humanRequiredReason": None})
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECONCILED", self.state, hash=payload_hash)
         self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
+        return True
+
+    def recover_false_result_reconciliation(self, bridge: Any) -> bool:
+        """Undo only a proven IDLE STOP caused by a false result reconciliation."""
+        task_id = str(self.state.get("taskId") or "")
+        fingerprint = self.state.get("architectResultFingerprint")
+        result_path = self.state.get("executorResultPath")
+        try:
+            result_ready = isinstance(result_path, str) and Path(result_path).is_file() and Path(result_path).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            result_ready = False
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        try:
+            executor_active = bool(active_pid and LocalWatcher.process_alive(int(active_pid))) if active_pid else False
+        except (TypeError, ValueError):
+            executor_active = True
+        consumed = self.state.get("consumedArchitectResponses") or {}
+        record = consumed.get(fingerprint) if isinstance(fingerprint, str) else None
+        if (self.state.get("state") != "IDLE" or not task_id or task_id != str(self.state.get("lastCompletedTaskId") or "")
+                or not result_ready or self.state.get("architectSendState") != "CONFIRMED"
+                or not isinstance(fingerprint, str) or not isinstance(record, dict)
+                or record.get("taskId") != task_id or record.get("action") != "STOP"
+                or self.state.get("nextPromptPath") or self.state.get("nextTaskId") or executor_active):
+            return False
+        payload, payload_hash = self._result_delivery_payload()
+        if self.state.get("architectDeliveryPayloadHash") != payload_hash:
+            return False
+        if self._exact_result_payload_observed(bridge, payload):
+            return False
+        messages = getattr(bridge, "user_message_texts", None)
+        if not callable(messages):
+            return False
+        task_marker = f"previous response for task {task_id}"
+        try:
+            current_messages = messages()
+        except Exception:
+            return False
+        recovery_present = any(isinstance(text, str) and task_marker in text and "Return only the machine-readable envelope" in text for text in current_messages)
+        if not recovery_present:
+            return False
+        self.state.update({
+            "state": "RESULT_READY", "architectSendState": "FAILED",
+            "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_PRE_SEND_FAILURE",
+            "humanRequiredReason": None, "architectResultFingerprint": None,
+            "formatRecoveryCount": 0, "formatRecoveryExhausted": False,
+            "architectFormatRecoveryTaskId": None, "architectBaseline": None,
+        })
+        consumed.pop(fingerprint, None)
+        if self.state.get("documentationClosureFingerprint") == fingerprint:
+            self.state["documentationClosureFingerprint"] = None
+            self.state["documentationClosureCompletedTaskId"] = None
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "FALSE_RESULT_RECONCILIATION_RECOVERED", self.state, taskId=task_id, payloadHash=payload_hash, invalidArchitectResultFingerprint=fingerprint, exactPayloadObserved=False)
         return True
 
     def deliver_result(self, bridge: Any) -> str | None:
@@ -3303,6 +3408,10 @@ class LocalFirstOrchestrator:
         prior_hash = self.state.get("architectDeliveryPayloadHash")
         delivery_state = self.state.get("architectSendState")
         if prior_hash == payload_hash and delivery_state == "CONFIRMED":
+            if not self._exact_result_payload_observed(bridge, payload):
+                self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
+                self.save()
+                raise ResultSubmissionError("ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED")
             self.state.update({"state": "ARCHITECT_RUNNING", "architectResultFingerprint": None})
             self.save()
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash, disposition="ALREADY_DELIVERED")
@@ -3312,7 +3421,7 @@ class LocalFirstOrchestrator:
         delivery_probe = getattr(bridge, "latest_user_message", None)
         can_reconcile_delivery = callable(delivery_probe)
         if prior_hash == payload_hash and pre_send_failure:
-            if self._delivery_evidence_advanced(bridge, payload):
+            if self._exact_result_payload_observed(bridge, payload):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
@@ -3320,7 +3429,7 @@ class LocalFirstOrchestrator:
                 self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
                 return
         elif prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and (ambiguous_history or can_reconcile_delivery))):
-            if self._delivery_evidence_advanced(bridge, payload):
+            if self._exact_result_payload_observed(bridge, payload):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
@@ -3373,6 +3482,11 @@ class LocalFirstOrchestrator:
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode=code, failureClass=failure_class, attempt=self.state.get("architectTransportRecoveryCount"))
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_FAILED", self.state, errorClass=code, failureClass=failure_class)
             raise
+        if not self._wait_for_exact_result_payload(bridge, payload):
+            self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode="ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED")
+            raise ResultSubmissionError("ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED")
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash)
@@ -3420,6 +3534,13 @@ class LocalFirstOrchestrator:
         """Request one machine-readable envelope without replaying the result."""
         if self.discussion_pause_active():
             return
+        if (self.state.get("state") == "RESULT_READY" or self.state.get("architectDeliveryPayloadHash")
+                and self.state.get("architectSendState") in {"PENDING", "FAILED", "AMBIGUOUS"}):
+            raise RuntimeError("RESULT_DELIVERY_NOT_CONFIRMED")
+        if self.state.get("architectDeliveryPayloadHash"):
+            payload, payload_hash = self._result_delivery_payload()
+            if payload_hash != self.state.get("architectDeliveryPayloadHash") or not self._exact_result_payload_observed(bridge, payload):
+                raise RuntimeError("RESULT_DELIVERY_NOT_CONFIRMED")
         task_id = str(self.state["taskId"])
         self._reset_format_recovery_for_task(task_id)
         if int(self.state.get("formatRecoveryCount", 0)) >= 1:
@@ -3947,6 +4068,11 @@ def main() -> None:
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                         raise
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
+                recover_false = getattr(watcher, "recover_false_result_reconciliation", None)
+                if callable(recover_false) and recover_false(idle_bridge):
+                    idle_bridge.close()
+                    idle_bridge = None
+                    continue
                 try:
                     watcher.inspect_idle_architect(idle_bridge, launch)
                 except Exception:

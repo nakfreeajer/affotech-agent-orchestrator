@@ -694,7 +694,7 @@ def test_result_delivery_pre_send_failure_is_persisted_and_restart_retries_witho
             raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", "TimeoutError")
     with pytest.raises(ResultSubmissionError):
         watcher.deliver_result(FailedBridge())
-    assert watcher.state["state"] == "RESULT_READY"
+        assert watcher.state["state"] == "RESULT_READY"
     assert watcher.state["architectDeliveryFailureClass"] == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
     assert Path(watcher.state["executorResultPath"]).read_bytes() == payload
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
@@ -702,6 +702,7 @@ def test_result_delivery_pre_send_failure_is_persisted_and_restart_retries_witho
     class HealthyBridge:
         def assistant_baseline(self): return {"count": 3, "entries": []}
         def submit_result_bounded(self, message): sends.append(message)
+        def latest_user_message(self): return sends[-1] if sends else None
     restarted.deliver_result(HealthyBridge())
     assert len(sends) == 1
     assert not restarted.state.get("executorLaunchCount", 0)
@@ -753,6 +754,7 @@ def test_confirmed_identical_result_delivery_is_terminally_idempotent(tmp_path):
     class Bridge:
         def assistant_baseline(self): return {"count": 1, "entries": []}
         def submit_result_bounded(self, message): sent.append(message)
+        def latest_user_message(self): return sent[-1] if sent else None
     watcher.deliver_result(Bridge())
     watcher.state["state"] = "RESULT_READY"
     watcher.save()
@@ -1127,6 +1129,7 @@ def test_result_delivery_deferral_resumes_same_bridge_after_generation(tmp_path,
         def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
         def user_baseline(self): return {"count": 0, "text_hash": "baseline"}
         def submit_result_bounded(self, payload): sends.append(payload)
+        def latest_user_message(self): return sends[-1] if sends else None
         def wait_for_new_response(self, *_args, **_kwargs):
             self.wait_called = True
             raise AssertionError("decision wait is not part of delivery")
@@ -1159,6 +1162,7 @@ def test_exact_unsent_payload_is_replaced_and_sent_once(tmp_path):
         def assistant_baseline(self): return {"count": 1, "text_hash": "baseline"}
         def _live_composer(self): return page_bridge._live_composer()
         def submit_result_bounded(self, value): return page_bridge.submit_result_bounded(value, timeout=1)
+        def latest_user_message(self): return page.sent[-1] if page.sent else None
     watcher.deliver_result(Bridge())
     assert page.sent == [payload]
     assert watcher.state["architectSendState"] == "CONFIRMED"
@@ -1191,6 +1195,7 @@ def test_same_payload_pre_send_failure_is_retryable_and_confirms_delivery(tmp_pa
         def generation_visible(self): return False
         def assistant_baseline(self): return {"count": 1, "text_hash": "baseline"}
         def submit_result_bounded(self, value): sends.append(value)
+        def latest_user_message(self): return sends[-1] if sends else None
     watcher.deliver_result(Bridge())
     assert sends == [payload]
     assert watcher.state["architectSendState"] == "CONFIRMED"
@@ -2332,6 +2337,7 @@ def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeyp
     class Bridge:
         def submit_result_bounded(self, message): messages.append(message)
         def assistant_baseline(self): return {"count": 1, "entries": []}
+        def latest_user_message(self): return messages[-1] if messages else None
     watcher.deliver_result(Bridge())
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
     assert messages
@@ -2350,6 +2356,7 @@ def test_authorized_child_success_reaches_result_and_architect(tmp_path, monkeyp
     class SecondBridge:
         def submit_result_bounded(self, message): second_messages.append(message)
         def assistant_baseline(self): return {"count": 2, "entries": []}
+        def latest_user_message(self): return second_messages[-1] if second_messages else None
     watcher.deliver_result(SecondBridge())
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
     assert second_messages
@@ -3027,11 +3034,12 @@ def test_runtime_logging_attach_failure_uses_actual_failure_event(tmp_path):
 
 
 class _DeliveryEvidenceBridge:
-    def __init__(self, *, user=None, assistant=None, generating=False, latest=None):
+    def __init__(self, *, user=None, assistant=None, generating=False, latest=None, user_messages=None):
         self._user = user
         self._assistant = assistant
         self._generating = generating
         self._latest = latest
+        self._user_messages = user_messages
 
     def user_baseline(self):
         return self._user
@@ -3044,6 +3052,9 @@ class _DeliveryEvidenceBridge:
 
     def latest_user_message(self):
         return self._latest
+
+    def user_message_texts(self):
+        return list(self._user_messages or [])
 
 
 def _baseline(count, text_hash):
@@ -3073,7 +3084,102 @@ def test_delivery_missing_baselines_without_independent_evidence_fails_closed(tm
     assert watcher._delivery_evidence_advanced(bridge, payload) is False
 
 
-def test_legacy_task_000023_reconciles_from_assistant_baseline_only(tmp_path):
+def test_strict_result_proof_rejects_advanced_assistant_user_and_generation_evidence(tmp_path):
+    watcher = ready(tmp_path)
+    payload, _payload_hash = watcher._result_delivery_payload()
+    assert watcher._exact_result_payload_observed(_DeliveryEvidenceBridge(assistant=_baseline(3, "b" * 64)), payload) is False
+    assert watcher._exact_result_payload_observed(_DeliveryEvidenceBridge(user=_baseline(3, "b" * 64)), payload) is False
+    assert watcher._exact_result_payload_observed(_DeliveryEvidenceBridge(generating=True), payload) is False
+    assert watcher._exact_result_payload_observed(_DeliveryEvidenceBridge(user_messages=["unrelated handover response"]), payload) is False
+
+
+def test_strict_result_proof_inspects_all_user_messages_and_normalizes_controls(tmp_path):
+    watcher = ready(tmp_path)
+    payload, _payload_hash = watcher._result_delivery_payload()
+    later_recovery = "Your previous response for task task-1 was received successfully. Return only the machine-readable envelope."
+    bridge = _DeliveryEvidenceBridge(user_messages=[payload, later_recovery])
+    assert watcher._exact_result_payload_observed(bridge, payload) is True
+
+
+def test_architect_user_message_reader_excludes_button_controls():
+    class Page:
+        def __init__(self): self.script = ""
+        def evaluate(self, script):
+            self.script = script
+            return ["complete result"]
+    page = Page()
+    assert ArchitectPlaywright(page).user_message_texts() == ["complete result"]
+    assert "cloneNode" in page.script and "button,[role=\"button\"]" in page.script
+
+
+def test_sender_success_without_exact_result_proof_is_ambiguous(tmp_path, monkeypatch):
+    watcher = ready(tmp_path)
+    sent = []
+    class Bridge:
+        def assistant_baseline(self): return _baseline(0, "a" * 64)
+        def user_baseline(self): return _baseline(0, "b" * 64)
+        def submit_result_bounded(self, message): sent.append(message)
+        def latest_user_message(self): return "unrelated message"
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(watcher_module.time, "monotonic", iter([0, 3]).__next__)
+    with pytest.raises(ResultSubmissionError, match="ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED"):
+        watcher.deliver_result(Bridge())
+    assert len(sent) == 1
+    assert watcher.state["architectSendState"] == "AMBIGUOUS"
+    assert watcher.state["state"] == "RESULT_READY"
+
+
+def test_false_result_reconciliation_recovery_restores_only_proven_corruption(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    invalid = "invalid-stop-fingerprint"
+    format_request = "Your previous response for task task-1 was received successfully but did not contain a valid ORCHESTRATOR_RESULT envelope. Return only the machine-readable envelope."
+    watcher.state.update({
+        "state": "IDLE", "lastCompletedTaskId": "task-1", "architectDeliveryPayloadHash": payload_hash,
+        "architectSendState": "CONFIRMED", "architectResultFingerprint": invalid,
+        "consumedArchitectResponses": {invalid: {"taskId": "task-1", "action": "STOP"}},
+        "nextPromptPath": None, "nextTaskId": None, "documentationClosureFingerprint": invalid,
+        "documentationClosureCompletedTaskId": "task-1",
+    })
+    watcher.save()
+    bridge = _DeliveryEvidenceBridge(user_messages=[format_request])
+    assert watcher.recover_false_result_reconciliation(bridge) is True
+    assert watcher.state["state"] == "RESULT_READY"
+    assert watcher.state["architectSendState"] == "FAILED"
+    assert watcher.state["architectDeliveryFailureClass"] == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+    assert watcher.state["architectDeliveryPayloadHash"] == payload_hash
+    assert watcher.state["taskId"] == watcher.state["lastCompletedTaskId"] == "task-1"
+    assert watcher.state["architectResultFingerprint"] is None
+    assert invalid not in watcher.state["consumedArchitectResponses"]
+    assert watcher.state["documentationClosureFingerprint"] is None
+    assert watcher.state["documentationClosureCompletedTaskId"] is None
+
+
+def test_false_result_reconciliation_preserves_legitimate_stop_when_payload_exists(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    invalid = "legitimate-stop"
+    request = "Your previous response for task task-1 was received successfully. Return only the machine-readable envelope."
+    watcher.state.update({"state": "IDLE", "lastCompletedTaskId": "task-1", "architectDeliveryPayloadHash": payload_hash,
+                          "architectSendState": "CONFIRMED", "architectResultFingerprint": invalid,
+                          "consumedArchitectResponses": {invalid: {"taskId": "task-1", "action": "STOP"}}})
+    watcher.save()
+    assert watcher.recover_false_result_reconciliation(_DeliveryEvidenceBridge(user_messages=[payload, request])) is False
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state["architectResultFingerprint"] == invalid
+
+
+def test_false_result_reconciliation_rejects_unrelated_idle_stop(tmp_path):
+    watcher = ready(tmp_path)
+    _payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"state": "IDLE", "lastCompletedTaskId": "other", "architectDeliveryPayloadHash": payload_hash,
+                          "architectSendState": "CONFIRMED", "architectResultFingerprint": "stop",
+                          "consumedArchitectResponses": {"stop": {"taskId": "different", "action": "STOP"}}})
+    watcher.save()
+    assert watcher.recover_false_result_reconciliation(_DeliveryEvidenceBridge(user_messages=["Return only the machine-readable envelope."])) is False
+
+
+def test_legacy_task_000023_assistant_baseline_alone_cannot_reconcile(tmp_path):
     watcher = ready(tmp_path)
     watcher.state["taskId"] = "000023"
     payload, payload_hash = watcher._result_delivery_payload()
@@ -3085,8 +3191,8 @@ def test_legacy_task_000023_reconciles_from_assistant_baseline_only(tmp_path):
         "architectDeliveryUserBaseline": None,
     })
     bridge = _DeliveryEvidenceBridge(assistant=_baseline(3, "b" * 64))
-    assert watcher.reconcile_exhausted_result_delivery(bridge) is True
-    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.reconcile_exhausted_result_delivery(bridge) is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
 
 
 def test_legacy_task_000023_unchanged_assistant_baseline_remains_human_required(tmp_path):
@@ -3192,7 +3298,7 @@ def test_exhausted_delivery_reconciliation_clears_stale_reason(tmp_path):
     watcher.state["taskId"] = "000023"
     payload, payload_hash = watcher._result_delivery_payload()
     watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED", "architectDeliveryPayloadHash": payload_hash, "architectDeliveryBaseline": _baseline(1, "a" * 64)})
-    assert watcher.reconcile_exhausted_result_delivery(_DeliveryEvidenceBridge(assistant=_baseline(2, "b" * 64))) is True
+    assert watcher.reconcile_exhausted_result_delivery(_DeliveryEvidenceBridge(assistant=_baseline(2, "b" * 64), user_messages=[payload])) is True
     assert watcher.state["humanRequiredReason"] is None
 
 
@@ -3315,6 +3421,7 @@ def test_discussion_resume_restores_normal_result_delivery_eligibility(tmp_path)
         def assistant_baseline(self): return {"count": 1, "text_hash": "a" * 64}
         def user_baseline(self): return {"count": 1, "text_hash": "b" * 64}
         def submit_result_bounded(self, message): sent.append(message)
+        def latest_user_message(self): return sent[-1] if sent else None
     watcher.deliver_result(Bridge())
     assert len(sent) == 1
 
@@ -3531,6 +3638,7 @@ def test_result_review_instruction_advertises_documentation_disposition(tmp_path
         def assistant_baseline(self): return {"count": 0, "text_hash": "a" * 64}
         def user_baseline(self): return {"count": 0, "text_hash": "b" * 64}
         def submit_result_bounded(self, message): messages.append(message)
+        def latest_user_message(self): return messages[-1] if messages else None
     watcher.deliver_result(Bridge())
     message = messages[0]
     assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
@@ -3560,6 +3668,7 @@ def test_format_recovery_instruction_preserves_documentation_disposition(tmp_pat
     class Bridge:
         def submit_result_bounded(self, message): messages.append(message)
         def assistant_baseline(self): return {"count": 1, "text_hash": "a" * 64}
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED"})
     watcher.state.update({"taskId": "task-1", "documentationClosurePending": True})
     watcher.request_format_recovery(Bridge())
     message = messages[0]
@@ -3575,10 +3684,13 @@ def test_all_production_documentation_schema_prompts_advertise_all_values(tmp_pa
         def assistant_baseline(self): return {"count": 0, "text_hash": "a" * 64}
         def user_baseline(self): return {"count": 0, "text_hash": "b" * 64}
         def submit_result_bounded(self, message): captured.append(message)
+        def latest_user_message(self): return captured[-1] if captured else None
+        def user_message_texts(self): return list(captured)
     watcher.deliver_result(Bridge())
     watcher.state.update({"state": "IDLE", "continuationSourceFingerprint": "next-source"})
     watcher.request_architect_bootstrap(Bridge())
     watcher.state.update({"taskId": "task-1", "formatRecoveryCount": 0})
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED"})
     watcher.request_format_recovery(Bridge())
     assert len(captured) == 3
     for message in captured:
