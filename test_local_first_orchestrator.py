@@ -1231,6 +1231,35 @@ def test_preempted_rollover_confirmed_recovery_allows_normal_execute_envelope(tm
     assert watcher.state["nextTaskId"] == "000001"
 
 
+def test_fact_based_confirmed_human_recovery_preserves_result_and_stages_once(tmp_path, monkeypatch):
+    watcher, base, _worktree = recovery_fixture(tmp_path)
+    result = Path(watcher.state["executorResultPath"])
+    result.write_text("completed result", encoding="utf-8")
+    _payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED",
+                          "taskId": "recovery-safety-task", "lastCompletedTaskId": "recovery-safety-task",
+                          "nextTaskId": "recovery-safety-task", "nextPromptPath": None,
+                          "architectDeliveryPayloadHash": payload_hash, "architectSendState": "CONFIRMED",
+                          "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": True,
+                          "handoverRequested": True, "pending_handover": "stale", "codexPid": 7348})
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    assert watcher.recover_completed_confirmed_workflow() is True
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert watcher.state["architectDeliveryPayloadHash"] == payload_hash
+    assert watcher.state["executorResultPath"] == str(result)
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverPending"] is False
+    assert "pending_handover" not in watcher.state
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    decision = watcher.accept_architect_response(envelope("recovery-safety-task", prompt=configured_project_prompt(base, head, "next-task")))
+    assert decision["action"] == "EXECUTE"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000001"
+
+
 def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,

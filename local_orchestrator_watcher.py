@@ -2896,6 +2896,35 @@ class LocalFirstOrchestrator:
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_RECOVERY", self.state, taskId=task_id)
         return True
 
+    def recover_completed_confirmed_workflow(self) -> bool:
+        """Restore a completed result workflow from durable facts, independent of its old error label."""
+        task_id = str(self.state.get("taskId") or "")
+        result_path = self.state.get("executorResultPath")
+        try:
+            result_ready = isinstance(result_path, str) and Path(result_path).is_file() and bool(Path(result_path).read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            result_ready = False
+        active_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        try:
+            executor_active = bool(active_pid and LocalWatcher.process_alive(int(active_pid))) if active_pid else False
+        except (TypeError, ValueError):
+            executor_active = True
+        if (self.state.get("state") != "HUMAN_REQUIRED" or not task_id
+                or task_id != str(self.state.get("lastCompletedTaskId") or "")
+                or not result_ready or not self.state.get("architectDeliveryPayloadHash")
+                or self.state.get("architectSendState") != "CONFIRMED"
+                or self.state.get("nextPromptPath")
+                or (self.state.get("nextTaskId") and self.state.get("nextTaskId") not in {task_id, str(self.state.get("lastCompletedTaskId") or "")})
+                or executor_active):
+            return False
+        self.state.update({"state": "ARCHITECT_RUNNING", "humanRequiredReason": None,
+                           "handoverRequested": False, "handoverReady": False,
+                           "rolloverInProgress": False, "rolloverPending": False})
+        self.state.pop("pending_handover", None)
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "COMPLETED_CONFIRMED_WORKFLOW_RECOVERED", self.state, taskId=task_id)
+        return True
+
     def _fail_closed_idle_envelope(self, response: str, fingerprint: str | None) -> str:
         self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ENVELOPE_INVALID"})
         self.save()
@@ -4227,6 +4256,8 @@ def main() -> None:
                 print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
+                if watcher.recover_completed_confirmed_workflow():
+                    continue
                 if watcher.recover_preempted_rollover_failure():
                     continue
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED":
