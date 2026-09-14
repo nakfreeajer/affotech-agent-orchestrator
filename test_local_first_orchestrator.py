@@ -3498,6 +3498,40 @@ def test_architect_human_required_replaces_stale_transport_reason(tmp_path):
     assert watcher.reconcile_exhausted_result_delivery(_DeliveryEvidenceBridge(generating=True)) is False
 
 
+def test_human_decision_wait_accepts_discussion_without_format_recovery(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state["state"] = "ARCHITECT_RUNNING"
+    watcher.accept_architect_response(envelope("task-1", action="HUMAN_REQUIRED", documentation="COMPLETE"))
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    baseline = {"count": 3, "text_hash": "discussion"}
+    assert watcher_module.resident_human_decision_response(watcher, "Rony's decision is being discussed...", baseline) == "DISCUSSION"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_DECISION_HUMAN_REQUIRED"
+    assert watcher.state["architectBaseline"] == baseline
+
+
+def test_human_decision_wait_repeated_human_and_later_execute_stage_normally(tmp_path):
+    watcher, base, _worktree = recovery_fixture(tmp_path)
+    result = Path(watcher.state["executorResultPath"])
+    result.write_text("completed", encoding="utf-8")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "recovery-safety-task",
+                          "lastCompletedTaskId": "recovery-safety-task"})
+    first = envelope("recovery-safety-task", action="HUMAN_REQUIRED", documentation="COMPLETE")
+    assert watcher.accept_architect_response(first)["action"] == "HUMAN_REQUIRED"
+    assert watcher_module.resident_human_decision_response(watcher, first, {"count": 1, "text_hash": "a"}) == "DUPLICATE"
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    execute = envelope("recovery-safety-task", prompt=configured_project_prompt(base, head, "next bounded work"), documentation="COMPLETE")
+    assert watcher_module.resident_human_decision_response(watcher, execute, {"count": 2, "text_hash": "b"}) == "EXECUTE"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000001"
+
+
+def test_run_executor_state_keeps_architect_human_decision_resident(tmp_path):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})
+    assert run_executor_state_once(watcher, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "HUMAN_REQUIRED"
+
+
 def test_architect_execute_clears_stale_transport_reason(tmp_path):
     watcher, base, _ = recovery_fixture(tmp_path)
     watcher.state.update({"taskId": "000021", "taskSequence": 21, "state": "ARCHITECT_RUNNING", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"})

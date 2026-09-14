@@ -4053,6 +4053,8 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
         else:
             return state
     if watcher.state.get("state") == "HUMAN_REQUIRED":
+        if watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
+            return "HUMAN_REQUIRED"
         recovered = watcher.recover_prelaunch_incomplete(launch)
         if recovered is not None:
             return "NEXT_PROMPT_READY"
@@ -4062,6 +4064,25 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
         print("STATE=HUMAN_REQUIRED")
         return "STOP"
     return watcher.state.get("state", "IDLE")
+
+
+def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: str, baseline: dict[str, Any] | None = None) -> str:
+    """Consume one response while waiting for a business decision."""
+    if "<ORCHESTRATOR_RESULT>" not in response:
+        if isinstance(baseline, dict):
+            watcher.state["architectBaseline"] = baseline
+            watcher.save()
+        return "DISCUSSION"
+    try:
+        decision = watcher.accept_architect_response(response)
+    except (ValueError, RuntimeError):
+        watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})
+        watcher.save()
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_HUMAN_DECISION_RESPONSE_INVALID", watcher.state)
+        return "INVALID"
+    watcher.state["architectBaseline"] = baseline if isinstance(baseline, dict) else watcher.state.get("architectBaseline")
+    watcher.save()
+    return str(decision.get("action") or "")
 
 
 def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool]) -> bool:
@@ -4184,6 +4205,7 @@ def main() -> None:
         if not remote_monitor.start():
             print("REMOTE CONTROL UNAVAILABLE; F9/F10 remain available")
     idle_bridge = None
+    human_wait_bridge = None
     last_logged_state = recovery_state
     stop_logged = False
     pause_notice = None
@@ -4193,6 +4215,12 @@ def main() -> None:
             if rollover is not None:
                 rollover.sample_memory()
             state = watcher.state.get("state", "IDLE")
+            if state != "HUMAN_REQUIRED" and human_wait_bridge is not None:
+                try:
+                    human_wait_bridge.close()
+                except Exception:
+                    pass
+                human_wait_bridge = None
             if state != last_logged_state:
                 runtime_log(logger, run_id, "STATE_TRANSITION", watcher.state, **{"from": last_logged_state, "to": state, "reason": watcher.state.get("humanRequiredReason")})
                 last_logged_state = state
@@ -4256,6 +4284,48 @@ def main() -> None:
                 print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
                 continue
             if state == "HUMAN_REQUIRED":
+                if watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
+                    conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+                    if human_wait_bridge is None:
+                        try:
+                            human_wait_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                            conversation_id = canonicalize_attached_architect_conversation(watcher, human_wait_bridge, conversation_id)
+                            runtime_log(logger, run_id, "ARCHITECT_HUMAN_WAIT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
+                        except Exception as error:
+                            if human_wait_bridge is not None:
+                                try:
+                                    human_wait_bridge.close()
+                                except Exception:
+                                    pass
+                                human_wait_bridge = None
+                            runtime_log(logger, run_id, "ARCHITECT_HUMAN_WAIT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
+                            time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                            watcher.state = watcher._load_state()
+                            continue
+                    baseline = watcher.state.get("architectBaseline")
+                    if not isinstance(baseline, dict):
+                        baseline = human_wait_bridge.assistant_baseline()
+                    try:
+                        observed = human_wait_bridge.wait_for_new_response(baseline, poll_interval=1.0)
+                    except Exception as error:
+                        try:
+                            human_wait_bridge.close()
+                        except Exception:
+                            pass
+                        human_wait_bridge = None
+                        runtime_log(logger, run_id, "ARCHITECT_HUMAN_WAIT_READ_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error))
+                        time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                        watcher.state = watcher._load_state()
+                        continue
+                    response = str(observed.get("text") or "")
+                    disposition = resident_human_decision_response(watcher, response, human_wait_bridge.assistant_baseline())
+                    if disposition in {"EXECUTE", "STOP"}:
+                        try:
+                            human_wait_bridge.close()
+                        except Exception:
+                            pass
+                        human_wait_bridge = None
+                    continue
                 if watcher.recover_completed_confirmed_workflow():
                     continue
                 if watcher.recover_preempted_rollover_failure():
@@ -4401,6 +4471,11 @@ def main() -> None:
                     if decision == "EXECUTE":
                         break
                     if not isinstance(decision, dict) or decision.get("action") != "EXECUTE":
+                        if watcher.state.get("state") in {"HUMAN_REQUIRED", "IDLE"}:
+                            if watcher.state.get("state") == "HUMAN_REQUIRED":
+                                watcher.state["architectBaseline"] = bridge.assistant_baseline()
+                                watcher.save()
+                            break
                         print(f"STATE={watcher.state['state']}")
                         return
                     break
