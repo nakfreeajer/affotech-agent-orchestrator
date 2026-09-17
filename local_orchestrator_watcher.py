@@ -934,8 +934,25 @@ class ArchitectSessionRollover:
         task_id = str(self.watcher.state.get("taskId") or "")
         if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id:
             return False
-        if architect_generating or not latest_prompt_dispatched or not executor_running or self.watcher.state.get("handoverRequested"):
+        if architect_generating or not latest_prompt_dispatched or self.watcher.state.get("handoverRequested"):
             return False
+        if boundary_state in {"IDLE", "EXECUTOR_RUNNING"}:
+            if not executor_running:
+                return False
+        elif boundary_state == "NEXT_PROMPT_READY":
+            # NEXT_PROMPT_READY is the pre-dispatch maintenance boundary: the
+            # staged task is authoritative, but it has not acquired an
+            # Executor yet.  Reject a live owner here as well as in the
+            # service gate so direct callers cannot bypass the boundary.
+            if executor_running:
+                return False
+            codex_pid = self.watcher.state.get("codexPid") or self.watcher.state.get("active_codex_pid")
+            if codex_pid:
+                try:
+                    if LocalWatcher.process_alive(int(codex_pid)):
+                        return False
+                except (TypeError, ValueError):
+                    return False
         if task_id:
             self.watcher.state["rolloverAttemptedForTaskId"] = task_id
         self.watcher.state["rolloverDue"] = True
@@ -4096,7 +4113,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     boundary_state = safe_boundary_state or watcher.state.get("state")
     if paused() or boundary_state not in {"EXECUTOR_RUNNING", "NEXT_PROMPT_READY"} or watcher.state.get("state") != boundary_state or not watcher.state.get("rolloverDue"):
         return False
-    pid = watcher.state.get("codexPid")
+    pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if boundary_state == "EXECUTOR_RUNNING" and (not pid or not LocalWatcher.process_alive(int(pid))):
         return False
     if boundary_state == "NEXT_PROMPT_READY" and pid and LocalWatcher.process_alive(int(pid)):

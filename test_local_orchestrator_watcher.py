@@ -543,6 +543,64 @@ def test_architect_rollover_requires_running_executor_and_dedupes_events(tmp_pat
     assert bridge.calls == 1
 
 
+def test_architect_rollover_accepts_next_prompt_ready_without_executor(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    prompt = tmp_path / "next-prompt.txt"
+    prompt.write_text("next bounded task", encoding="utf-8")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY",
+        "taskId": "task-1",
+        "nextTaskId": "task-2",
+        "nextPromptPath": str(prompt),
+        "rolloverDue": True,
+        "rolloverTrigger": "MEMORY_THRESHOLD",
+        "architectConversationId": "current",
+        "codexPid": None,
+    })
+    rollover = ArchitectSessionRollover(watcher)
+    class Bridge:
+        def __init__(self): self.calls = 0
+        def submit_result_bounded(self, value): self.calls += 1
+    bridge = Bridge()
+    assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
+    assert bridge.calls == 1
+    assert watcher.state["handoverRequested"] is True
+
+
+def test_next_prompt_ready_rollover_rejects_live_codex_and_invalid_staging(tmp_path, monkeypatch):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+
+    def make_watcher(prompt_path, next_task="task-2", pid=None):
+        watcher = LocalWatcher(str(tmp_path), tmp_path / ("state-" + str(next_task) + ".json"), runner=object())
+        watcher.state.update({
+            "state": "NEXT_PROMPT_READY",
+            "taskId": "task-1",
+            "nextTaskId": next_task,
+            "nextPromptPath": str(prompt_path) if prompt_path is not None else None,
+            "rolloverDue": True,
+            "rolloverTrigger": "MEMORY_THRESHOLD",
+            "codexPid": pid,
+        })
+        return watcher
+
+    prompt = tmp_path / "valid-prompt.txt"
+    prompt.write_text("next bounded task", encoding="utf-8")
+    class Bridge:
+        def submit_result_bounded(self, value): raise AssertionError("must not submit")
+
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    live = make_watcher(prompt, pid=123)
+    assert not ArchitectSessionRollover(live).request_if_due(Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY")
+
+    missing_task = make_watcher(prompt, next_task=None)
+    assert not ArchitectSessionRollover(missing_task).request_if_due(Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY")
+    missing_prompt = make_watcher(tmp_path / "does-not-exist.txt")
+    assert not ArchitectSessionRollover(missing_prompt).request_if_due(Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY")
+    generating = make_watcher(prompt)
+    assert not ArchitectSessionRollover(generating).request_if_due(Bridge(), True, False, architect_generating=True, safe_boundary_state="NEXT_PROMPT_READY")
+
+
 def test_architect_memory_tree_aggregates_only_owned_root_and_descendants():
     from local_orchestrator_watcher import architect_process_tree_memory_bytes
     rows = [
