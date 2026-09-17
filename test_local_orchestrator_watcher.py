@@ -843,7 +843,7 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
         def __init__(self, url): self.url = url; self.closed = False
         def close(self): self.closed = True
         def evaluate(self, script):
-            return False if "stop-button" in script else [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}]
+                return False if "stop-button" in script else [{"id": "ack", "text": "ARCHITECT_SESSION_READY"}]
     old = Page("https://chatgpt.com/c/OLD"); new = Page("https://chatgpt.com/c/NEW")
     class Bridge:
         page = old
@@ -870,7 +870,7 @@ def test_rollover_identity_is_the_next_resident_attach_target(tmp_path):
         def __init__(self, url): self.url = url; self.closed = False
         def close(self): self.closed = True
         def evaluate(self, script):
-            return False if "stop-button" in script else [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}]
+                return False if "stop-button" in script else [{"id": "ack", "text": "ARCHITECT_SESSION_READY"}]
 
     old = Page("https://chatgpt.com/c/OLD")
     new = Page("https://chatgpt.com/c/NEW")

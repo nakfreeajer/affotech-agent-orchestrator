@@ -795,7 +795,7 @@ class _RolloverPage:
     def evaluate(self, script):
         if "stop-button" in script:
             return False
-        return [{"id": "ack", "text": "ARCHITECT_HANDOVER_READY"}]
+        return [{"id": "ack", "text": "ARCHITECT_SESSION_READY"}]
 
 
 class _AckPage(_RolloverPage):
@@ -818,7 +818,7 @@ class _AckPage(_RolloverPage):
 class _ChangingAckPage:
     def __init__(self, urls, entries=None, generating=False):
         self.urls = iter(urls)
-        self.entries = entries or [{"id": "ack", "text": "ARCHITECT_HANDOVER_READY"}]
+        self.entries = entries or [{"id": "ack", "text": "ARCHITECT_SESSION_READY"}]
         self.generating = generating
         self.closed = False
 
@@ -1074,7 +1074,7 @@ def test_new_architect_handover_ack_must_finish_before_delivery_ready(tmp_path):
     watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
     watcher.save()
     old_page = _AckPage("https://chatgpt.com/c/OLD")
-    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": r"handover accepted\nARCHITECT\_HANDOVER\_READY"}])
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "ARCHITECT_SESSION_READY"}])
     assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is True
     assert watcher.state["architectConversationId"] == "NEW"
     assert old_page.closed is True
@@ -1085,7 +1085,7 @@ def test_generation_visible_new_architect_blocks_handover_ack_until_timeout(tmp_
     watcher.state.update({"handoverRequested": True, "rolloverPending": True, "architectConversationId": "OLD"})
     watcher.save()
     old_page = _AckPage("https://chatgpt.com/c/OLD")
-    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "ARCHITECT_HANDOVER_READY"}], generating=True)
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "ARCHITECT_SESSION_READY"}], generating=True)
     ticks = iter(range(1000))
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
@@ -1448,6 +1448,97 @@ def test_rollover_waits_for_new_conversation_url_before_switching(tmp_path, monk
     assert not watcher.state.get("pending_handover")
     assert new_page.closed is False
     assert old_page.closed is True
+
+
+def test_fresh_session_ready_is_strict_and_handover_marker_is_not_fresh_ack():
+    assert watcher_module.architect_session_ready("ARCHITECT_SESSION_READY")
+    assert watcher_module.architect_session_ready("  ARCHITECT_SESSION_READY  ")
+    assert not watcher_module.architect_session_ready("ARCHITECT_HANDOVER_READY")
+    assert not watcher_module.architect_session_ready("discussion\nARCHITECT_SESSION_READY")
+
+
+def test_fresh_bootstrap_adds_ready_instruction_without_changing_handover_body(tmp_path, monkeypatch):
+    sent = []
+
+    class Context:
+        def __init__(self, page): self.page = page
+        def new_page(self): return self.page
+
+    class Page:
+        url = "https://chatgpt.com/"
+        def __init__(self): self.closed = False; self.context = Context(self)
+        def goto(self, _url): pass
+        def close(self): self.closed = True
+
+    old = Page(); fresh = Page(); old.context = Context(fresh)
+    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", lambda _self, payload: sent.append(payload))
+    bridge = ArchitectPlaywright(old)
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    assert bridge.open_fresh_with_handover(handover) is fresh
+    assert sent[0].startswith(handover)
+    assert sent[0].endswith("ARCHITECT_SESSION_READY")
+
+
+def test_ambiguous_fresh_submission_persists_candidate_without_closing_it(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True,
+                          "architectConversationId": "OLD", "taskId": "000049"})
+    watcher.save()
+
+    class Context:
+        def __init__(self, fresh): self.fresh = fresh
+        def new_page(self): return self.fresh
+
+    class Page:
+        def __init__(self, url): self.url = url; self.closed = False; self.context = None
+        def goto(self, _url): pass
+        def close(self): self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD")
+    fresh = Page("https://chatgpt.com/c/CANDIDATE")
+    old.context = Context(fresh)
+    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", lambda _self, _payload: (_ for _ in ()).throw(ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT")))
+    bridge = ArchitectPlaywright(old)
+    assert watcher.session_rollover.complete_from_response(bridge, "private handover\nARCHITECT_HANDOVER_READY") is False
+    assert fresh.closed is False
+    assert old.closed is False
+    assert watcher.state["rolloverFreshCandidateConversationId"] == "CANDIDATE"
+    assert watcher.state["rolloverFreshCandidateState"] == "SUBMISSION_AMBIGUOUS"
+    assert watcher.state["handoverRequested"] is True
+
+
+def test_ambiguous_fresh_candidate_is_reused_before_new_tab_creation(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True,
+                          "architectConversationId": "OLD", "taskId": "000049",
+                          "nextTaskId": "000050", "rolloverDue": True})
+    watcher.save()
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "ARCHITECT_SESSION_READY"}])
+    context = type("Context", (), {"pages": [old_page, new_page]})()
+    old_page.context = context
+    new_page.context = context
+    calls = []
+
+    class Bridge:
+        page = old_page
+        _fresh_candidate_page = None
+        _fresh_candidate_submission_ambiguous = False
+        def open_fresh_with_handover(self, _response):
+            calls.append(1)
+            raise AssertionError("existing candidate must be reused")
+
+    bridge = Bridge()
+    watcher.state.update({"rolloverFreshCandidateConversationId": "NEW",
+                          "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+                          "pending_handover": "complete old handover\nARCHITECT_HANDOVER_READY"})
+    watcher.save()
+    assert watcher.session_rollover.complete_from_response(bridge, watcher.state["pending_handover"]) is True
+    assert calls == []
+    assert watcher.state["architectConversationId"] == "NEW"
+    assert old_page.closed is True
+    assert new_page.closed is False
+    assert watcher.state["nextTaskId"] == "000050"
 
 
 def test_rollover_timeout_closes_only_fresh_page_and_preserves_authority(tmp_path, monkeypatch):
