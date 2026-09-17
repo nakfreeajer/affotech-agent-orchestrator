@@ -2906,6 +2906,64 @@ def test_idle_intended_envelope_marker_is_not_triggered_by_ordinary_prose(tmp_pa
     assert watcher._architect_response_attempts_authority("mentioning orchestrator in discussion") is False
 
 
+def test_ambiguous_idle_bootstrap_is_reconciled_without_duplicate_send(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "IDLE", "continuationSourceFingerprint": "source-1"})
+    sent = []
+
+    class SendingBridge:
+        sendActionAttempted = True
+        def submit_result_bounded(self, message):
+            sent.append(message)
+            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", "TimeoutError")
+
+    with pytest.raises(ResultSubmissionError):
+        watcher.request_architect_bootstrap(SendingBridge())
+    assert watcher.state["architectSendState"] == "AMBIGUOUS"
+    payload = watcher.state["architectBootstrapPayload"]
+
+    class ReattachedBridge:
+        def exact_user_message_payload_observed(self, candidate): return candidate == payload
+        def generation_visible(self): return False
+        def assistant_baseline(self): return {"count": 3, "entries": []}
+        def submit_result_bounded(self, _message): raise AssertionError("duplicate bootstrap")
+
+    assert watcher.inspect_idle_architect(ReattachedBridge(), lambda *_: None) == "ARCHITECT_RUNNING"
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert len(sent) == 1
+
+
+def test_ambiguous_idle_bootstrap_waits_while_architect_generates(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "IDLE", "architectBootstrapDeliveryState": "AMBIGUOUS",
+                          "architectBootstrapPayload": "bootstrap", "architectBootstrapPayloadHash": hashlib.sha256(b"bootstrap").hexdigest()})
+
+    class Bridge:
+        def exact_user_message_payload_observed(self, _payload): return False
+        def generation_visible(self): return True
+        def assistant_baseline(self): return {"count": 1, "entries": []}
+
+    assert watcher.inspect_idle_architect(Bridge(), lambda *_: None) == "IDLE"
+    assert watcher.state["state"] == "IDLE"
+
+
+def test_ambiguous_idle_bootstrap_can_clear_fence_for_one_bounded_retry(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "IDLE", "architectBootstrapDeliveryState": "AMBIGUOUS",
+                          "architectBootstrapPayload": "bootstrap", "architectBootstrapPayloadHash": hashlib.sha256(b"bootstrap").hexdigest(),
+                          "architectBootstrapRetryAfter": 0, "architectBootstrapObservationAttempts": 0,
+                          "lastContinuationSourceFingerprint": "source-1"})
+
+    class Bridge:
+        def exact_user_message_payload_observed(self, _payload): return False
+        def generation_visible(self): return False
+
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 10.0)
+    assert watcher._reconcile_architect_bootstrap(Bridge()) == "RETRY"
+    assert watcher.state["architectBootstrapDeliveryState"] == "UNSENT"
+    assert "lastContinuationSourceFingerprint" not in watcher.state
+
+
 def test_bootstrap_execute_response_uses_same_architect_task_once(tmp_path):
     worktree = tmp_path / "affotech-worktree"
     worktree.mkdir()

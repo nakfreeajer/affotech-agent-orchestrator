@@ -1069,10 +1069,11 @@ class ArchitectSessionRollover:
         pages = getattr(context, "pages", []) if context is not None else []
         matches = []
         old_id = None
-        try:
-            old_id = architect_conversation_id_from_url(getattr(bridge.page, "url", ""))
-        except RuntimeError:
-            pass
+        if context is not None:
+            try:
+                old_id = architect_conversation_id_from_url(getattr(bridge.page, "url", ""))
+            except (RuntimeError, StopIteration):
+                pass
         for page in pages:
             try:
                 actual_id = architect_conversation_id_from_url(getattr(page, "url", ""))
@@ -3261,6 +3262,9 @@ class LocalFirstOrchestrator:
         ])
         if not isinstance(source_fingerprint, str) or not source_fingerprint:
             source_fingerprint = "UNSPECIFIED"
+        self.state["architectBootstrapPayload"] = message
+        self.state["architectBootstrapPayloadHash"] = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        self.state["architectBootstrapDeliveryState"] = "UNSENT"
         self.state.update({"lastContinuationSourceFingerprint": source_fingerprint, "architectBootstrapCount": int(self.state.get("architectBootstrapCount", 0)) + 1, "architectBootstrapAwaiting": True, "architectSendState": "PENDING", "state": "IDLE"})
         self.save()
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
@@ -3273,7 +3277,7 @@ class LocalFirstOrchestrator:
                 if bool(getattr(bridge, "last_unsent_payload_cleared", False)):
                     runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_UNSENT_PAYLOAD_CLEARED", self.state, taskId=self.state.get("taskId"))
                 self.state.pop("lastContinuationSourceFingerprint", None)
-                self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False, "architectSendState": "FAILED"})
+                self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False, "architectSendState": "FAILED", "architectBootstrapDeliveryState": "UNSENT"})
                 self.save()
                 print("IDLE_GATE=pre_send_failed")
                 return False
@@ -3282,11 +3286,11 @@ class LocalFirstOrchestrator:
                 self.state["architectSendState"] = "FAILED"
             else:
                 self.state["architectSendState"] = "AMBIGUOUS"
-            self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
+            self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False, "architectBootstrapDeliveryState": "AMBIGUOUS", "architectBootstrapRetryAfter": time.time() + 5.0})
             self.save()
             print("IDLE_GATE=send_failed")
             raise
-        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectContactCount": int(self.state.get("architectContactCount", 0)) + 1})
+        self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectBootstrapDeliveryState": "CONFIRMED", "architectContactCount": int(self.state.get("architectContactCount", 0)) + 1})
         self.save()
         if hasattr(bridge, "assistant_baseline"):
             self.state["architectBaseline"] = bridge.assistant_baseline()
@@ -3294,8 +3298,59 @@ class LocalFirstOrchestrator:
         print("IDLE_GATE=continuation_sent")
         return True
 
+    def _reconcile_architect_bootstrap(self, bridge: Any) -> str | None:
+        """Reconcile an ambiguous IDLE continuation without replaying it blindly."""
+        delivery_state = self.state.get("architectBootstrapDeliveryState")
+        payload = self.state.get("architectBootstrapPayload")
+        if delivery_state not in {"AMBIGUOUS", "PENDING"} or not isinstance(payload, str) or not payload:
+            return None
+        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if self.state.get("architectBootstrapPayloadHash") != payload_hash:
+            return "WAIT"
+        observed = False
+        exact = getattr(bridge, "exact_user_message_payload_observed", None)
+        if callable(exact):
+            try:
+                observed = bool(exact(payload))
+            except Exception:
+                observed = False
+        else:
+            messages = getattr(bridge, "user_message_texts", None)
+            if callable(messages):
+                try:
+                    observed = any(isinstance(text, str) and normalize_prompt(text) == normalize_prompt(payload) for text in messages())
+                except Exception:
+                    observed = False
+        if observed:
+            baseline = bridge.assistant_baseline() if callable(getattr(bridge, "assistant_baseline", None)) else None
+            self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectBootstrapDeliveryState": "CONFIRMED", "architectBootstrapAwaiting": True, "architectBaseline": baseline})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_BOOTSTRAP_RECONCILED", self.state, hash=payload_hash)
+            return "CONFIRMED"
+        if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
+            self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
+            self.save()
+            return "WAIT"
+        retry_after = float(self.state.get("architectBootstrapRetryAfter") or 0.0)
+        attempts = int(self.state.get("architectBootstrapObservationAttempts", 0))
+        if time.time() < retry_after or attempts >= 1:
+            self.state["architectBootstrapObservationAttempts"] = attempts + 1
+            self.state.update({"state": "IDLE", "architectBootstrapAwaiting": False})
+            self.save()
+            return "WAIT"
+        self.state.update({"architectBootstrapDeliveryState": "UNSENT", "architectBootstrapObservationAttempts": attempts + 1})
+        self.state.pop("lastContinuationSourceFingerprint", None)
+        self.save()
+        return "RETRY"
+
     def inspect_idle_architect(self, bridge: Any, launcher: Callable[[str, Path], Any]) -> str:
         """Inspect the configured Architect conversation while IDLE."""
+        bootstrap_disposition = self._reconcile_architect_bootstrap(bridge)
+        if bootstrap_disposition == "CONFIRMED":
+            return "ARCHITECT_RUNNING"
+        if bootstrap_disposition == "WAIT":
+            print("IDLE_GATE=bootstrap_reconciliation_wait")
+            return "IDLE"
         generation_visible = bridge.generation_visible()
         if generation_visible:
             self.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": bridge.assistant_baseline()})
@@ -4455,7 +4510,11 @@ def main() -> None:
                             idle_bridge.close()
                             idle_bridge = None
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
-                        raise
+                        if not isinstance(error, ResultSubmissionError) and type(error).__name__ != "TimeoutError" and not str(error).startswith("ARCHITECT_"):
+                            raise
+                        time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                        watcher.state = watcher._load_state()
+                        continue
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                 recover_false = getattr(watcher, "recover_false_result_reconciliation", None)
                 if callable(recover_false) and recover_false(idle_bridge):
@@ -4464,11 +4523,21 @@ def main() -> None:
                     continue
                 try:
                     watcher.inspect_idle_architect(idle_bridge, launch)
-                except Exception:
+                except Exception as error:
                     if idle_bridge is not None:
                         idle_bridge.close()
                     idle_bridge = None
-                    raise
+                    bootstrap_transport = (
+                        watcher.state.get("state") == "IDLE"
+                        and watcher.state.get("architectBootstrapDeliveryState") in {"UNSENT", "AMBIGUOUS", "PENDING"}
+                        and (isinstance(error, ResultSubmissionError) or type(error).__name__ == "TimeoutError")
+                    )
+                    if not bootstrap_transport:
+                        raise
+                    runtime_log(logger, run_id, "ARCHITECT_IDLE_BOOTSTRAP_TRANSPORT_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error))
+                    time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                    watcher.state = watcher._load_state()
+                    continue
                 if watcher.state.get("state") == "IDLE":
                     time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
                     watcher.state = watcher._load_state()
@@ -4663,7 +4732,7 @@ def main() -> None:
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
                             decision = watcher.consume_idle_architect_response(observed["text"], launch)
-                            watcher.state["architectBootstrapAwaiting"] = False
+                            watcher.state.update({"architectBootstrapAwaiting": False, "architectBootstrapDeliveryState": None, "architectBootstrapPayload": None, "architectBootstrapPayloadHash": None, "architectBootstrapRetryAfter": None, "architectBootstrapObservationAttempts": 0})
                             watcher.save()
                         else:
                             decision = watcher.accept_architect_response(observed["text"])
