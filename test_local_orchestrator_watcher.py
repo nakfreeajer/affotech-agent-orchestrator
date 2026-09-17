@@ -543,6 +543,115 @@ def test_architect_rollover_requires_running_executor_and_dedupes_events(tmp_pat
     assert bridge.calls == 1
 
 
+def test_rollover_ack_timeout_retains_reconciliation_authority(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    rollover = ArchitectSessionRollover(watcher)
+    rollover.initialize_current_session()
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 123, "architectResponseCount": 30})
+
+    class Bridge:
+        sendActionAttempted = True
+        def submit_result_bounded(self, _value):
+            raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+
+    assert rollover.request_if_due(Bridge(), True, True) is False
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["rolloverHandoverSendState"] == "AMBIGUOUS"
+    assert watcher.state["rolloverAttemptedForTaskId"] == "task-1"
+
+
+def test_orphaned_handover_is_reconciled_without_duplicate_send(tmp_path, monkeypatch):
+    from local_orchestrator_watcher import ArchitectSessionRollover, LocalFirstOrchestrator
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "rolloverDue": True,
+                          "rolloverPending": True, "handoverRequested": False,
+                          "rolloverAttemptedForTaskId": "task-1"})
+    rollover = ArchitectSessionRollover(watcher)
+    calls = []
+
+    class Bridge:
+        def _assistant_entries(self):
+            return [{"id": "handover", "text": "completed\nARCHITECT_HANDOVER_READY"}]
+        def submit_result_bounded(self, _value):
+            raise AssertionError("orphan recovery must not resend handover")
+
+    monkeypatch.setattr(watcher, "process_pending_handover_response", lambda _bridge, response: calls.append(response) or True)
+    assert rollover.reconcile_pending_handover(Bridge()) is True
+    assert len(calls) == 1
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["rolloverHandoverSendState"] == "AMBIGUOUS"
+
+
+def test_ambiguous_handover_without_response_remains_resident(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "rolloverDue": True,
+                          "rolloverPending": True, "handoverRequested": True,
+                          "rolloverAttemptedForTaskId": "task-1", "rolloverHandoverSendState": "AMBIGUOUS"})
+    rollover = ArchitectSessionRollover(watcher)
+
+    class Bridge:
+        def _assistant_entries(self): return []
+        def submit_result_bounded(self, _value): raise AssertionError("ambiguous request must not resend")
+
+    assert rollover.reconcile_pending_handover(Bridge()) is False
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["rolloverDue"] is True
+
+
+def test_service_reconciles_orphan_before_requesting_new_handover(tmp_path, monkeypatch):
+    import local_orchestrator_watcher as watcher_module
+    from local_orchestrator_watcher import LocalFirstOrchestrator
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "rolloverDue": True,
+                          "rolloverPending": True, "handoverRequested": False,
+                          "rolloverAttemptedForTaskId": "task-1", "architectConversationId": "current"})
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/c/current"
+
+    class Bridge:
+        page = Page()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def _assistant_entries(self): return [{"id": "handover", "text": "completed\nARCHITECT_HANDOVER_READY"}]
+        def generation_visible(self): return False
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _watcher, _bridge, requested: requested)
+    monkeypatch.setattr(watcher, "process_pending_handover_response", lambda _bridge, response: calls.append(response) or True)
+    monkeypatch.setattr(watcher.session_rollover, "request_if_due", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate handover request")))
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is True
+    assert len(calls) == 1
+
+
+def test_conclusive_unsent_handover_remains_retryable(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    rollover = ArchitectSessionRollover(watcher)
+    rollover.initialize_current_session()
+    watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 123, "architectResponseCount": 30})
+
+    class Bridge:
+        sendActionAttempted = False
+        def __init__(self): self.calls = 0
+        def submit_result_bounded(self, _value):
+            self.calls += 1
+            if self.calls == 1:
+                raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE")
+
+    bridge = Bridge()
+    assert rollover.request_if_due(bridge, True, True) is False
+    assert "rolloverAttemptedForTaskId" not in watcher.state
+    assert watcher.state["rolloverHandoverSendState"] == "UNSENT"
+    assert rollover.request_if_due(bridge, True, True) is True
+    assert bridge.calls == 2
+
+
 def test_architect_rollover_accepts_next_prompt_ready_without_executor(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())

@@ -961,21 +961,65 @@ class ArchitectSessionRollover:
         self.watcher.state["rolloverTrigger"] = trigger
         self.watcher.state["handoverRequested"] = True
         self.watcher.state["handoverReady"] = False
+        self.watcher.state["rolloverHandoverSendState"] = "PENDING"
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_PENDING", self.watcher.state, trigger=trigger)
         try:
             bridge.submit_result_bounded(STANDARD_HANDOVER_REQUEST)
+            self.watcher.state["rolloverHandoverSendState"] = "ACKNOWLEDGED"
+            self.watcher.save()
             emit("ARCHITECT_HANDOVER_REQUESTED")
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_REQUESTED", self.watcher.state)
             return True
-        except Exception:
-            self.watcher.state["rolloverInProgress"] = False
-            self.watcher.state["handoverRequested"] = False
-            self.watcher.state["handoverReady"] = False
-            self.watcher.state["rolloverDue"] = True
+        except Exception as error:
+            attempted = bool(getattr(bridge, "sendActionAttempted", False)) or bool(getattr(bridge, "last_send_method", None))
+            ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+            if ambiguous:
+                self.watcher.state.update({
+                    "rolloverInProgress": True,
+                    "rolloverDue": True,
+                    "rolloverPending": True,
+                    "handoverRequested": True,
+                    "handoverReady": False,
+                    "rolloverHandoverSendState": "AMBIGUOUS",
+                })
+                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_SEND_AMBIGUOUS", self.watcher.state, errorClass=type(error).__name__)
+            else:
+                self.watcher.state.update({
+                    "rolloverInProgress": False,
+                    "handoverRequested": False,
+                    "handoverReady": False,
+                    "rolloverDue": True,
+                    "rolloverPending": True,
+                    "rolloverHandoverSendState": "UNSENT",
+                })
+                self.watcher.state.pop("rolloverAttemptedForTaskId", None)
             self.watcher.save()
             emit("STATE=ROLLOVER_PENDING")
             return False
+
+    def reconcile_pending_handover(self, bridge: "ArchitectPlaywright") -> bool:
+        """Consume an already-visible handover for an outstanding rollover."""
+        if not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending"):
+            return False
+        task_id = str(self.watcher.state.get("taskId") or "")
+        if not task_id or self.watcher.state.get("rolloverAttemptedForTaskId") != task_id:
+            return False
+        entries = bridge._assistant_entries()
+        handover = next((entry.get("text") for entry in reversed(entries)
+                         if isinstance(entry, dict) and isinstance(entry.get("text"), str)
+                         and architect_handover_ready(entry["text"])), None)
+        if not handover:
+            return False
+        if not self.watcher.state.get("handoverRequested"):
+            self.watcher.state.update({
+                "handoverRequested": True,
+                "handoverReady": False,
+                "rolloverInProgress": True,
+                "rolloverHandoverSendState": "AMBIGUOUS",
+            })
+            self.watcher.save()
+        return self.watcher.process_pending_handover_response(bridge, handover)
 
     def complete_from_response(self, bridge: "ArchitectPlaywright", response: str, emit: Callable[[str], None] = print) -> bool:
         if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
@@ -1039,6 +1083,7 @@ class ArchitectSessionRollover:
             self.watcher.state["rolloverInProgress"] = False
             self.watcher.state.pop("rolloverAttemptedForTaskId", None)
             self.watcher.state.pop("rolloverTrigger", None)
+            self.watcher.state.pop("rolloverHandoverSendState", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
             committed = True
@@ -4125,6 +4170,14 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
         baseline = bridge.assistant_baseline()
         rollover = watcher.session_rollover
+        task_id = str(watcher.state.get("taskId") or "")
+        if (watcher.state.get("rolloverPending") and task_id
+                and watcher.state.get("rolloverAttemptedForTaskId") == task_id):
+            if rollover.reconcile_pending_handover(bridge):
+                return True
+            if (watcher.state.get("handoverRequested")
+                    or watcher.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}):
+                return False
         if not rollover.request_if_due(bridge, latest_prompt_dispatched=True, executor_running=boundary_state == "EXECUTOR_RUNNING", architect_generating=bridge.generation_visible(), safe_boundary_state=boundary_state):
             return False
         observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
