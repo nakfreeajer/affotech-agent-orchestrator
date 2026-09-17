@@ -1279,6 +1279,54 @@ def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monk
     assert closed == [True]
 
 
+def _next_prompt_ready_fixture(tmp_path, *, due=False):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "next.txt"
+    prompt.write_text("next bounded task", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000040", "nextTaskId": "000041",
+                          "nextPromptPath": str(prompt), "targetWorktree": str(tmp_path / "worktree"),
+                          "rolloverDue": due, "architectConversationId": "current"})
+    watcher.save()
+    return watcher, prompt
+
+
+def test_next_prompt_ready_below_threshold_launches_without_rollover(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path)
+    events = []
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: events.append("launch") or type("Process", (), {"pid": 41})())
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: events.append("rollover") or False)
+    process = watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False)
+    assert process is not None
+    assert events == ["launch"]
+    assert prompt.read_text(encoding="utf-8") == "next bounded task"
+
+
+def test_next_prompt_ready_due_rollover_precedes_single_launch_and_preserves_staged_task(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    original = {key: watcher.state[key] for key in ("taskId", "nextTaskId", "nextPromptPath", "targetWorktree")}
+    events = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: events.append("rollover") or True)
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: events.append("launch") or type("Process", (), {"pid": 41})())
+    process = watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False)
+    assert process is not None
+    assert events == ["rollover", "launch"]
+    assert {key: watcher.state[key] for key in original} == original
+    assert prompt.read_text(encoding="utf-8") == "next bounded task"
+
+
+def test_next_prompt_ready_failed_rollover_does_not_launch_or_duplicate(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    original = {key: watcher.state[key] for key in ("taskId", "nextTaskId", "nextPromptPath", "targetWorktree")}
+    launches = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1))
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+    assert launches == []
+    assert watcher.state["rolloverDue"] is True
+    assert {key: watcher.state[key] for key in original} == original
+    assert prompt.read_text(encoding="utf-8") == "next bounded task"
+
+
 def test_result_delivery_deferral_resumes_same_bridge_after_generation(tmp_path, monkeypatch):
     watcher = ready(tmp_path)
     sends = []

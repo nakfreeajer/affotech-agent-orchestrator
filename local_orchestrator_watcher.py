@@ -911,15 +911,21 @@ class ArchitectSessionRollover:
         self.watcher.save()
         return True
 
-    def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False) -> bool:
+    def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False, safe_boundary_state: str | None = None) -> bool:
         workflow_state = self.watcher.state.get("state", "IDLE")
-        if workflow_state == "IDLE":
+        boundary_state = safe_boundary_state or workflow_state
+        if boundary_state == "IDLE":
             if any(self.watcher.state.get(key) for key in ("taskId", "executorResultPath", "architectDeliveryPayloadHash", "handoverRequested")):
                 return False
-        elif workflow_state != "EXECUTOR_RUNNING":
+        elif boundary_state not in {"EXECUTOR_RUNNING", "NEXT_PROMPT_READY"}:
             return False
-        if workflow_state == "EXECUTOR_RUNNING" and self.watcher.state.get("architectSendState") in {"PENDING", "AMBIGUOUS", "FAILED"}:
+        if boundary_state == "EXECUTOR_RUNNING" and self.watcher.state.get("architectSendState") in {"PENDING", "AMBIGUOUS", "FAILED"}:
             return False
+        if boundary_state == "NEXT_PROMPT_READY":
+            prompt_path = self.watcher.state.get("nextPromptPath")
+            next_task = self.watcher.state.get("nextTaskId")
+            if not next_task or not isinstance(prompt_path, str) or not Path(prompt_path).is_file() or self.watcher.state.get("handoverRequested"):
+                return False
         count = int(self.watcher.state.get("architectResponseCount", 0))
         memory_bytes = int(self.watcher.state.get("architectMemoryBytes", 0))
         trigger = self.watcher.state.get("rolloverTrigger") or self.rollover_trigger(memory_bytes, count)
@@ -4085,12 +4091,15 @@ def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: 
     return str(decision.get("action") or "")
 
 
-def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool]) -> bool:
+def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool], safe_boundary_state: str | None = None) -> bool:
     """Service maintenance once at the live-executor boundary only."""
-    if paused() or watcher.state.get("state") != "EXECUTOR_RUNNING" or not watcher.state.get("rolloverDue"):
+    boundary_state = safe_boundary_state or watcher.state.get("state")
+    if paused() or boundary_state not in {"EXECUTOR_RUNNING", "NEXT_PROMPT_READY"} or watcher.state.get("state") != boundary_state or not watcher.state.get("rolloverDue"):
         return False
     pid = watcher.state.get("codexPid")
-    if not pid or not LocalWatcher.process_alive(int(pid)):
+    if boundary_state == "EXECUTOR_RUNNING" and (not pid or not LocalWatcher.process_alive(int(pid))):
+        return False
+    if boundary_state == "NEXT_PROMPT_READY" and pid and LocalWatcher.process_alive(int(pid)):
         return False
     bridge = None
     try:
@@ -4099,7 +4108,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
         baseline = bridge.assistant_baseline()
         rollover = watcher.session_rollover
-        if not rollover.request_if_due(bridge, latest_prompt_dispatched=True, executor_running=True, architect_generating=bridge.generation_visible()):
+        if not rollover.request_if_due(bridge, latest_prompt_dispatched=True, executor_running=boundary_state == "EXECUTOR_RUNNING", architect_generating=bridge.generation_visible(), safe_boundary_state=boundary_state):
             return False
         observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
         if observed.get("state") != "COMPLETED" or not watcher.process_pending_handover_response(bridge, observed.get("text", "")):
@@ -4118,6 +4127,19 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 bridge.close()
             except Exception:
                 pass
+
+
+def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any], endpoint: str, paused: Callable[[], bool], logger: logging.Logger | None = None, run_id: str | None = None) -> Any:
+    """Gate NEXT_PROMPT_READY dispatch on due rollover maintenance."""
+    if watcher.state.get("state") != "NEXT_PROMPT_READY":
+        return None
+    if watcher.state.get("rolloverDue") and not service_deferred_rollover_once(watcher, endpoint, paused, "NEXT_PROMPT_READY"):
+        return None
+    runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
+    runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
+    process = watcher.launch_next(launch)
+    print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
+    return process
 
 
 def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -> bool:
@@ -4278,10 +4300,10 @@ def main() -> None:
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
-                runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
-                runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
-                process = watcher.launch_next(launch)
-                print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
+                process = dispatch_next_prompt_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
+                if process is None and watcher.state.get("rolloverDue"):
+                    time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+                    watcher.state = watcher._load_state()
                 continue
             if state == "HUMAN_REQUIRED":
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":

@@ -554,16 +554,17 @@ def test_architect_memory_tree_aggregates_only_owned_root_and_descendants():
     assert architect_process_tree_memory_bytes(10, rows) == 600
 
 
-def test_memory_threshold_is_primary_and_creates_one_pending_rollover(tmp_path):
+def test_memory_threshold_is_primary_and_creates_one_deferred_rollover(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_THRESHOLD_BYTES
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     rollover = ArchitectSessionRollover(watcher)
     lines = []
     assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES, lines.append) == "MEMORY_THRESHOLD"
     assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES + 1, lines.append) == "MEMORY_THRESHOLD"
-    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverDue"] is True
     assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
-    assert lines == ["ROLLOVER_PENDING trigger=MEMORY_THRESHOLD"]
+    assert watcher.state.get("rolloverPending", False) is False
+    assert lines == ["ROLLOVER_DUE trigger=MEMORY_THRESHOLD"]
 
 
 def test_rollover_waits_for_generation_and_requests_once_after_threshold(tmp_path):
@@ -661,8 +662,9 @@ def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab
     response = "HANDOVER\nARCHITECT_HANDOVER_READY"
     assert not rollover.complete_from_response(bridge, response)
     assert bridge.page.closed is False
-    assert watcher.state["handoverReady"] is True
+    assert watcher.state["handoverReady"] is False
     assert watcher.state["pending_handover"] == response
+    assert watcher.state["rolloverDue"] is True
 
 
 def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_count(tmp_path):
@@ -673,6 +675,8 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
     class Page:
         def __init__(self, url): self.url = url; self.closed = False
         def close(self): self.closed = True
+        def evaluate(self, script):
+            return False if "stop-button" in script else [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}]
     old = Page("https://chatgpt.com/c/OLD"); new = Page("https://chatgpt.com/c/NEW")
     class Bridge:
         page = old
@@ -698,6 +702,8 @@ def test_rollover_identity_is_the_next_resident_attach_target(tmp_path):
     class Page:
         def __init__(self, url): self.url = url; self.closed = False
         def close(self): self.closed = True
+        def evaluate(self, script):
+            return False if "stop-button" in script else [{"id": "ack", "text": "handover\nARCHITECT_HANDOVER_READY"}]
 
     old = Page("https://chatgpt.com/c/OLD")
     new = Page("https://chatgpt.com/c/NEW")
