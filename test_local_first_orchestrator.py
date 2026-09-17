@@ -3580,6 +3580,37 @@ def test_run_executor_state_keeps_architect_human_decision_resident(tmp_path):
     assert run_executor_state_once(watcher, lambda *_: (_ for _ in ()).throw(AssertionError("must not launch"))) == "HUMAN_REQUIRED"
 
 
+def test_unhandled_human_required_waits_reloads_and_preserves_workflow(tmp_path, monkeypatch):
+    watcher = ready(tmp_path)
+    prompt = tmp_path / "staged.txt"
+    prompt.write_text("staged", encoding="utf-8")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-1", "lastCompletedTaskId": "task-0",
+                          "nextTaskId": "task-1", "nextPromptPath": str(prompt),
+                          "humanRequiredReason": "EXECUTOR_EXITED_WITHOUT_RESULT"})
+    watcher.save()
+    slept = []
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda value: slept.append(value))
+    assert watcher_module.passive_human_required_wait(watcher, 0.25) == "HUMAN_REQUIRED"
+    assert slept == [0.25]
+    assert watcher.state["taskId"] == "task-1"
+    assert watcher.state["nextTaskId"] == "task-1"
+    assert watcher.state["nextPromptPath"] == str(prompt)
+    assert watcher.state["humanRequiredReason"] == "EXECUTOR_EXITED_WITHOUT_RESULT"
+
+
+def test_result_transport_exhausted_remains_resident_without_executor_rerun(tmp_path, monkeypatch):
+    watcher = ready(tmp_path)
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED",
+                          "taskId": "task-1", "lastCompletedTaskId": "task-1"})
+    watcher.save()
+    launches = []
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _value: None)
+    assert watcher_module.passive_human_required_wait(watcher, 0) == "HUMAN_REQUIRED"
+    assert launches == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
+
+
 def test_architect_execute_clears_stale_transport_reason(tmp_path):
     watcher, base, _ = recovery_fixture(tmp_path)
     watcher.state.update({"taskId": "000021", "taskSequence": 21, "state": "ARCHITECT_RUNNING", "humanRequiredReason": "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"})

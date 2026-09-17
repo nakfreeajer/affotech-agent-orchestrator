@@ -4161,6 +4161,14 @@ def run_human_required_startup_once(watcher: LocalFirstOrchestrator, launch: Cal
     return run_executor_state_once(watcher, launch)
 
 
+def passive_human_required_wait(watcher: LocalFirstOrchestrator, poll_interval: float | None = None) -> str:
+    """Wait once without changing HUMAN_REQUIRED workflow authority."""
+    interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+    time.sleep(interval)
+    watcher.state = watcher._load_state()
+    return watcher.state.get("state", "HUMAN_REQUIRED")
+
+
 def main() -> None:
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     state_dir = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR") or (Path(project) / ".agent-work" / "orchestrator"))
@@ -4386,7 +4394,8 @@ def main() -> None:
                 if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY"}:
                     continue
                 print("STATE=HUMAN_REQUIRED")
-                return
+                passive_human_required_wait(watcher)
+                continue
             if state not in {"RESULT_READY", "ARCHITECT_RUNNING"}:
                 print(f"STATE={state}")
                 return
@@ -4431,7 +4440,7 @@ def main() -> None:
                     )
                     if bridge is None:
                         print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
-                        return
+                        break
                 baseline = watcher.state.get("architectBaseline")
                 if not isinstance(baseline, dict):
                     entries = bridge._assistant_entries()
@@ -4468,7 +4477,7 @@ def main() -> None:
                                 )
                                 if bridge is None:
                                     print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
-                                    return
+                                    break
                                 baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
                             continue
                         if not watcher.state.get("handoverRequested"):
@@ -4476,7 +4485,7 @@ def main() -> None:
                             continue
                         watcher.reject_invalid_handover_response()
                         print("STATE=HUMAN_REQUIRED reason=ARCHITECT_HANDOVER_RESPONSE_INVALID")
-                        return
+                        break
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
                             decision = watcher.consume_idle_architect_response(observed["text"], launch)
@@ -4487,7 +4496,7 @@ def main() -> None:
                     except ValueError:
                         if not handle_architect_value_error(watcher, bridge):
                             print(f"STATE={watcher.state['state']}")
-                            return
+                            break
                         baseline = watcher.state.get("architectBaseline")
                         continue
                     if decision == "EXECUTE":
