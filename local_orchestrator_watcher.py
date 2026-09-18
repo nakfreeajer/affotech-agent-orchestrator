@@ -13,6 +13,7 @@ import sys
 import threading
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -42,6 +43,154 @@ ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
 RUNTIME_LOGGER_NAME = "affotech.orchestrator.runtime"
 RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING = "DEFERRED_ARCHITECT_GENERATING"
 ARCHITECT_DELIVERY_PROOF_VERSION = "SHA256_MARKER_V1"
+DIAGNOSTIC_TRACE_ENV = "ORCHESTRATOR_DIAGNOSTIC_TRACE"
+DIAGNOSTIC_TRACE_MAX_BYTES = 100 * 1024 * 1024
+DIAGNOSTIC_SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024
+_ACTIVE_DIAGNOSTIC_TRACE = None
+
+
+class DiagnosticTracer:
+    """Opt-in, bounded, privacy-conscious trace of already-executed work."""
+    _sequence = 0
+    _sequence_lock = threading.Lock()
+
+    def __init__(self, state_dir: str | os.PathLike[str], run_id: str):
+        self.root = Path(state_dir) / "logs" / "diagnostic" / run_id
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "state").mkdir(exist_ok=True)
+        (self.root / "snapshots").mkdir(exist_ok=True)
+        self.path = self.root / "trace.jsonl"
+        self._handle = self.path.open("a", encoding="utf-8")
+        self._bytes = self.path.stat().st_size
+        self._disabled = False
+        self._lock = threading.Lock()
+        self._connections = {}
+        self._created = 0
+        self._closed = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get(DIAGNOSTIC_TRACE_ENV) == "1"
+
+    def _state_fields(self, state: dict[str, Any] | None) -> dict[str, Any]:
+        current = state or {}
+        keys = (
+            "state", "taskId", "lastCompletedTaskId", "nextTaskId", "rolloverDue", "rolloverPending",
+            "rolloverInProgress", "rolloverAttemptedForTaskId", "rolloverRecoveryState",
+            "rolloverRecoveryAttemptCount", "rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt",
+            "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason", "handoverRequested", "handoverReady",
+            "rolloverHandoverSendState", "rolloverHandoverRecoveryDisposition", "rolloverHandoverRecoveryReason",
+            "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState", "rolloverFreshCandidateDiscoveryState",
+            "rolloverFreshCandidateAttemptCount", "codexPid", "active_codex_pid", "lastExecutorPid",
+            "executorProcessState", "architectConversationId", "architectMemoryBytes",
+        )
+        return {key: current.get(key) for key in keys}
+
+    def record(self, component: str, function: str, operation: str, phase: str, state: dict[str, Any] | None = None, duration_ms: float | None = None, **fields: Any) -> None:
+        if self._disabled:
+            return
+        with self._lock:
+            with self._sequence_lock:
+                type(self)._sequence += 1
+                seq = type(self)._sequence
+            record = {
+                "seq": seq,
+                "wallClockTimestamp": time.time(),
+                "monotonicTimestamp": time.monotonic(),
+                "runId": self.root.name,
+                "processPid": os.getpid(),
+                "threadId": threading.get_ident(),
+                "threadName": threading.current_thread().name,
+                "state": (state or {}).get("state", "UNKNOWN"),
+                "taskId": (state or {}).get("taskId") or (state or {}).get("nextTaskId") or "NONE",
+                "lastCompletedTaskId": (state or {}).get("lastCompletedTaskId"),
+                "nextTaskId": (state or {}).get("nextTaskId"),
+                "component": component,
+                "function": function,
+                "operation": operation,
+                "phase": phase,
+            }
+            if duration_ms is not None:
+                record["durationMs"] = round(float(duration_ms), 3)
+            record.update({key: value for key, value in fields.items() if value is not None})
+            record.setdefault("stateFields", self._state_fields(state))
+            encoded = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            encoded_bytes = len(encoded.encode("utf-8"))
+            if self._bytes + encoded_bytes > DIAGNOSTIC_TRACE_MAX_BYTES:
+                if not self._disabled:
+                    self._disabled = True
+                    cap = json.dumps({
+                        "seq": seq, "wallClockTimestamp": time.time(), "monotonicTimestamp": time.monotonic(),
+                        "runId": self.root.name, "processPid": os.getpid(), "threadId": threading.get_ident(),
+                        "threadName": threading.current_thread().name, "state": record["state"], "taskId": record["taskId"],
+                        "lastCompletedTaskId": record["lastCompletedTaskId"], "nextTaskId": record["nextTaskId"],
+                        "component": "DIAGNOSTIC", "function": "DiagnosticTracer.record", "operation": "TRACE_LIMIT_REACHED",
+                        "phase": "ERROR", "reason": "TRACE_SIZE_CAP"
+                    }) + "\n"
+                    self._handle.write(cap)
+                    self._handle.flush()
+                return
+            self._handle.write(encoded)
+            self._handle.flush()
+            self._bytes += encoded_bytes
+
+    def state_write(self, before: dict[str, Any], after: dict[str, Any]) -> None:
+        changed = {}
+        for key in sorted(set(before) | set(after)):
+            if before.get(key) != after.get(key):
+                old, new = before.get(key), after.get(key)
+                def summary(value):
+                    if isinstance(value, str) and len(value) > 256:
+                        return {"length": len(value), "sha256": hashlib.sha256(value.encode()).hexdigest()}
+                    return value
+                changed[key] = [summary(old), summary(new)]
+        if changed:
+            self.record("STATE", "save", "STATE_WRITE", "END", after, changed=changed)
+
+    def snapshot_text(self, label: str, text: str) -> str | None:
+        payload = str(text or "")
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)[:80]
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        directory = self.root / "snapshots"
+        existing = sum(path.stat().st_size for path in directory.glob("*") if path.is_file())
+        if existing + len(payload.encode("utf-8")) * 2 > DIAGNOSTIC_SNAPSHOT_MAX_BYTES:
+            self.record("DIAGNOSTIC", "snapshot_text", "SNAPSHOT", "SKIP", {}, reason="SNAPSHOT_LIMIT_REACHED", sha256=digest, length=len(payload))
+            return None
+        raw_path = directory / f"{safe_label}-{digest[:12]}-rawText.txt"
+        sanitized_path = directory / f"{safe_label}-{digest[:12]}-sanitizedText.txt"
+        raw_path.write_text(payload, encoding="utf-8")
+        sanitized_path.write_text(payload, encoding="utf-8")
+        return str(sanitized_path.relative_to(self.root))
+
+    def connection_begin(self, endpoint: str, requested: str | None, state: dict[str, Any] | None = None) -> str:
+        self._created += 1
+        connection_id = f"PW-CONN-{self._created:04d}"
+        self._connections[connection_id] = True
+        self.record("PLAYWRIGHT", "ArchitectPlaywright.attach", "PLAYWRIGHT_ATTACH", "BEGIN", state, endpoint=endpoint, requestedConversationId=requested, connectionId=connection_id, playwrightConnectionsCreated=self._created, playwrightConnectionsClosed=self._closed, playwrightConnectionsCurrentlyOpen=len(self._connections))
+        return connection_id
+
+    def connection_end(self, connection_id: str | None, state: dict[str, Any] | None = None, error: Exception | None = None, endpoint: str | None = None, requested: str | None = None, actual: str | None = None, started: float | None = None) -> None:
+        if connection_id and connection_id in self._connections:
+            self._connections.pop(connection_id, None)
+            self._closed += 1
+        self.record("PLAYWRIGHT", "ArchitectPlaywright.attach", "PLAYWRIGHT_ATTACH" if error is None else "PLAYWRIGHT_ATTACH_ERROR", "ERROR" if error else "END", state, duration_ms=(time.monotonic() - started) * 1000 if started else None, endpoint=endpoint, requestedConversationId=requested, actualConversationId=actual, connectionId=connection_id, errorClass=type(error).__name__ if error else None, errorMessage=str(error)[:500] if error else None, stackTrace=traceback.format_exc() if error else None, playwrightConnectionsCreated=self._created, playwrightConnectionsClosed=self._closed, playwrightConnectionsCurrentlyOpen=len(self._connections))
+
+    def attach_end(self, connection_id: str, endpoint: str, requested: str | None, actual: str | None, started: float, state: dict[str, Any] | None = None) -> None:
+        self.record("PLAYWRIGHT", "ArchitectPlaywright.attach", "PLAYWRIGHT_ATTACH", "END", state, duration_ms=(time.monotonic() - started) * 1000, endpoint=endpoint, requestedConversationId=requested, actualConversationId=actual, connectionId=connection_id, playwrightConnectionsCreated=self._created, playwrightConnectionsClosed=self._closed, playwrightConnectionsCurrentlyOpen=len(self._connections))
+
+    def close_connection(self, connection_id: str | None, reason: str, state: dict[str, Any] | None = None, started: float | None = None, error: Exception | None = None) -> None:
+        self.record("PLAYWRIGHT", "ArchitectPlaywright.close", "PLAYWRIGHT_CLOSE", "BEGIN", state, connectionId=connection_id, reason=reason)
+        self.connection_end(connection_id, state, error=error, started=started)
+
+    def shutdown(self, state: dict[str, Any] | None = None) -> None:
+        remaining = list(self._connections)
+        self.record("DIAGNOSTIC", "shutdown", "SHUTDOWN_COMPLETE" if not remaining else "SHUTDOWN_INCOMPLETE", "END", state, activePlaywrightConnectionIds=remaining, playwrightConnectionsCurrentlyOpen=len(remaining))
+        with self._lock:
+            self._handle.close()
+
+
+def diagnostic_trace_for(value: Any = None) -> DiagnosticTracer | None:
+    return getattr(value, "diagnostic_trace", None) or _ACTIVE_DIAGNOSTIC_TRACE
 
 
 def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
@@ -324,6 +473,10 @@ def architect_conversation_ids_equivalent(left: str, right: str) -> bool:
 
 def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requested_id: str | None) -> str:
     """Validate an attached page and persist its actual URL representation."""
+    tracer = diagnostic_trace_for(watcher)
+    started = time.monotonic()
+    if tracer:
+        tracer.record("ROLLOVER", "canonicalize_attached_architect_conversation", "FUNCTION", "BEGIN", getattr(watcher, "state", {}), requestedConversationId=requested_id)
     page = getattr(bridge, "page", None)
     if page is None:
         return requested_id or ""
@@ -334,6 +487,8 @@ def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requ
         watcher.state["architectConversationId"] = actual_id
         watcher.save()
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_ID_CANONICALIZED", watcher.state, **{"from": requested_id, "to": actual_id})
+    if tracer:
+        tracer.record("ROLLOVER", "canonicalize_attached_architect_conversation", "FUNCTION", "END", getattr(watcher, "state", {}), durationMs=(time.monotonic() - started) * 1000, requestedConversationId=requested_id, actualConversationId=actual_id, result=True)
     return actual_id
 
 
@@ -865,7 +1020,13 @@ class ArchitectSessionRollover:
 
     def sample_memory(self, memory_reader: Callable[[], int] | None = None, emit: Callable[[str], None] = print) -> str | None:
         """Sample only the explicitly governed Architect process tree."""
+        tracer = diagnostic_trace_for(self.watcher)
+        started = time.monotonic()
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_BEGIN", "BEGIN", self.watcher.state, threshold=ARCHITECT_MEMORY_THRESHOLD_BYTES, safetyCeiling=ARCHITECT_MEMORY_SAFETY_CEILING_BYTES)
         if self.watcher.state.get("humanRequiredReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT":
+            if tracer:
+                tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_SKIPPED", "SKIP", self.watcher.state, reason="SAFETY_CUTOUT", durationMs=(time.monotonic() - started) * 1000)
             return None
         reader = memory_reader or getattr(self.watcher, "architect_memory_reader", None)
         if reader is None:
@@ -912,12 +1073,17 @@ class ArchitectSessionRollover:
             emit(f"ROLLOVER_DUE trigger={trigger}")
         if trigger and memory_bytes >= ARCHITECT_MEMORY_SAFETY_CEILING_BYTES:
             self._enter_safety_cutout("ARCHITECT_ROLLOVER_SAFETY_CUTOUT")
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_END", "END", self.watcher.state, durationMs=(time.monotonic() - started) * 1000, memoryBytes=memory_bytes, memoryMiB=round(memory_bytes / (1024 * 1024), 2), rolloverDueBefore=bool(previous_memory_bytes and previous_memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES), rolloverDueAfter=bool(self.watcher.state.get("rolloverDue")), rootPid=os.environ.get("ARCHITECT_BROWSER_ROOT_PID"))
         return trigger
 
     def sample_memory_for_loop(self) -> str | None:
         """Throttle main-loop telemetry without changing direct sampling semantics."""
         now = time.monotonic()
         if now < self._next_memory_sample_at:
+            tracer = diagnostic_trace_for(self.watcher)
+            if tracer:
+                tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory_for_loop", "MEMORY_SAMPLE_SKIPPED", "SKIP", self.watcher.state, reason="COOLDOWN", retryAfter=self._next_memory_sample_at)
             return None
         self._next_memory_sample_at = now + ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS
         return self.sample_memory()
@@ -925,7 +1091,12 @@ class ArchitectSessionRollover:
     def _begin_bounded_recovery(self) -> bool:
         """Acquire one durable, backoff-protected rollover recovery attempt."""
         state = self.watcher.state
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "FUNCTION", "BEGIN", state)
         if state.get("humanRequiredReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT":
+            if tracer:
+                tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "GATE", "DECISION", state, gate="safety_cutout", result="BLOCK", reason="terminal_cutout")
             return False
         now = time.time()
         started = float(state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
@@ -948,16 +1119,23 @@ class ArchitectSessionRollover:
             return False
         retry_after = float(state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
         if now < retry_after:
+            if tracer:
+                tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "GATE", "DECISION", state, gate="rollover_retry_after", result="BLOCK", now=now, retryAfter=retry_after)
             return False
         state["rolloverRecoveryAttemptCount"] = attempts + 1
         state["rolloverRecoveryLastAttemptAt"] = now
         state["rolloverRecoveryRetryAfter"] = now + ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS
         state["rolloverRecoveryState"] = "RECOVERING"
         self.watcher.save()
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "FUNCTION", "END", state, result=True, attemptCount=state.get("rolloverRecoveryAttemptCount"))
         return True
 
     def _record_recovery_failure(self) -> None:
         state = self.watcher.state
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._record_recovery_failure", "FUNCTION", "BEGIN", state)
         attempts = int(state.get("rolloverRecoveryAttemptCount", 0) or 0)
         started = float(state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
         if attempts >= ROLLOVER_RECOVERY_MAX_ATTEMPTS or (started and time.time() - started >= ROLLOVER_RECOVERY_WINDOW_SECONDS):
@@ -971,6 +1149,9 @@ class ArchitectSessionRollover:
         state["rolloverRecoveryState"] = "COMPLETE"
         state.pop("rolloverRecoveryRetryAfter", None)
         self.watcher.save()
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._record_recovery_success", "FUNCTION", "END", state, result=True)
 
     def _enter_safety_cutout(self, reason: str) -> None:
         state = self.watcher.state
@@ -985,6 +1166,9 @@ class ArchitectSessionRollover:
         state.pop("rolloverRecoveryRetryAfter", None)
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_ROLLOVER_SAFETY_CUTOUT", state, reason=reason)
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._enter_safety_cutout", "FUNCTION", "END", state, reason=reason, result="HUMAN_REQUIRED")
 
     @staticmethod
     def rollover_trigger(memory_bytes: int, response_count: int = 0) -> str | None:
@@ -1006,6 +1190,9 @@ class ArchitectSessionRollover:
         return True
 
     def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False, safe_boundary_state: str | None = None) -> bool:
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover.request_if_due", "FUNCTION", "BEGIN", self.watcher.state, latestPromptDispatched=latest_prompt_dispatched, executorRunning=executor_running, architectGenerating=architect_generating, safeBoundaryState=safe_boundary_state)
         workflow_state = self.watcher.state.get("state", "IDLE")
         boundary_state = safe_boundary_state or workflow_state
         if boundary_state == "IDLE":
@@ -1059,6 +1246,8 @@ class ArchitectSessionRollover:
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_PENDING", self.watcher.state, trigger=trigger)
         try:
+            if tracer:
+                tracer.record("HANDOVER", "request_if_due", "HANDOVER_REQUEST_SEND_BEGIN", "BEGIN", self.watcher.state, payloadLength=len(STANDARD_HANDOVER_REQUEST), payloadSha256=hashlib.sha256(STANDARD_HANDOVER_REQUEST.encode()).hexdigest())
             bridge.submit_result_bounded(STANDARD_HANDOVER_REQUEST)
             self.watcher.state["rolloverHandoverSendState"] = "ACKNOWLEDGED"
             self.watcher.save()
@@ -1066,6 +1255,8 @@ class ArchitectSessionRollover:
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_REQUESTED", self.watcher.state)
             return True
         except Exception as error:
+            if tracer:
+                tracer.record("HANDOVER", "request_if_due", "HANDOVER_REQUEST_SEND_ERROR", "ERROR", self.watcher.state, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc())
             attempted = bool(getattr(bridge, "sendActionAttempted", False)) or bool(getattr(bridge, "last_send_method", None))
             ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
             if ambiguous:
@@ -1094,6 +1285,9 @@ class ArchitectSessionRollover:
 
     def reconcile_pending_handover(self, bridge: "ArchitectPlaywright") -> bool:
         """Consume an already-visible handover for an outstanding rollover."""
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover.reconcile_pending_handover", "FUNCTION", "BEGIN", self.watcher.state)
         if not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending"):
             return False
         task_id = str(self.watcher.state.get("taskId") or "")
@@ -1114,6 +1308,8 @@ class ArchitectSessionRollover:
             handover = next((entry.get("text") for entry in reversed(entries)
                              if isinstance(entry, dict) and isinstance(entry.get("text"), str)
                              and architect_handover_ready(entry["text"])), None)
+            if tracer:
+                tracer.record("HANDOVER", "reconcile_pending_handover", "HANDOVER_RESPONSE_CLASSIFICATION", "DECISION", self.watcher.state, found=bool(handover), entryCount=len(entries))
         if not isinstance(handover, str) or not architect_handover_ready(handover):
             self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_NOT_FOUND")
             return False
@@ -1203,13 +1399,21 @@ class ArchitectSessionRollover:
             "rolloverFreshCandidateState": status,
         })
         self.watcher.save()
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._record_fresh_candidate", "FUNCTION", "END", self.watcher.state, conversationId=conversation_id, candidateState=status)
         return conversation_id
 
     def _existing_fresh_candidate_page(self, bridge: "ArchitectPlaywright", handover: str | None = None) -> Any | None:
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._existing_fresh_candidate_page", "FUNCTION", "BEGIN", self.watcher.state, persistedCandidateId=self.watcher.state.get("rolloverFreshCandidateConversationId"))
         candidate_id = self.watcher.state.get("rolloverFreshCandidateConversationId")
         stale_candidate_id = None
         context = getattr(getattr(bridge, "page", None), "context", None)
         pages = getattr(context, "pages", []) if context is not None else []
+        if tracer:
+            tracer.record("ROLLOVER", "_existing_fresh_candidate_page", "TARGET_INVENTORY", "BEGIN", self.watcher.state, pageCount=len(pages), inventory=[{"index": index, "url": getattr(page, "url", "")} for index, page in enumerate(pages)])
         matches = []
         old_id = None
         if context is not None:
@@ -1289,6 +1493,9 @@ class ArchitectSessionRollover:
         return proven[0] if proven else None
 
     def complete_from_response(self, bridge: "ArchitectPlaywright", response: str, emit: Callable[[str], None] = print) -> bool:
+        tracer = diagnostic_trace_for(self.watcher)
+        if tracer:
+            tracer.record("ROLLOVER", "ArchitectSessionRollover.complete_from_response", "HANDOVER_WAIT_COMPLETE", "BEGIN", self.watcher.state, responseLength=len(response), responseSha256=hashlib.sha256(response.encode()).hexdigest(), handoverReady=architect_handover_ready(response))
         if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
             return False
         self.watcher.state["handoverReady"] = True
@@ -1328,20 +1535,32 @@ class ArchitectSessionRollover:
                     self.watcher.save()
                     break
                 except RuntimeError:
+                    if tracer:
+                        tracer.record("ROLLOVER", "complete_from_response", "WAIT_BEGIN", "BEGIN", self.watcher.state, reason="new conversation URL", requestedSeconds=0.1)
                     time.sleep(0.1)
+                    if tracer:
+                        tracer.record("ROLLOVER", "complete_from_response", "WAIT_END", "END", self.watcher.state, reason="new conversation URL")
             if conversation_id is None:
                 raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ID_TIMEOUT")
             phase = "WAIT_NEW_CONVERSATION_ACK"
+            if tracer:
+                tracer.record("ROLLOVER", "complete_from_response", "FRESH_READY_WAIT_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id)
             ack_deadline = time.monotonic() + 30.0
             new_bridge = ArchitectPlaywright(new_page)
             while time.monotonic() < ack_deadline:
                 if new_bridge.generation_visible():
+                    if tracer:
+                        tracer.record("ROLLOVER", "complete_from_response", "WAIT_BEGIN", "BEGIN", self.watcher.state, reason="fresh session generation", requestedSeconds=0.25)
                     time.sleep(0.25)
+                    if tracer:
+                        tracer.record("ROLLOVER", "complete_from_response", "WAIT_END", "END", self.watcher.state, reason="fresh session generation")
                     continue
                 entries = new_bridge._assistant_entries()
                 if entries:
                     latest = entries[-1].get("text", "") if isinstance(entries[-1], dict) else ""
                     if architect_session_ready(latest):
+                        if tracer:
+                            tracer.record("ROLLOVER", "complete_from_response", "FRESH_READY_WAIT_COMPLETE", "END", self.watcher.state, conversationId=conversation_id, assistantSha256=hashlib.sha256(latest.encode()).hexdigest())
                         break
                     if latest.strip():
                         raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ACK_INVALID")
@@ -1352,6 +1571,8 @@ class ArchitectSessionRollover:
             final_url = final_url() if callable(final_url) else final_url
             conversation_id = architect_conversation_id_from_url(final_url)
             phase = "COMMIT_NEW_CONVERSATION_AUTHORITY"
+            if tracer:
+                tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id)
             self.watcher.state["architectConversationId"] = conversation_id
             self.watcher.state.pop("currentArchitectConversationId", None)
             self.watcher.state["architectResponseCount"] = 0
@@ -1376,12 +1597,18 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
             committed = True
+            if tracer:
+                tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_END", "END", self.watcher.state, conversationId=conversation_id)
             bridge.page = new_page
             if hasattr(old_page, "close"):
+                if tracer:
+                    tracer.record("PLAYWRIGHT", "complete_from_response", "OLD_ARCHITECT_CLOSE_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id, mutation=True)
                 try:
                     old_page.close()
                 except Exception:
                     pass
+                if tracer:
+                    tracer.record("PLAYWRIGHT", "complete_from_response", "OLD_ARCHITECT_CLOSE_END", "END", self.watcher.state, conversationId=conversation_id, mutation=True)
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_NEW_CONVERSATION_CREATED", self.watcher.state, conversationId=conversation_id)
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_SWITCHED", self.watcher.state, conversationId=conversation_id)
             emit("ARCHITECT_SESSION_ROLLOVER_COMPLETE")
@@ -1686,11 +1913,20 @@ class ArchitectPlaywright:
     def __init__(self, page: Any):
         self.page = page
         self.last_state = "NOT_YET"
+        self.diagnostic_trace = diagnostic_trace_for()
+        self._diagnostic_connection_id = None
+
+    def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
+        tracer = getattr(self, "diagnostic_trace", None)
+        if tracer:
+            tracer.record("PLAYWRIGHT", "ArchitectPlaywright", operation, phase, {}, duration_ms=(time.monotonic() - started) * 1000 if started else None, connectionId=getattr(self, "_diagnostic_connection_id", None), **fields)
 
     def latest_response(self) -> str:
         return self.page.get_by_role("main").inner_text()
 
     def _assistant_entries(self) -> list[dict[str, str | None]]:
+        started = time.monotonic()
+        self._trace_operation("assistant_entries", "BEGIN", selector='[data-message-author-role="assistant"]', mutation=False)
         evaluate = getattr(self.page, "evaluate", None)
         if evaluate is not None:
             script = """
@@ -1712,11 +1948,20 @@ class ArchitectPlaywright:
                     if not isinstance(result, list):
                         last_error = RuntimeError("ASSISTANT_SNAPSHOT_INVALID")
                         break
-                    return [
+                    entries = [
                         {"id": item.get("id"), "text": item.get("text", "")}
                         for item in (result or [])
                         if isinstance(item, dict)
                     ]
+                    self._trace_operation("assistant_entries", "END", started, count=len(entries), mutation=False)
+                    for entry in entries:
+                        text = str(entry.get("text") or "")
+                        if self.diagnostic_trace:
+                            fields = {"messageId": entry.get("id"), "textLength": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest(), "containsHandoverReady": HANDOVER_READY in text, "architectHandoverReady": architect_handover_ready(text)}
+                            if architect_handover_ready(text):
+                                fields["snapshotPath"] = self.diagnostic_trace.snapshot_text(f"assistant-{entry.get('id') or 'unknown'}", text)
+                            self.diagnostic_trace.record("HANDOVER", "_assistant_entries", "ASSISTANT_ENTRY", "END", {}, **fields)
+                    return entries
                 except Exception as error:  # transient DOM replacement; retry the whole snapshot
                     last_error = error
                     time.sleep(0.05)
@@ -1729,6 +1974,7 @@ class ArchitectPlaywright:
             message = messages.nth(index)
             get_attribute = getattr(message, "get_attribute", lambda name: None)
             entries.append({"id": get_attribute("data-message-id"), "text": message.inner_text()})
+        self._trace_operation("assistant_entries", "END", started, count=len(entries), mutation=False)
         return entries
 
     def assistant_baseline(self) -> dict[str, Any]:
@@ -1931,6 +2177,7 @@ class ArchitectPlaywright:
         return observed["text"]
 
     def wait_for_new_response(self, baseline: dict[str, Any], poll_interval: float = 0.5) -> dict[str, Any]:
+        self._trace_operation("wait_for_new_response", "BEGIN", baselineCount=baseline.get("count"), pollInterval=poll_interval)
         stable_hash = None
         stable_polls = 0
         while True:
@@ -1954,7 +2201,9 @@ class ArchitectPlaywright:
             if identity_changed and text.strip():
                 if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text):
                     self.last_state = "COMPLETED"
-                    return {"state": "COMPLETED", "text": text}
+                    result = {"state": "COMPLETED", "text": text}
+                    self._trace_operation("wait_for_new_response", "END", resultState=result["state"])
+                    return result
                 current_hash = hashlib.sha256(text.encode()).hexdigest()
                 if current_hash == stable_hash:
                     stable_polls += 1
@@ -1967,9 +2216,13 @@ class ArchitectPlaywright:
                     continue
                 if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text) or extract_executor_prompt_envelope(text) is not None:
                     self.last_state = "COMPLETED"
-                    return {"state": "COMPLETED", "text": text}
+                    result = {"state": "COMPLETED", "text": text}
+                    self._trace_operation("wait_for_new_response", "END", resultState=result["state"])
+                    return result
                 self.last_state = "BLOCKED"
-                return {"state": "BLOCKED", "text": text}
+                result = {"state": "BLOCKED", "text": text}
+                self._trace_operation("wait_for_new_response", "END", resultState=result["state"])
+                return result
             stable_hash = None
             stable_polls = 0
             if identity_changed:
@@ -2038,6 +2291,7 @@ class ArchitectPlaywright:
             return False
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
+        self._trace_operation("submit_result_bounded", "BEGIN", payloadLength=len(result), payloadSha256=hashlib.sha256(result.encode()).hexdigest(), mutation=True)
         """Submit a result with explicit, bounded stages and typed failures."""
         self.last_send_method = None
         self.sendActionAttempted = False
@@ -2082,6 +2336,8 @@ class ArchitectPlaywright:
                 keyboard = getattr(self.page, "keyboard", None)
                 if keyboard is None:
                     raise RuntimeError("KEYBOARD_INPUT_UNAVAILABLE")
+                if self.diagnostic_trace:
+                    self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="populate composer", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True, payloadLength=len(result), payloadSha256=hashlib.sha256(result.encode()).hexdigest())
                 keyboard.insert_text(result)
                 populated = True
                 break
@@ -2142,6 +2398,8 @@ class ArchitectPlaywright:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
         try:
             self.sendActionAttempted = True
+            if self.diagnostic_trace:
+                self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send Architect payload", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
             send.click(timeout=1000)
             self.last_send_method = "playwright.click"
         except Exception as error:
@@ -2155,6 +2413,8 @@ class ArchitectPlaywright:
                 self.sendActionAttempted = True
                 composer = self._live_composer()
                 composer.focus(timeout=1000)
+                if self.diagnostic_trace:
+                    self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send fallback Enter", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
                 composer.press("Enter", timeout=1000)
                 self.last_send_method = "playwright.composer.press(Enter)"
             except Exception as fallback_error:
@@ -2172,19 +2432,24 @@ class ArchitectPlaywright:
                 assistant_started = self.assistant_count() > assistant_count_before
                 if composer_empty or generation_visible or assistant_started:
                     self.sendActionAcknowledged = True
+                    self._trace_operation("submit_result_bounded", "END", result="ACKNOWLEDGED", sendActionAttempted=self.sendActionAttempted, mutation=True)
                     return
             except Exception as error:
                 last_error = error
             time.sleep(0.1)
         detail = type(last_error).__name__ if last_error else None
+        self._trace_operation("submit_result_bounded", "ERROR", errorClass="TimeoutError", errorMessage="ARCHITECT_SUBMISSION_ACK_TIMEOUT", mutation=True)
         raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT", detail) from last_error
 
     def generation_visible(self) -> bool:
+        started = time.monotonic()
+        self._trace_operation("generation_visible", "BEGIN", mutation=False)
         evaluate = getattr(self.page, "evaluate", None)
         if evaluate is None:
+            self._trace_operation("generation_visible", "END", started, result=False, mutation=False)
             return False
         try:
-            return bool(evaluate("""
+            result = bool(evaluate("""
             () => [...document.querySelectorAll('[data-testid="stop-button"]')]
               .filter((button) => button.isConnected && !button.disabled)
               .some((button) => {
@@ -2193,22 +2458,34 @@ class ArchitectPlaywright:
                 return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
               })
             """))
-        except Exception:
+            self._trace_operation("generation_visible", "END", started, result=result, mutation=False)
+            return result
+        except Exception as error:
+            self._trace_operation("generation_visible", "ERROR", started, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc(), mutation=False)
             return False
 
     def close(self) -> None:
+        started = time.monotonic()
+        self._trace_operation("PLAYWRIGHT_CLOSE", "BEGIN", reason="bridge_close")
         runtime = getattr(self, "_runtime", None)
         browser = getattr(self, "_browser", None)
+        error = None
         if browser is not None:
             try:
                 browser.close()
-            except Exception:
-                pass
+            except Exception as caught:
+                error = caught
         if runtime is not None:
             try:
                 runtime.stop()
-            except Exception:
-                pass
+            except Exception as caught:
+                error = error or caught
+        if self.diagnostic_trace:
+            self.diagnostic_trace.close_connection(self._diagnostic_connection_id, "bridge_close", error=error, started=started)
+        self._diagnostic_connection_id = None
+        self._runtime = None
+        self._browser = None
+        self._trace_operation("PLAYWRIGHT_CLOSE", "ERROR" if error else "END", started, reason="bridge_close", errorClass=type(error).__name__ if error else None, errorMessage=str(error)[:500] if error else None, stackTrace=traceback.format_exc() if error else None)
 
     def open_fresh_and_wait_ready(self, handover: str) -> bool:
         new_page = self.page.context.new_page()
@@ -2222,16 +2499,28 @@ class ArchitectPlaywright:
 
     def open_fresh_with_handover(self, handover: str) -> Any:
         """Create one fresh tab and submit the handover with fresh-session framing."""
+        started = time.monotonic()
+        if self.diagnostic_trace:
+            self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_SESSION_CREATE_BEGIN", "BEGIN", {}, pagesBefore=len(getattr(getattr(self.page, "context", None), "pages", [])))
         new_page = self.page.context.new_page()
+        if self.diagnostic_trace:
+            self.diagnostic_trace.record("PLAYWRIGHT", "open_fresh_with_handover", "PLAYWRIGHT_VISIBLE_MUTATION", "END", {}, reason="fresh Architect page", mutation=True, callingFunction="open_fresh_with_handover", pageCountAfter=len(getattr(getattr(self.page, "context", None), "pages", [])))
         self._fresh_candidate_page = new_page
         self._fresh_candidate_submission_ambiguous = False
         bootstrap = fresh_architect_bootstrap_payload(handover)
         fresh_bridge = None
         try:
             new_page.goto("https://chatgpt.com/")
+            if self.diagnostic_trace:
+                self.diagnostic_trace.record("PLAYWRIGHT", "open_fresh_with_handover", "FRESH_SESSION_CREATE_END", "END", {}, durationMs=(time.monotonic() - started) * 1000, newPageUrl=getattr(new_page, "url", ""))
             fresh_bridge = ArchitectPlaywright(new_page)
+            fresh_bridge.diagnostic_trace = self.diagnostic_trace
             fresh_bridge.submit_result_bounded(bootstrap)
+            if self.diagnostic_trace:
+                self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_BOOTSTRAP_SEND_END", "END", {}, payloadLength=len(bootstrap), payloadSha256=hashlib.sha256(bootstrap.encode()).hexdigest())
         except Exception as error:
+            if self.diagnostic_trace:
+                self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_SESSION_CREATE_ERROR", "ERROR", {}, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc())
             attempted = bool(getattr(fresh_bridge, "sendActionAttempted", False)) or bool(getattr(fresh_bridge, "last_send_method", None))
             ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
             if ambiguous:
@@ -2248,10 +2537,15 @@ class ArchitectPlaywright:
     @staticmethod
     def attach(endpoint: str, conversation_id: str | None = None) -> "ArchitectPlaywright":
         from playwright.sync_api import sync_playwright
+        tracer = diagnostic_trace_for()
+        attach_started = time.monotonic()
         runtime = sync_playwright().start()
+        connection_id = tracer.connection_begin(endpoint, conversation_id) if tracer else None
         try:
             browser = runtime.chromium.connect_over_cdp(endpoint, timeout=10000)
         except Exception as error:
+            if tracer:
+                tracer.connection_end(connection_id, error=error, endpoint=endpoint, requested=conversation_id, started=attach_started)
             runtime.stop()
             raise RuntimeError("ARCHITECT_CDP_WEBSOCKET_ATTACHMENT_TIMEOUT") from error
         pages = [p for context in browser.contexts for p in context.pages]
@@ -2266,6 +2560,8 @@ class ArchitectPlaywright:
                     candidates.append((page, actual_id))
             distinct_ids = {actual_id for _page, actual_id in candidates}
             if len(distinct_ids) > 1:
+                if tracer:
+                    tracer.connection_end(connection_id, error=RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"), endpoint=endpoint, requested=conversation_id, started=attach_started)
                 runtime.stop()
                 raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
             exact = [page for page, actual_id in candidates if actual_id == conversation_id]
@@ -2274,16 +2570,28 @@ class ArchitectPlaywright:
             elif len(candidates) == 1:
                 pages = [candidates[0][0]]
             elif candidates:
+                if tracer:
+                    tracer.connection_end(connection_id, error=RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"), endpoint=endpoint, requested=conversation_id, started=attach_started)
                 runtime.stop()
                 raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
             else:
                 pages = []
         if not pages:
+            if tracer:
+                tracer.connection_end(connection_id, error=RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND" if conversation_id else "ARCHITECT_PAGE_NOT_FOUND"), endpoint=endpoint, requested=conversation_id, started=attach_started)
             runtime.stop()
             raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND") if conversation_id else RuntimeError("ARCHITECT_PAGE_NOT_FOUND")
         bridge = ArchitectPlaywright(pages[-1])
+        bridge.diagnostic_trace = tracer
+        bridge._diagnostic_connection_id = connection_id
         bridge._runtime = runtime
         bridge._browser = browser
+        if tracer:
+            try:
+                actual = architect_conversation_id_from_url(getattr(bridge.page, "url", "")) if conversation_id else None
+            except Exception:
+                actual = None
+            tracer.attach_end(connection_id, endpoint, conversation_id, actual, attach_started)
         return bridge
 
 
@@ -2346,8 +2654,13 @@ class LocalWatcher:
         return prompt
 
     def save(self) -> None:
+        tracer = diagnostic_trace_for(self)
+        before = dict(getattr(self, "_diagnostic_last_saved_state", {})) if tracer else {}
         self.state.update({"last_prompt_hash": self.loop_guard.last_prompt_hash, "last_result_hash": self.loop_guard.last_result_hash})
         self.state_path.write_text(json.dumps(self.state, indent=2) + "\n")
+        if tracer:
+            tracer.state_write(before, self.state)
+            self._diagnostic_last_saved_state = dict(self.state)
 
     @staticmethod
     def process_alive(pid: Any) -> bool:
@@ -3064,7 +3377,12 @@ class LocalFirstOrchestrator:
         return value
 
     def save(self) -> None:
+        tracer = diagnostic_trace_for(self)
+        before = dict(getattr(self, "_diagnostic_last_saved_state", {})) if tracer else {}
         atomic_write(self.state_path, (json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        if tracer:
+            tracer.state_write(before, self.state)
+            self._diagnostic_last_saved_state = dict(self.state)
 
     def discussion_pause_active(self) -> bool:
         marker = self.state_dir / "discussion-pause.marker"
@@ -3218,6 +3536,9 @@ class LocalFirstOrchestrator:
 
     def defer_failed_rollover(self, reason: str = "ARCHITECT_HANDOVER_RESPONSE_INVALID") -> None:
         """Drop a failed maintenance attempt without changing workflow authority."""
+        tracer = diagnostic_trace_for(self)
+        if tracer:
+            tracer.record("ROLLOVER", "defer_failed_rollover", "FUNCTION", "BEGIN", self.state, reason=reason)
         preserve_candidate_recovery = (
             self.state.get("rolloverFreshCandidateState") in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"}
             or self.state.get("rolloverFreshCandidateConversationId")
@@ -3232,6 +3553,9 @@ class LocalFirstOrchestrator:
 
     def process_pending_handover_response(self, bridge: Any, response: str) -> bool:
         """Keep pending handover responses out of ordinary task decision parsing."""
+        tracer = diagnostic_trace_for(self)
+        if tracer:
+            tracer.record("ROLLOVER", "process_pending_handover_response", "FUNCTION", "BEGIN", self.state, responseLength=len(response), responseSha256=hashlib.sha256(response.encode()).hexdigest())
         if not self.state.get("handoverRequested"):
             return False
         if self.session_rollover.complete_from_response(bridge, response):
@@ -4569,6 +4893,9 @@ def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: 
 
 def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool], safe_boundary_state: str | None = None) -> bool:
     """Service one bounded rollover recovery attempt at a safe boundary."""
+    tracer = diagnostic_trace_for(watcher)
+    if tracer:
+        tracer.record("ROLLOVER", "service_deferred_rollover_once", "FUNCTION", "BEGIN", watcher.state, safeBoundaryState=safe_boundary_state)
     boundary_state = safe_boundary_state or watcher.state.get("state")
     if paused() or boundary_state not in {"EXECUTOR_RUNNING", "NEXT_PROMPT_READY"} or watcher.state.get("state") != boundary_state or not watcher.state.get("rolloverDue"):
         return False
@@ -4581,6 +4908,8 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         return False
     rollover = watcher.session_rollover
     if not rollover._begin_bounded_recovery():
+        if tracer:
+            tracer.record("ROLLOVER", "service_deferred_rollover_once", "GATE", "DECISION", watcher.state, gate="bounded_recovery", result="BLOCK", reason="backoff_or_terminal")
         return False
     def failed() -> bool:
         rollover._record_recovery_failure()
@@ -4624,6 +4953,9 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
 
 def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any], endpoint: str, paused: Callable[[], bool], logger: logging.Logger | None = None, run_id: str | None = None) -> Any:
     """Gate NEXT_PROMPT_READY dispatch on due rollover maintenance."""
+    tracer = diagnostic_trace_for(watcher)
+    if tracer:
+        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "BEGIN", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"), promptPath=watcher.state.get("nextPromptPath"), rolloverDue=watcher.state.get("rolloverDue"), discussionPause=bool(watcher.state.get("discussionPauseActive")))
     if watcher.state.get("state") != "NEXT_PROMPT_READY":
         return None
     watcher.retire_completed_executor_ownership()
@@ -4632,6 +4964,8 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
     runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
     process = watcher.launch_next(launch)
+    if tracer:
+        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "CODEX_LAUNCH_END", "END", watcher.state, pid=getattr(process, "pid", None), decision="LAUNCH")
     print(f"CODEX_STARTED taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId')} pid={process.pid}")
     return process
 
@@ -4664,6 +4998,7 @@ def passive_human_required_wait(watcher: LocalFirstOrchestrator, poll_interval: 
 
 
 def main() -> None:
+    global _ACTIVE_DIAGNOSTIC_TRACE
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     state_dir = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR") or (Path(project) / ".agent-work" / "orchestrator"))
     instance_lock = WatcherInstanceLock(state_dir)
@@ -4683,6 +5018,11 @@ def main() -> None:
     watcher = LocalFirstOrchestrator(project, state_dir)
     watcher.runtime_logger = logger
     watcher.runtime_run_id = run_id
+    diagnostic_trace = DiagnosticTracer(state_dir, run_id) if DiagnosticTracer.enabled() else None
+    watcher.diagnostic_trace = diagnostic_trace
+    _ACTIVE_DIAGNOSTIC_TRACE = diagnostic_trace
+    if diagnostic_trace:
+        diagnostic_trace.record("MAIN", "main", "DIAGNOSTIC_TRACE_ENABLED", "BEGIN", watcher.state, traceDirectory=str(diagnostic_trace.root))
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
     bind_memory_owner = getattr(watcher, "bind_architect_memory_owner", None)
     if bind_memory_owner is not None:
@@ -4690,6 +5030,9 @@ def main() -> None:
             bind_memory_owner(endpoint)
         except RuntimeError as error:
             print(f"ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED reason={error}")
+            if diagnostic_trace:
+                diagnostic_trace.shutdown(watcher.state)
+                _ACTIVE_DIAGNOSTIC_TRACE = None
             instance_lock.release()
             return
     recovery_state = watcher.state.get("state", "IDLE")
@@ -4710,6 +5053,9 @@ def main() -> None:
     hotkeys = DiscussionHotkeyController(watcher)
     if not hotkeys.start(lambda event: runtime_log(logger, run_id, event, watcher.state)) and os.name == "nt":
         print("ORCHESTRATOR_HOTKEY_REGISTRATION_FAILED")
+        if diagnostic_trace:
+            diagnostic_trace.shutdown(watcher.state)
+            _ACTIVE_DIAGNOSTIC_TRACE = None
         instance_lock.release()
         return
     discussion_paused = getattr(watcher, "discussion_pause_active", lambda: bool(watcher.state.get("discussionPauseActive")))
@@ -4736,6 +5082,8 @@ def main() -> None:
     try:
         while True:
             rollover = getattr(watcher, "session_rollover", None)
+            if diagnostic_trace:
+                diagnostic_trace.record("MAIN", "main", "LOOP_BEGIN", "BEGIN", watcher.state, discussionPauseActive=bool(discussion_paused()), rolloverRecoveryState=watcher.state.get("rolloverRecoveryState"))
             if rollover is not None:
                 rollover.sample_memory_for_loop()
             state = watcher.state.get("state", "IDLE")
@@ -4749,6 +5097,8 @@ def main() -> None:
                 runtime_log(logger, run_id, "STATE_TRANSITION", watcher.state, **{"from": last_logged_state, "to": state, "reason": watcher.state.get("humanRequiredReason")})
                 last_logged_state = state
             if discussion_paused() and state in {"IDLE", "RESULT_READY", "NEXT_PROMPT_READY"}:
+                if diagnostic_trace:
+                    diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="DISCUSSION_PAUSE_SKIP", reason="discussion_pause_active")
                 notice = (state, watcher.state.get("taskId") or watcher.state.get("nextTaskId"))
                 if notice != pause_notice:
                     print(f"ORCHESTRATOR PAUSED BY HUMAN state={state} taskId={notice[1] or 'NONE'} architectRelay=BLOCKED F10=RESUME")
@@ -4761,6 +5111,8 @@ def main() -> None:
                 idle_bridge.close()
                 idle_bridge = None
             if state == "IDLE":
+                if diagnostic_trace:
+                    diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="IDLE_WAIT")
                 print("STATE=IDLE")
                 if watcher.intake_inbox(launch):
                     continue
@@ -4808,6 +5160,8 @@ def main() -> None:
                     watcher.state = watcher._load_state()
                 continue
             if state == "EXECUTOR_RUNNING":
+                if diagnostic_trace:
+                    diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="EXECUTOR_RUNNING_WAIT")
                 state = run_executor_state_once(watcher, launch)
                 if state == "EXECUTOR_RUNNING":
                     service_deferred_rollover_once(watcher, endpoint, discussion_paused)
@@ -4816,12 +5170,16 @@ def main() -> None:
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
+                if diagnostic_trace:
+                    diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="NEXT_PROMPT_READY_DISPATCH_ATTEMPT")
                 process = dispatch_next_prompt_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
                 if process is None and watcher.state.get("rolloverDue"):
                     time.sleep(float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
                     watcher.state = watcher._load_state()
                 continue
             if state == "HUMAN_REQUIRED":
+                if diagnostic_trace:
+                    diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="HUMAN_REQUIRED_PASSIVE_WAIT")
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     if human_wait_bridge is None:
@@ -4909,6 +5267,8 @@ def main() -> None:
                 return
 
             conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+            if diagnostic_trace:
+                diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="RESULT_DELIVERY" if state == "RESULT_READY" else "ARCHITECT_WAIT")
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
             bridge = None
             try:
@@ -5038,6 +5398,10 @@ def main() -> None:
         instance_lock.release()
         if not stop_logged and logger is not None and 'watcher' in locals():
             runtime_log(logger, run_id, "WATCHER_STOPPED", watcher.state, reason="shutdown")
+        if diagnostic_trace:
+            diagnostic_trace.record("MAIN", "main", "SHUTDOWN_BEGIN", "BEGIN", watcher.state if 'watcher' in locals() else None, activePlaywrightConnectionIds=list(diagnostic_trace._connections), remoteMonitorActive=bool(remote_monitor and remote_monitor.active), hotkeyThreadActive=bool(hotkeys and hotkeys._thread and hotkeys._thread.is_alive()) if 'hotkeys' in locals() else False)
+            diagnostic_trace.shutdown(watcher.state if 'watcher' in locals() else None)
+            _ACTIVE_DIAGNOSTIC_TRACE = None
 
 
 if __name__ == "__main__":

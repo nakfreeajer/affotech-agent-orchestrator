@@ -2,6 +2,7 @@ import json
 import hashlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from local_orchestrator_watcher import (
@@ -760,6 +761,65 @@ def test_due_rollover_recovery_is_bounded_and_enters_safety_cutout(tmp_path, mon
     assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: launches.append(1), "endpoint", lambda: False) is None
     assert attaches == [1, 1]
     assert launches == []
+
+
+def test_diagnostic_trace_is_opt_in_and_records_existing_browser_evidence(tmp_path, monkeypatch):
+    import local_orchestrator_watcher as watcher_module
+    from local_orchestrator_watcher import ArchitectPlaywright, DiagnosticTracer, LocalWatcher
+
+    monkeypatch.delenv("ORCHESTRATOR_DIAGNOSTIC_TRACE", raising=False)
+    assert not DiagnosticTracer.enabled()
+    assert not (tmp_path / "logs" / "diagnostic").exists()
+
+    monkeypatch.setenv("ORCHESTRATOR_DIAGNOSTIC_TRACE", "1")
+    tracer = DiagnosticTracer(tmp_path, "run-test")
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.diagnostic_trace = tracer
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000053", "nextTaskId": "000054"})
+    watcher.save()
+    watcher.state["rolloverDue"] = True
+    watcher.save()
+
+    calls = []
+    semantic = "handover body\nARCHITECT_HANDOVER_READY"
+    class Page:
+        def evaluate(self, script):
+            calls.append(script)
+            return [{"id": "assistant-1", "text": semantic}]
+
+    bridge = ArchitectPlaywright(Page())
+    bridge.diagnostic_trace = tracer
+    entries = bridge._assistant_entries()
+    assert entries[0]["text"] == semantic
+    assert len(calls) == 1
+    tracer.record("TEST", "test", "GATE", "DECISION", watcher.state, gate="example", result="ALLOW")
+    connection_id = tracer.connection_begin("endpoint", "OLD", watcher.state)
+    tracer.attach_end(connection_id, "endpoint", "OLD", "OLD", time.monotonic(), watcher.state)
+    tracer.close_connection(connection_id, "test", watcher.state)
+    tracer.shutdown(watcher.state)
+
+    trace_path = tmp_path / "logs" / "diagnostic" / "run-test" / "trace.jsonl"
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["seq"] for record in records] == sorted(record["seq"] for record in records)
+    assert any(record["operation"] == "STATE_WRITE" for record in records)
+    assert any(record["operation"] == "assistant_entries" for record in records)
+    assert any(record["operation"] == "ASSISTANT_ENTRY" and record["sha256"] == hashlib.sha256(semantic.encode()).hexdigest() for record in records)
+    assert any(record["operation"] == "GATE" and record["gate"] == "example" for record in records)
+    snapshots = list((tmp_path / "logs" / "diagnostic" / "run-test" / "snapshots").glob("*"))
+    assert snapshots
+    assert any(path.read_text(encoding="utf-8") == semantic for path in snapshots)
+
+
+def test_diagnostic_trace_cap_disables_only_trace_writes(tmp_path, monkeypatch):
+    import local_orchestrator_watcher as watcher_module
+    from local_orchestrator_watcher import DiagnosticTracer
+    monkeypatch.setattr(watcher_module, "DIAGNOSTIC_TRACE_MAX_BYTES", 300)
+    tracer = DiagnosticTracer(tmp_path, "run-cap")
+    tracer.record("TEST", "test", "LARGE", "BEGIN", {}, payload="x" * 1000)
+    tracer.record("TEST", "test", "AFTER", "END", {})
+    tracer.shutdown({})
+    lines = (tmp_path / "logs" / "diagnostic" / "run-cap" / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) <= 2
 
 
 def test_rollover_recovery_accounting_records_successful_completion(tmp_path):
