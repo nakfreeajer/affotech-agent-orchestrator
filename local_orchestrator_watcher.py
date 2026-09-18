@@ -3666,10 +3666,10 @@ class LocalFirstOrchestrator:
             time.sleep(0.1)
 
     def clear_confirmed_stale_composer(self, bridge: Any, payload: str, payload_hash: str) -> bool:
-        composer = getattr(bridge, "_live_composer", lambda: None)()
-        if composer is None:
-            return False
         try:
+            composer = getattr(bridge, "_live_composer", lambda: None)()
+            if composer is None:
+                return False
             observed = composer.inner_text(timeout=1000)
             if isinstance(observed, str) and observed.strip() and normalize_prompt(observed) == normalize_prompt(payload):
                 composer.focus(timeout=1000)
@@ -3843,6 +3843,15 @@ class LocalFirstOrchestrator:
 
     def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
         """Reconcile or deliver one result without exiting the resident watcher."""
+        def confirmed_current_payload() -> bool:
+            if self.state.get("state") != "ARCHITECT_RUNNING" or self.state.get("architectSendState") != "CONFIRMED":
+                return False
+            try:
+                _payload, payload_hash = self._result_delivery_payload()
+            except (KeyError, OSError, UnicodeError):
+                return False
+            return self.state.get("architectDeliveryPayloadHash") == payload_hash
+
         bridge = initial_bridge
         attempt = 0
         while attempt < max_attempts:
@@ -3864,8 +3873,13 @@ class LocalFirstOrchestrator:
                 self.save()
                 return bridge
             except Exception as error:
+                if confirmed_current_payload():
+                    self.state["architectTransportRecoveryCount"] = 0
+                    self.save()
+                    return bridge
                 try:
-                    bridge.close()
+                    if bridge is not None:
+                        bridge.close()
                 except Exception:
                     pass
                 bridge = None
@@ -4683,7 +4697,7 @@ def main() -> None:
                     )
                     if bridge is None:
                         print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason', 'ARCHITECT_RESULT_TRANSPORT_EXHAUSTED')}")
-                        break
+                        continue
                 baseline = watcher.state.get("architectBaseline")
                 if not isinstance(baseline, dict):
                     entries = bridge._assistant_entries()

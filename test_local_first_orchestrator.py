@@ -3678,6 +3678,48 @@ def test_stale_composer_cleanup_does_not_clear_unrelated_or_unverified_text(tmp_
     assert failed.text == payload
 
 
+def test_confirmed_delivery_ignores_stale_composer_acquisition_failure(tmp_path):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+    watcher.state.update({"architectDeliveryPayloadHash": payload_hash, "architectSendState": "FAILED",
+                          "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"})
+    watcher.save()
+
+    class Bridge:
+        def generation_visible(self): return False
+        def user_message_texts(self): return [payload]
+        def assistant_baseline(self): return {"count": 1, "text_hash": "baseline"}
+        def _live_composer(self): raise PlaywrightTimeoutError("composer lookup timed out")
+        def submit_result_bounded(self, _message): raise AssertionError("confirmed result must not resend")
+
+    bridge = Bridge()
+    assert watcher.deliver_result_with_recovery(lambda: (_ for _ in ()).throw(AssertionError("must retain bridge")), initial_bridge=bridge) is bridge
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert watcher.state["architectSendState"] == "CONFIRMED"
+    assert watcher.state["architectTransportRecoveryCount"] == 0
+
+
+@pytest.mark.parametrize("failure", ["inner_text", "focus", "press"])
+def test_confirmed_stale_composer_cleanup_operation_is_best_effort(tmp_path, failure):
+    watcher = ready(tmp_path)
+    payload, payload_hash = watcher._result_delivery_payload()
+
+    class Composer:
+        def inner_text(self, **_):
+            if failure == "inner_text": raise PlaywrightTimeoutError("read timed out")
+            return payload
+        def focus(self, **_):
+            if failure == "focus": raise PlaywrightTimeoutError("focus timed out")
+        def press(self, *_args, **_kwargs):
+            if failure == "press": raise PlaywrightTimeoutError("clear timed out")
+
+    class Bridge:
+        def _live_composer(self): return Composer()
+
+    assert watcher.clear_confirmed_stale_composer(Bridge(), payload, payload_hash) is False
+    assert watcher.state.get("state") == "RESULT_READY"
+
+
 def test_architect_stop_clears_stale_transport_reason(tmp_path):
     watcher = ready(tmp_path)
     watcher.state["humanRequiredReason"] = "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED"
