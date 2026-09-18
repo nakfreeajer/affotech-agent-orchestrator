@@ -1657,6 +1657,46 @@ def test_multiple_proven_fresh_candidates_fail_closed(tmp_path):
     assert watcher.state["rolloverFreshCandidateDiscoveryState"] == "AMBIGUOUS"
 
 
+def test_lost_handover_authority_is_reconstructed_before_candidate_discovery(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "rolloverDue": True, "rolloverPending": True,
+                          "rolloverAttemptedForTaskId": "000049", "handoverRequested": False,
+                          "taskId": "000049", "nextTaskId": "000050", "architectConversationId": "OLD",
+                          "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS"})
+    watcher.save()
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+
+    class Page:
+        def __init__(self, url, users, assistants): self.url, self.users, self.assistants, self.closed, self.context = url, users, assistants, False, None
+        def evaluate(self, script):
+            if "stop-button" in script: return False
+            if 'data-message-author-role="user"' in script: return self.users
+            if 'data-message-author-role="assistant"' in script: return self.assistants
+            return False
+        def close(self): self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD", [], [{"id": "handover", "text": handover}])
+    fresh = Page("https://chatgpt.com/c/FRESH", [bootstrap], [{"id": "ready", "text": "ARCHITECT_SESSION_READY"}])
+    context = type("Context", (), {"pages": [old, fresh]})()
+    old.context = fresh.context = context
+    opened, sends = [], []
+    class Bridge:
+        page = old
+        _fresh_candidate_submission_ambiguous = True
+        def _assistant_entries(self): return [{"id": "handover", "text": handover}]
+        def open_fresh_with_handover(self, _handover): opened.append(1); raise AssertionError("must reuse fresh candidate")
+        def submit_result_bounded(self, message): sends.append(message)
+
+    bridge = Bridge()
+    assert watcher.session_rollover.reconcile_pending_handover(bridge) is True
+    assert watcher.state["handoverRequested"] is False
+    assert watcher.state["architectConversationId"] == "FRESH"
+    assert opened == [] and sends == []
+    assert old.closed is True and fresh.closed is False
+    assert watcher.state["nextTaskId"] == "000050"
+
+
 def test_rollover_timeout_closes_only_fresh_page_and_preserves_authority(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "ARCHITECT_RUNNING", "handoverRequested": True, "rolloverPending": True,

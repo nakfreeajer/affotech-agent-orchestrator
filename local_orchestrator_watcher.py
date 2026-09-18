@@ -1017,12 +1017,27 @@ class ArchitectSessionRollover:
         task_id = str(self.watcher.state.get("taskId") or "")
         if not task_id or self.watcher.state.get("rolloverAttemptedForTaskId") != task_id:
             return False
+        reconstructed_handover = False
         handover = self.watcher.state.get("pending_handover")
         if not isinstance(handover, str) or not architect_handover_ready(handover):
             entries = bridge._assistant_entries()
             handover = next((entry.get("text") for entry in reversed(entries)
                              if isinstance(entry, dict) and isinstance(entry.get("text"), str)
                              and architect_handover_ready(entry["text"])), None)
+        if isinstance(handover, str) and architect_handover_ready(handover) and not self.watcher.state.get("handoverRequested"):
+            response_identity = hashlib.sha256(handover.encode("utf-8")).hexdigest()
+            bootstrap = fresh_architect_bootstrap_payload(handover)
+            self.watcher.state.update({
+                "handoverRequested": True,
+                "handoverReady": False,
+                "pending_handover": handover,
+                "rolloverHandoverResponseIdentity": response_identity,
+                "rolloverFreshBootstrapPayloadHash": hashlib.sha256(bootstrap.encode("utf-8")).hexdigest(),
+                "rolloverInProgress": True,
+                "rolloverHandoverSendState": "AMBIGUOUS",
+            })
+            self.watcher.save()
+            reconstructed_handover = True
         candidate_state = self.watcher.state.get("rolloverFreshCandidateState")
         candidate_page = self._existing_fresh_candidate_page(bridge, handover)
         if self.watcher.state.get("rolloverFreshCandidateDiscoveryState") == "AMBIGUOUS":
@@ -1046,7 +1061,8 @@ class ArchitectSessionRollover:
             return False
         response_identity = hashlib.sha256(handover.encode("utf-8")).hexdigest()
         if (self.watcher.state.get("rolloverHandoverResponseIdentity") == response_identity
-                and candidate_state not in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"}):
+                and candidate_state not in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"}
+                and not reconstructed_handover):
             return False
         if not self.watcher.state.get("handoverRequested"):
             self.watcher.state.update({
@@ -3034,8 +3050,15 @@ class LocalFirstOrchestrator:
 
     def defer_failed_rollover(self, reason: str = "ARCHITECT_HANDOVER_RESPONSE_INVALID") -> None:
         """Drop a failed maintenance attempt without changing workflow authority."""
+        preserve_candidate_recovery = (
+            self.state.get("rolloverFreshCandidateState") in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"}
+            or self.state.get("rolloverFreshCandidateConversationId")
+            or self.state.get("rolloverFreshBootstrapPayloadHash")
+            or self.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
+        )
         self.state.update({"rolloverInProgress": False, "rolloverDue": True, "rolloverPending": True, "handoverRequested": False, "handoverReady": False})
-        self.state.pop("pending_handover", None)
+        if not preserve_candidate_recovery:
+            self.state.pop("pending_handover", None)
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_FAILED", self.state, reason=reason)
 
