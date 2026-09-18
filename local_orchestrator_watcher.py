@@ -1017,13 +1017,24 @@ class ArchitectSessionRollover:
         task_id = str(self.watcher.state.get("taskId") or "")
         if not task_id or self.watcher.state.get("rolloverAttemptedForTaskId") != task_id:
             return False
+        retry_after = float(self.watcher.state.get("rolloverHandoverRecoveryRetryAfter", 0.0) or 0.0)
+        if (self.watcher.state.get("rolloverHandoverRecoveryDisposition") == "RETRYABLE"
+                and time.time() < retry_after):
+            return False
         reconstructed_handover = False
         handover = self.watcher.state.get("pending_handover")
         if not isinstance(handover, str) or not architect_handover_ready(handover):
-            entries = bridge._assistant_entries()
+            try:
+                entries = bridge._assistant_entries()
+            except Exception:
+                self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_HISTORY_UNAVAILABLE")
+                return False
             handover = next((entry.get("text") for entry in reversed(entries)
                              if isinstance(entry, dict) and isinstance(entry.get("text"), str)
                              and architect_handover_ready(entry["text"])), None)
+        if not isinstance(handover, str) or not architect_handover_ready(handover):
+            self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_NOT_FOUND")
+            return False
         if isinstance(handover, str) and architect_handover_ready(handover) and not self.watcher.state.get("handoverRequested"):
             response_identity = hashlib.sha256(handover.encode("utf-8")).hexdigest()
             bootstrap = fresh_architect_bootstrap_payload(handover)
@@ -1036,20 +1047,29 @@ class ArchitectSessionRollover:
                 "rolloverInProgress": True,
                 "rolloverHandoverSendState": "AMBIGUOUS",
             })
+            self.watcher.state.pop("rolloverHandoverRecoveryDisposition", None)
+            self.watcher.state.pop("rolloverHandoverRecoveryReason", None)
+            self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
             self.watcher.save()
             reconstructed_handover = True
         candidate_state = self.watcher.state.get("rolloverFreshCandidateState")
         candidate_page = self._existing_fresh_candidate_page(bridge, handover)
         if self.watcher.state.get("rolloverFreshCandidateDiscoveryState") == "AMBIGUOUS":
+            self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS")
             return False
         if candidate_state in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"} and candidate_page is None:
+            self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_FRESH_CANDIDATE_NOT_FOUND")
             return False
         if candidate_page is not None and not self.watcher.state.get("rolloverFreshCandidateConversationId"):
             self._record_fresh_candidate(candidate_page, candidate_state or "ACK_PENDING")
         if candidate_state == "FAILED":
             attempts = int(self.watcher.state.get("rolloverFreshCandidateAttemptCount", 0))
             retry_after = float(self.watcher.state.get("rolloverFreshCandidateRetryAfter", 0.0) or 0.0)
-            if attempts >= 2 or time.time() < retry_after:
+            if attempts >= 2:
+                self._mark_handover_recovery_disposition("HUMAN_REQUIRED", "ARCHITECT_FRESH_CANDIDATE_RETRY_EXHAUSTED")
+                return False
+            if time.time() < retry_after:
+                self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_FRESH_CANDIDATE_RETRY_BACKOFF")
                 return False
             self.watcher.state.pop("rolloverFreshCandidateConversationId", None)
             self.watcher.state.pop("rolloverFreshCandidateState", None)
@@ -1058,6 +1078,7 @@ class ArchitectSessionRollover:
             self.watcher.save()
             candidate_state = None
         if not handover:
+            self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_NOT_FOUND")
             return False
         response_identity = hashlib.sha256(handover.encode("utf-8")).hexdigest()
         if (self.watcher.state.get("rolloverHandoverResponseIdentity") == response_identity
@@ -1073,6 +1094,20 @@ class ArchitectSessionRollover:
             })
             self.watcher.save()
         return self.watcher.process_pending_handover_response(bridge, handover)
+
+    def _mark_handover_recovery_disposition(self, disposition: str, reason: str) -> None:
+        previous = (self.watcher.state.get("rolloverHandoverRecoveryDisposition"),
+                    self.watcher.state.get("rolloverHandoverRecoveryReason"))
+        self.watcher.state["rolloverHandoverRecoveryDisposition"] = disposition
+        self.watcher.state["rolloverHandoverRecoveryReason"] = reason
+        if disposition == "RETRYABLE":
+            self.watcher.state["rolloverHandoverRecoveryRetryAfter"] = time.time() + 5.0
+        else:
+            self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
+        self.watcher.save()
+        if previous != (disposition, reason):
+            event = "ARCHITECT_HANDOVER_RECOVERY_RETRYABLE" if disposition == "RETRYABLE" else "ARCHITECT_HANDOVER_RECOVERY_HUMAN_REQUIRED"
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), event, self.watcher.state, reason=reason)
 
     def _record_fresh_candidate(self, page: Any, status: str) -> str | None:
         try:
@@ -1253,6 +1288,9 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverFreshCandidateAttemptCount", None)
             self.watcher.state.pop("rolloverFreshBootstrapPayloadHash", None)
             self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
+            self.watcher.state.pop("rolloverHandoverRecoveryDisposition", None)
+            self.watcher.state.pop("rolloverHandoverRecoveryReason", None)
+            self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
             committed = True
@@ -1828,7 +1866,7 @@ class ArchitectPlaywright:
                 time.sleep(poll_interval)
                 continue
             if identity_changed and text.strip():
-                if text.rstrip().endswith(COMPLETE):
+                if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text):
                     self.last_state = "COMPLETED"
                     return {"state": "COMPLETED", "text": text}
                 current_hash = hashlib.sha256(text.encode()).hexdigest()
@@ -1841,7 +1879,7 @@ class ArchitectPlaywright:
                     self.last_state = "RUNNING"
                     time.sleep(poll_interval)
                     continue
-                if text.rstrip().endswith(COMPLETE) or extract_executor_prompt_envelope(text) is not None:
+                if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text) or extract_executor_prompt_envelope(text) is not None:
                     self.last_state = "COMPLETED"
                     return {"state": "COMPLETED", "text": text}
                 self.last_state = "BLOCKED"

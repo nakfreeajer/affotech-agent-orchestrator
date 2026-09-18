@@ -1279,6 +1279,82 @@ def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monk
     assert closed == [True]
 
 
+def test_acknowledged_handover_recovery_reconstructs_and_launches_staged_next_task(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000054.txt"
+    prompt.write_text("next bounded task", encoding="utf-8")
+    handover = "captured handover\nARCHITECT_HANDOVER_READY"
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000053", "lastCompletedTaskId": "000053",
+                          "nextTaskId": "000054", "nextPromptPath": str(prompt), "rolloverDue": True,
+                          "rolloverPending": True, "rolloverInProgress": False, "rolloverAttemptedForTaskId": "000053",
+                          "handoverRequested": False, "handoverReady": False, "rolloverHandoverSendState": "ACKNOWLEDGED",
+                          "rolloverHandoverResponseIdentity": None, "architectConversationId": "OLD",
+                          "executorProcessState": "COMPLETED_WITH_RESULT"})
+    watcher.save()
+
+    class Page:
+        def __init__(self, url, assistants): self.url, self.assistants, self.closed, self.context = url, assistants, False, None
+        def evaluate(self, script):
+            if "stop-button" in script: return False
+            if 'data-message-author-role="assistant"' in script: return self.assistants
+            return []
+        def close(self): self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD", [{"id": "handover", "text": handover}])
+    fresh = Page("https://chatgpt.com/c/NEW", [{"id": "ready", "text": "ARCHITECT_SESSION_READY"}])
+    old.context = type("Context", (), {"pages": [old]})()
+    opened, sends, launches = [], [], []
+
+    class Bridge:
+        page = old
+        def _assistant_entries(self): return old.assistants
+        def assistant_baseline(self): return {"count": 1, "text_hash": "old"}
+        def generation_visible(self): return False
+        def open_fresh_with_handover(self, _handover): opened.append(1); return fresh
+        def wait_for_new_response(self, *_args, **_kwargs): raise AssertionError("recovered handover must not be resent or waited for")
+        def submit_result_bounded(self, _message): sends.append(1)
+        def close(self): pass
+
+    bridge = Bridge()
+    original_complete = watcher.session_rollover.complete_from_response
+    def capture_before_fresh_mutation(current_bridge, response):
+        assert watcher.state["pending_handover"] == handover
+        assert watcher.state["rolloverHandoverResponseIdentity"] == hashlib.sha256(handover.encode()).hexdigest()
+        assert watcher.state["rolloverFreshBootstrapPayloadHash"] == hashlib.sha256(watcher_module.fresh_architect_bootstrap_payload(handover).encode()).hexdigest()
+        return original_complete(current_bridge, response)
+    monkeypatch.setattr(watcher.session_rollover, "complete_from_response", capture_before_fresh_mutation)
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _watcher, _bridge, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is True
+    assert watcher.state["architectConversationId"] == "NEW"
+    assert watcher.state["rolloverDue"] is False
+    assert watcher.state["rolloverPending"] is False
+    assert opened == [1] and sends == []
+    assert old.closed is True and fresh.closed is False
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1) or type("Process", (), {"pid": 5400})())
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is not None
+    assert launches == [1]
+    assert watcher.state["nextTaskId"] == "000054"
+
+
+def test_acknowledged_handover_without_proof_gets_explicit_retryable_disposition(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000053", "lastCompletedTaskId": "000053",
+                          "nextTaskId": "000054", "rolloverDue": True, "rolloverPending": True,
+                          "rolloverAttemptedForTaskId": "000053", "handoverRequested": False,
+                          "rolloverHandoverSendState": "ACKNOWLEDGED"})
+    class Page:
+        url = "https://chatgpt.com/c/OLD"
+        context = None
+        def evaluate(self, _script): return []
+    page = Page(); page.context = type("Context", (), {"pages": [page]})()
+    bridge = ArchitectPlaywright(page)
+    assert watcher.session_rollover.reconcile_pending_handover(bridge) is False
+    assert watcher.state["rolloverHandoverRecoveryDisposition"] == "RETRYABLE"
+    assert watcher.state["rolloverHandoverRecoveryReason"] == "ARCHITECT_HANDOVER_NOT_FOUND"
+    assert watcher.state["rolloverDue"] is True
+
+
 def _next_prompt_ready_fixture(tmp_path, *, due=False):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     prompt = tmp_path / "next.txt"

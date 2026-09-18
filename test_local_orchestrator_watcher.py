@@ -915,6 +915,27 @@ def test_completion_fallback_requires_two_stable_full_polls_and_no_generation():
     assert extract_executor_prompt_envelope(prompt_response) == "complete without marker"
 
 
+def test_wait_for_new_response_recognizes_terminal_handover_marker_without_generic_complete():
+    from local_orchestrator_watcher import ArchitectPlaywright
+    handover = "captured handover\nARCHITECT_HANDOVER_READY"
+
+    class Page:
+        def __init__(self):
+            self.snapshots = iter([
+                [{"id": "old", "text": "old"}],
+                [{"id": "new", "text": handover}],
+            ])
+        def evaluate(self, script):
+            if 'data-message-author-role="assistant"' in script:
+                return next(self.snapshots)
+            return False
+
+    bridge = ArchitectPlaywright(Page())
+    baseline = bridge.assistant_baseline()
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0)
+    assert observed == {"state": "COMPLETED", "text": handover}
+
+
 def test_completion_fallback_rejects_generation_visible_and_malformed_envelopes():
     assert extract_executor_prompt_envelope(f"{BEGIN}\none\n{END}\n{BEGIN}\ntwo\n{END}") is None
     assert extract_executor_prompt_envelope(f"{BEGIN}\nouter {BEGIN}\ninner\n{END}\n{END}") is None
