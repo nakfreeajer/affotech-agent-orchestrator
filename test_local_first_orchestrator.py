@@ -1327,6 +1327,75 @@ def test_next_prompt_ready_failed_rollover_does_not_launch_or_duplicate(tmp_path
     assert prompt.read_text(encoding="utf-8") == "next bounded task"
 
 
+def test_completed_executor_success_retires_active_pid_but_preserves_history(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "completed.txt"
+    result.write_text("completed", encoding="utf-8")
+    watcher.state.update({"taskId": "000052", "codexPid": 14872, "active_codex_pid": 14872,
+                          "nextTaskId": "000053"})
+    watcher._record_executor_success("000052", result, 0)
+    assert watcher.state["executorProcessState"] == "COMPLETED_WITH_RESULT"
+    assert "codexPid" not in watcher.state
+    assert "active_codex_pid" not in watcher.state
+    assert watcher.state["lastExecutorPid"] == 14872
+    assert watcher.state["lastCompletedTaskId"] == "000052"
+
+
+def test_next_prompt_ready_stale_completed_pid_does_not_block_rollover_or_launch(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({"lastCompletedTaskId": "000052", "taskId": "000052", "nextTaskId": "000053",
+                          "codexPid": 14872, "executorProcessState": "COMPLETED_WITH_RESULT"})
+    events = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: events.append("rollover") or True)
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: events.append("launch") or type("Process", (), {"pid": 5300})())
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: (_ for _ in ()).throw(AssertionError("stale PID must not be queried"))))
+    process = watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False)
+    assert process is not None
+    assert events == ["rollover", "launch"]
+    assert watcher.state.get("codexPid") is None
+    assert watcher.state["lastExecutorPid"] == 14872
+    assert prompt.read_text(encoding="utf-8") == "next bounded task"
+
+
+def test_next_prompt_ready_stale_completed_pid_allows_real_rollover_service(tmp_path, monkeypatch):
+    watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({"lastCompletedTaskId": "000052", "taskId": "000052", "nextTaskId": "000053",
+                          "codexPid": 14872, "executorProcessState": "COMPLETED_WITH_RESULT"})
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/c/current"
+
+    class Bridge:
+        page = Page()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def wait_for_new_response(self, *_args, **_kwargs): return {"state": "COMPLETED", "text": "handover"}
+        def close(self): pass
+
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: (_ for _ in ()).throw(AssertionError("retired PID must not be queried"))))
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: Bridge()))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _watcher, _bridge, requested: requested)
+    monkeypatch.setattr(watcher.session_rollover, "request_if_due", lambda *_args, **kwargs: calls.append(kwargs["executor_running"]) or True)
+    monkeypatch.setattr(watcher, "process_pending_handover_response", lambda *_args: True)
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is True
+    assert calls == [False]
+    assert watcher.state.get("codexPid") is None
+
+
+def test_next_prompt_ready_live_current_executor_still_blocks_dispatch(tmp_path, monkeypatch):
+    watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({"taskId": "000053", "lastCompletedTaskId": "000052", "nextTaskId": "000054",
+                          "codexPid": 5300, "executorProcessState": "RUNNING"})
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda pid: pid == 5300))
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: (_ for _ in ()).throw(AssertionError("must remain blocked before attach"))))
+    launches = []
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1))
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+    assert launches == []
+    assert watcher.state["codexPid"] == 5300
+
+
 def test_result_delivery_deferral_resumes_same_bridge_after_generation(tmp_path, monkeypatch):
     watcher = ready(tmp_path)
     sends = []

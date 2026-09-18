@@ -2975,6 +2975,7 @@ class LocalFirstOrchestrator:
             self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
 
     def _record_executor_success(self, task_id: str, result: Path, exit_code: int | None = None) -> None:
+        completed_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
         self.state.update({
             "state": "RESULT_READY",
             "taskId": task_id,
@@ -2990,6 +2991,28 @@ class LocalFirstOrchestrator:
             "formatRecoveryExhausted": False,
             "architectFormatRecoveryTaskId": None,
         })
+        if completed_pid:
+            self.state["lastExecutorPid"] = completed_pid
+            self.state.pop("codexPid", None)
+            self.state.pop("active_codex_pid", None)
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "STALE_EXECUTOR_PID_RETIRED", self.state, taskId=task_id, nextTaskId=self.state.get("nextTaskId"))
+
+    def retire_completed_executor_ownership(self) -> bool:
+        """Retire only PID fields proven to belong to a completed result."""
+        task_id = str(self.state.get("taskId") or "")
+        completed_task_id = str(self.state.get("lastCompletedTaskId") or "")
+        if (self.state.get("executorProcessState") != "COMPLETED_WITH_RESULT"
+                or not task_id or task_id != completed_task_id):
+            return False
+        completed_pid = self.state.get("codexPid") or self.state.get("active_codex_pid")
+        if not completed_pid:
+            return False
+        self.state["lastExecutorPid"] = completed_pid
+        self.state.pop("codexPid", None)
+        self.state.pop("active_codex_pid", None)
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "STALE_EXECUTOR_PID_RETIRED", self.state, taskId=task_id, nextTaskId=self.state.get("nextTaskId"))
+        return True
 
     def intake_inbox(self, launcher: Callable[[str, Path], Any]) -> bool:
         """Consume and launch one approved local prompt while IDLE."""
@@ -3565,7 +3588,7 @@ class LocalFirstOrchestrator:
         if isinstance(path, str) and Path(path).is_file() and Path(path).read_text(encoding="utf-8", errors="replace").strip():
             task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
             self._record_executor_success(task_id, Path(path), self.state.get("executorExitCode"))
-            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_FOUND", self.state, resultPath=path)
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_FOUND", self.state, pid=self.state.get("lastExecutorPid") or pid, resultPath=path)
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_READY", self.state)
         else:
             result_exists = bool(isinstance(path, str) and Path(path).is_file())
@@ -3642,7 +3665,7 @@ class LocalFirstOrchestrator:
             return "EXECUTOR_CRASHED"
         self._record_executor_success(task_id, result, exit_code)
         self.save()
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_FOUND", self.state, pid=self.state.get("codexPid"), exitCode=exit_code, resultPath=result_path)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "EXECUTOR_RESULT_FOUND", self.state, pid=self.state.get("lastExecutorPid"), exitCode=exit_code, resultPath=result_path)
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_READY", self.state)
         return "RESULT_READY"
 
@@ -4404,6 +4427,8 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     boundary_state = safe_boundary_state or watcher.state.get("state")
     if paused() or boundary_state not in {"EXECUTOR_RUNNING", "NEXT_PROMPT_READY"} or watcher.state.get("state") != boundary_state or not watcher.state.get("rolloverDue"):
         return False
+    if boundary_state == "NEXT_PROMPT_READY":
+        watcher.retire_completed_executor_ownership()
     pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if boundary_state == "EXECUTOR_RUNNING" and (not pid or not LocalWatcher.process_alive(int(pid))):
         return False
@@ -4449,6 +4474,7 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     """Gate NEXT_PROMPT_READY dispatch on due rollover maintenance."""
     if watcher.state.get("state") != "NEXT_PROMPT_READY":
         return None
+    watcher.retire_completed_executor_ownership()
     if watcher.state.get("rolloverDue") and not service_deferred_rollover_once(watcher, endpoint, paused, "NEXT_PROMPT_READY"):
         return None
     runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
