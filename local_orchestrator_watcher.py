@@ -1090,6 +1090,7 @@ class ArchitectSessionRollover:
 
     def _existing_fresh_candidate_page(self, bridge: "ArchitectPlaywright", handover: str | None = None) -> Any | None:
         candidate_id = self.watcher.state.get("rolloverFreshCandidateConversationId")
+        stale_candidate_id = None
         context = getattr(getattr(bridge, "page", None), "context", None)
         pages = getattr(context, "pages", []) if context is not None else []
         matches = []
@@ -1107,7 +1108,7 @@ class ArchitectSessionRollover:
                     continue
                 if architect_conversation_ids_equivalent(str(candidate_id), actual_id):
                     return page
-            return None
+            stale_candidate_id = str(candidate_id)
         if (not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending")
                 or not self.watcher.state.get("handoverRequested")
                 or not isinstance(handover, str) or not architect_handover_ready(handover)):
@@ -1116,6 +1117,10 @@ class ArchitectSessionRollover:
         bootstrap_hash = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
         stored_hash = self.watcher.state.get("rolloverFreshBootstrapPayloadHash")
         if stored_hash and stored_hash != bootstrap_hash:
+            if self.watcher.state.get("rolloverFreshCandidateDiscoveryState") != "BOOTSTRAP_MISMATCH":
+                self.watcher.state["rolloverFreshCandidateDiscoveryState"] = "BOOTSTRAP_MISMATCH"
+                self.watcher.save()
+                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_BOOTSTRAP_MISMATCH", self.watcher.state)
             return None
         if not stored_hash:
             self.watcher.state["rolloverFreshBootstrapPayloadHash"] = bootstrap_hash
@@ -1146,6 +1151,22 @@ class ArchitectSessionRollover:
             print(f"ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS count={len(proven)}")
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS", self.watcher.state, count=len(proven))
             return None
+        if not proven:
+            if self.watcher.state.get("rolloverFreshCandidateDiscoveryState") != "NOT_FOUND":
+                self.watcher.state["rolloverFreshCandidateDiscoveryState"] = "NOT_FOUND"
+                self.watcher.save()
+                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_NOT_FOUND", self.watcher.state)
+            return None
+        if stale_candidate_id:
+            actual_id = architect_conversation_id_from_url(getattr(proven[0], "url", ""))
+            self.watcher.state.update({
+                "rolloverFreshCandidateConversationId": actual_id,
+                "rolloverFreshCandidateState": self.watcher.state.get("rolloverFreshCandidateState") or "ACK_PENDING",
+                "rolloverFreshCandidateDiscoveryState": "IDENTITY_CORRECTED",
+            })
+            self.watcher.save()
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_IDENTITY_CORRECTED", self.watcher.state, oldCandidateId=stale_candidate_id, newCandidateId=actual_id)
+            return proven[0]
         self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
         self.watcher.save()
         return proven[0] if proven else None
