@@ -31,6 +31,11 @@ RELAY_POINTER = "relay/current/LATEST_ARCHITECT_PROMPT.json"
 RESULT_SCHEMA_VERSION = "1.0"
 ARCHITECT_MEMORY_THRESHOLD_BYTES = 1_073_741_824
 ARCHITECT_MEMORY_THRESHOLD_MIB = 1024
+ARCHITECT_MEMORY_SAFETY_CEILING_BYTES = ARCHITECT_MEMORY_THRESHOLD_BYTES * 2
+ROLLOVER_RECOVERY_MAX_ATTEMPTS = 2
+ROLLOVER_RECOVERY_WINDOW_SECONDS = 300.0
+ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS = 5.0
+ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS = 5.0
 AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
@@ -848,6 +853,7 @@ class ArchitectSessionRollover:
         self._last_logged_memory_bytes: int | None = None
         self._last_sampled_memory_bytes: int | None = None
         self._last_memory_error: str | None = None
+        self._next_memory_sample_at = 0.0
 
     def initialize_current_session(self) -> None:
         self.watcher.state["architectResponseCount"] = 0
@@ -859,6 +865,8 @@ class ArchitectSessionRollover:
 
     def sample_memory(self, memory_reader: Callable[[], int] | None = None, emit: Callable[[str], None] = print) -> str | None:
         """Sample only the explicitly governed Architect process tree."""
+        if self.watcher.state.get("humanRequiredReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT":
+            return None
         reader = memory_reader or getattr(self.watcher, "architect_memory_reader", None)
         if reader is None:
             if getattr(self.watcher, "memory_ownership_required", False) and self.watcher.state.get("architectMemoryOwnershipWarningEmitted") is not True:
@@ -902,7 +910,81 @@ class ArchitectSessionRollover:
             self.watcher.state["rolloverTrigger"] = trigger
             self.watcher.save()
             emit(f"ROLLOVER_DUE trigger={trigger}")
+        if trigger and memory_bytes >= ARCHITECT_MEMORY_SAFETY_CEILING_BYTES:
+            self._enter_safety_cutout("ARCHITECT_ROLLOVER_SAFETY_CUTOUT")
         return trigger
+
+    def sample_memory_for_loop(self) -> str | None:
+        """Throttle main-loop telemetry without changing direct sampling semantics."""
+        now = time.monotonic()
+        if now < self._next_memory_sample_at:
+            return None
+        self._next_memory_sample_at = now + ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS
+        return self.sample_memory()
+
+    def _begin_bounded_recovery(self) -> bool:
+        """Acquire one durable, backoff-protected rollover recovery attempt."""
+        state = self.watcher.state
+        if state.get("humanRequiredReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT":
+            return False
+        now = time.time()
+        started = float(state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
+        if state.get("rolloverRecoveryState") == "COMPLETE":
+            for key in ("rolloverRecoveryStartedAt", "rolloverRecoveryAttemptCount", "rolloverRecoveryLastAttemptAt", "rolloverRecoveryTerminalReason", "rolloverRecoveryRetryAfter"):
+                state.pop(key, None)
+            state.pop("rolloverRecoveryState", None)
+            started = 0.0
+        if not started:
+            started = now
+            state["rolloverRecoveryStartedAt"] = started
+            state["rolloverRecoveryAttemptCount"] = 0
+            state.pop("rolloverRecoveryTerminalReason", None)
+            state["rolloverRecoveryState"] = "PENDING"
+            state.pop("rolloverRecoveryRetryAfter", None)
+            self.watcher.save()
+        attempts = int(state.get("rolloverRecoveryAttemptCount", 0) or 0)
+        if attempts >= ROLLOVER_RECOVERY_MAX_ATTEMPTS or now - started >= ROLLOVER_RECOVERY_WINDOW_SECONDS:
+            self._enter_safety_cutout("ARCHITECT_ROLLOVER_SAFETY_CUTOUT")
+            return False
+        retry_after = float(state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
+        if now < retry_after:
+            return False
+        state["rolloverRecoveryAttemptCount"] = attempts + 1
+        state["rolloverRecoveryLastAttemptAt"] = now
+        state["rolloverRecoveryRetryAfter"] = now + ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS
+        state["rolloverRecoveryState"] = "RECOVERING"
+        self.watcher.save()
+        return True
+
+    def _record_recovery_failure(self) -> None:
+        state = self.watcher.state
+        attempts = int(state.get("rolloverRecoveryAttemptCount", 0) or 0)
+        started = float(state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
+        if attempts >= ROLLOVER_RECOVERY_MAX_ATTEMPTS or (started and time.time() - started >= ROLLOVER_RECOVERY_WINDOW_SECONDS):
+            self._enter_safety_cutout("ARCHITECT_ROLLOVER_SAFETY_CUTOUT")
+        else:
+            state["rolloverRecoveryState"] = "PENDING"
+            self.watcher.save()
+
+    def _record_recovery_success(self) -> None:
+        state = self.watcher.state
+        state["rolloverRecoveryState"] = "COMPLETE"
+        state.pop("rolloverRecoveryRetryAfter", None)
+        self.watcher.save()
+
+    def _enter_safety_cutout(self, reason: str) -> None:
+        state = self.watcher.state
+        state.update({
+            "state": "HUMAN_REQUIRED",
+            "humanRequiredReason": reason,
+            "rolloverRecoveryState": "HUMAN_REQUIRED",
+            "rolloverRecoveryTerminalReason": reason,
+            "rolloverInProgress": False,
+            "rolloverDue": True,
+        })
+        state.pop("rolloverRecoveryRetryAfter", None)
+        self.watcher.save()
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_ROLLOVER_SAFETY_CUTOUT", state, reason=reason)
 
     @staticmethod
     def rollover_trigger(memory_bytes: int, response_count: int = 0) -> str | None:
@@ -4486,7 +4568,7 @@ def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: 
 
 
 def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool], safe_boundary_state: str | None = None) -> bool:
-    """Service maintenance once at the live-executor boundary only."""
+    """Service one bounded rollover recovery attempt at a safe boundary."""
     boundary_state = safe_boundary_state or watcher.state.get("state")
     if paused() or boundary_state not in {"EXECUTOR_RUNNING", "NEXT_PROMPT_READY"} or watcher.state.get("state") != boundary_state or not watcher.state.get("rolloverDue"):
         return False
@@ -4497,34 +4579,41 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         return False
     if boundary_state == "NEXT_PROMPT_READY" and pid and LocalWatcher.process_alive(int(pid)):
         return False
+    rollover = watcher.session_rollover
+    if not rollover._begin_bounded_recovery():
+        return False
+    def failed() -> bool:
+        rollover._record_recovery_failure()
+        return False
     bridge = None
     try:
         conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
         bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
         conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
         baseline = bridge.assistant_baseline()
-        rollover = watcher.session_rollover
         task_id = str(watcher.state.get("taskId") or "")
         if (watcher.state.get("rolloverPending") and task_id
                 and watcher.state.get("rolloverAttemptedForTaskId") == task_id):
             if rollover.reconcile_pending_handover(bridge):
+                rollover._record_recovery_success()
                 return True
             if (watcher.state.get("handoverRequested")
                     or watcher.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}):
-                return False
+                return failed()
         if not rollover.request_if_due(bridge, latest_prompt_dispatched=True, executor_running=boundary_state == "EXECUTOR_RUNNING", architect_generating=bridge.generation_visible(), safe_boundary_state=boundary_state):
-            return False
+            return failed()
         observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
         if observed.get("state") != "COMPLETED" or not watcher.process_pending_handover_response(bridge, observed.get("text", "")):
             if watcher.state.get("rolloverInProgress"):
                 watcher.defer_failed_rollover("ARCHITECT_HANDOVER_RESPONSE_INVALID")
-            return False
+            return failed()
+        rollover._record_recovery_success()
         return True
     except Exception as error:
         if watcher.state.get("rolloverInProgress"):
             watcher.defer_failed_rollover(type(error).__name__)
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_MAINTENANCE_FAILED", watcher.state, errorClass=type(error).__name__)
-        return False
+        return failed()
     finally:
         if bridge is not None:
             try:
@@ -4648,7 +4737,7 @@ def main() -> None:
         while True:
             rollover = getattr(watcher, "session_rollover", None)
             if rollover is not None:
-                rollover.sample_memory()
+                rollover.sample_memory_for_loop()
             state = watcher.state.get("state", "IDLE")
             if state != "HUMAN_REQUIRED" and human_wait_bridge is not None:
                 try:
@@ -4850,7 +4939,7 @@ def main() -> None:
             watcher.save()
             try:
                 if rollover is not None:
-                    rollover.sample_memory()
+                    rollover.sample_memory_for_loop()
                 if (watcher.state.get("state") == "RESULT_READY" and not discussion_paused()
                         and (not watcher.state.get("handoverRequested", False) or not watcher.state.get("rolloverInProgress", False))):
                     bridge = watcher.deliver_result_with_recovery(

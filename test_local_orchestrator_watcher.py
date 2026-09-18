@@ -710,6 +710,78 @@ def test_next_prompt_ready_rollover_rejects_live_codex_and_invalid_staging(tmp_p
     assert not ArchitectSessionRollover(generating).request_if_due(Bridge(), True, False, architect_generating=True, safe_boundary_state="NEXT_PROMPT_READY")
 
 
+def test_due_rollover_recovery_is_bounded_and_enters_safety_cutout(tmp_path, monkeypatch):
+    import local_orchestrator_watcher as watcher_module
+    from local_orchestrator_watcher import LocalFirstOrchestrator
+
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000054.txt"
+    prompt.write_bytes(b"preserved staged prompt")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000053", "lastCompletedTaskId": "000053",
+        "nextTaskId": "000054", "nextPromptPath": str(prompt), "targetWorktree": "worktree-054",
+        "rolloverDue": True, "rolloverPending": True, "rolloverAttemptedForTaskId": "000053",
+        "handoverRequested": True, "executorProcessState": "COMPLETED_WITH_RESULT",
+        "codexPid": None, "active_codex_pid": None,
+    })
+    now = [1000.0]
+    attaches = []
+    launches = []
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now[0])
+
+    class Page:
+        url = "https://chatgpt.com/c/old"
+        context = None
+
+    class Bridge:
+        page = Page()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def _assistant_entries(self): return []
+        def generation_visible(self): return False
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: attaches.append(1) or bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    for _ in range(2):
+        assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+        now[0] += 6.0
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 2
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
+    assert watcher.state["rolloverRecoveryState"] == "HUMAN_REQUIRED"
+    assert watcher.state["rolloverRecoveryTerminalReason"] == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
+    assert len(attaches) == 2
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["nextTaskId"] == "000054"
+    assert watcher.state["nextPromptPath"] == str(prompt)
+    assert prompt.read_bytes() == b"preserved staged prompt"
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: launches.append(1), "endpoint", lambda: False) is None
+    assert attaches == [1, 1]
+    assert launches == []
+
+
+def test_rollover_recovery_accounting_records_successful_completion(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, LocalWatcher
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.state.update({"rolloverDue": True, "rolloverPending": True, "taskId": "task-1"})
+    rollover = ArchitectSessionRollover(watcher)
+    assert rollover._begin_bounded_recovery() is True
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 1
+    rollover._record_recovery_success()
+    assert watcher.state["rolloverRecoveryState"] == "COMPLETE"
+
+
+def test_memory_safety_ceiling_enters_rollover_cutout(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_SAFETY_CEILING_BYTES, LocalWatcher
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    rollover = ArchitectSessionRollover(watcher)
+    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_SAFETY_CEILING_BYTES) == "MEMORY_THRESHOLD"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
+
+
 def test_architect_memory_tree_aggregates_only_owned_root_and_descendants():
     from local_orchestrator_watcher import architect_process_tree_memory_bytes
     rows = [
