@@ -1614,10 +1614,14 @@ class ArchitectPlaywright:
             script = """
             () => [...document.querySelectorAll('[data-message-author-role="assistant"]')]
               .filter((node) => node.isConnected)
-              .map((node) => ({
-                id: node.getAttribute('data-message-id'),
-                text: node.innerText || node.textContent || ''
-              }))
+              .map((node) => {
+                const clone = node.cloneNode(true);
+                clone.querySelectorAll('button,[role="button"]').forEach(control => control.remove());
+                return {
+                  id: node.getAttribute('data-message-id'),
+                  text: clone.innerText || clone.textContent || ''
+                };
+              })
             """
             last_error = None
             for _ in range(3):

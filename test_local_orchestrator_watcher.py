@@ -1745,6 +1745,33 @@ def test_atomic_assistant_snapshot_survives_virtualized_node_replacement():
     assert bridge._assistant_entries() == [{"id": "b", "text": "current"}]
 
 
+def test_assistant_snapshot_removes_structural_ui_chrome_but_preserves_semantic_text():
+    from local_orchestrator_watcher import ArchitectPlaywright, architect_handover_ready
+    semantic = ("AFFOTECH ARCHITECT SESSION HANDOVER\n\n"
+                "```python\nprint('button and Shorten are genuine content')\n```\n\n"
+                "Fresh Architect session bootstrap protocol:\n\n"
+                "After accepting this handover, reply exactly:\n\n"
+                "ARCHITECT_SESSION_READY\n\nARCHITECT_HANDOVER_READY")
+    contaminated = semantic + "\nShorten this handover for faster bootstrapping"
+    assert "ARCHITECT_HANDOVER_READY" in contaminated
+    assert not architect_handover_ready(contaminated)
+
+    class Page:
+        def evaluate(self, script):
+            assert "cloneNode(true)" in script
+            assert "button,[role=\"button\"]" in script
+            return [{"id": "assistant-1", "text": semantic}]
+        def locator(self, _selector):
+            raise AssertionError("assistant snapshot should use one DOM evaluation")
+
+    entry = ArchitectPlaywright(Page())._assistant_entries()[0]
+    assert entry["id"] == "assistant-1"
+    assert entry["text"] == semantic
+    assert "Shorten this handover for faster bootstrapping" not in entry["text"]
+    assert "button and Shorten are genuine content" in entry["text"]
+    assert architect_handover_ready(entry["text"])
+
+
 def test_virtualized_snapshot_race_continues_and_finds_later_prompt(tmp_path):
     from local_orchestrator_watcher import ArchitectPlaywright
     class Page:

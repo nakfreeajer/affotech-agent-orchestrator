@@ -1296,7 +1296,10 @@ def test_acknowledged_handover_recovery_reconstructs_and_launches_staged_next_ta
         def __init__(self, url, assistants): self.url, self.assistants, self.closed, self.context = url, assistants, False, None
         def evaluate(self, script):
             if "stop-button" in script: return False
-            if 'data-message-author-role="assistant"' in script: return self.assistants
+            if 'data-message-author-role="assistant"' in script:
+                assert "cloneNode(true)" in script
+                assert "button,[role=\"button\"]" in script
+                return self.assistants
             return []
         def close(self): self.closed = True
 
@@ -1307,7 +1310,7 @@ def test_acknowledged_handover_recovery_reconstructs_and_launches_staged_next_ta
 
     class Bridge:
         page = old
-        def _assistant_entries(self): return old.assistants
+        def _assistant_entries(self): return ArchitectPlaywright(old)._assistant_entries()
         def assistant_baseline(self): return {"count": 1, "text_hash": "old"}
         def generation_visible(self): return False
         def open_fresh_with_handover(self, _handover): opened.append(1); return fresh
