@@ -1541,6 +1541,122 @@ def test_ambiguous_fresh_candidate_is_reused_before_new_tab_creation(tmp_path):
     assert watcher.state["nextTaskId"] == "000050"
 
 
+def test_fresh_candidate_reacquisition_uses_bootstrap_and_ready_proof(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "handoverRequested": True, "rolloverPending": True,
+                          "rolloverDue": True, "rolloverAttemptedForTaskId": "000049", "architectConversationId": "OLD",
+                          "taskId": "000049", "nextTaskId": "000050", "pending_handover": handover,
+                          "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS"})
+    watcher.save()
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+
+    class Page:
+        def __init__(self, url, users, assistants):
+            self.url, self.users, self.assistants, self.closed = url, users, assistants, False
+            self.context = None
+        def evaluate(self, script):
+            if 'data-message-author-role="user"' in script: return self.users
+            if 'data-message-author-role="assistant"' in script: return self.assistants
+            if "stop-button" in script: return False
+            return False
+        def close(self): self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD", [], [])
+    valid = Page("https://chatgpt.com/c/VALID", [bootstrap], [{"id": "ready", "text": "ARCHITECT_SESSION_READY"}])
+    unrelated = Page("https://chatgpt.com/c/OTHER", ["unrelated"], [{"id": "x", "text": "discussion"}])
+    context = type("Context", (), {"pages": [old, valid, unrelated]})()
+    old.context = valid.context = unrelated.context = context
+    bridge = ArchitectPlaywright(old)
+    assert watcher.session_rollover._existing_fresh_candidate_page(bridge, handover) is valid
+    assert watcher.state["rolloverFreshBootstrapPayloadHash"] == hashlib.sha256(bootstrap.encode()).hexdigest()
+
+
+def test_fresh_candidate_requires_exact_bootstrap_and_ready(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    handover = "handover\nARCHITECT_HANDOVER_READY"
+    watcher.state.update({"rolloverPending": True, "rolloverDue": True, "handoverRequested": True,
+                          "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS", "architectConversationId": "OLD"})
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+
+    class Page:
+        def __init__(self, url, users, assistants): self.url, self.users, self.assistants, self.context = url, users, assistants, None
+        def evaluate(self, script):
+            if 'data-message-author-role="user"' in script: return self.users
+            if 'data-message-author-role="assistant"' in script: return self.assistants
+            return False
+
+    old = Page("https://chatgpt.com/c/OLD", [], [])
+    wrong = Page("https://chatgpt.com/c/WRONG", [bootstrap + " extra"], [{"text": "ARCHITECT_SESSION_READY"}])
+    no_ready = Page("https://chatgpt.com/c/NO_READY", [bootstrap], [{"text": "ordinary prose"}])
+    context = type("Context", (), {"pages": [old, wrong, no_ready]})()
+    for page in (old, wrong, no_ready): page.context = context
+    assert watcher.session_rollover._existing_fresh_candidate_page(ArchitectPlaywright(old), handover) is None
+
+
+def test_ready_unidentified_candidate_is_reused_and_committed_without_new_tab(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "handoverRequested": True, "rolloverPending": True,
+                          "rolloverDue": True, "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+                          "architectConversationId": "OLD", "taskId": "000049", "nextTaskId": "000050",
+                          "pending_handover": handover})
+    watcher.save()
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+
+    class Page:
+        def __init__(self, url, users, assistants):
+            self.url, self.users, self.assistants, self.closed, self.context = url, users, assistants, False, None
+        def evaluate(self, script):
+            if "stop-button" in script: return False
+            if 'data-message-author-role="user"' in script: return self.users
+            if 'data-message-author-role="assistant"' in script: return self.assistants
+            return False
+        def close(self): self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD", [], [])
+    fresh = Page("https://chatgpt.com/c/FRESH", [bootstrap], [{"id": "ready", "text": "ARCHITECT_SESSION_READY"}])
+    context = type("Context", (), {"pages": [old, fresh]})()
+    old.context = fresh.context = context
+    opened = []
+    class Bridge:
+        page = old
+        _fresh_candidate_submission_ambiguous = True
+        def open_fresh_with_handover(self, _handover):
+            opened.append(1)
+            raise AssertionError("proven candidate must be reused")
+
+    bridge = Bridge()
+    assert watcher.session_rollover.complete_from_response(bridge, handover) is True
+    assert opened == []
+    assert watcher.state["architectConversationId"] == "FRESH"
+    assert old.closed is True
+    assert fresh.closed is False
+    assert watcher.state["nextTaskId"] == "000050"
+
+
+def test_multiple_proven_fresh_candidates_fail_closed(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    handover = "handover\nARCHITECT_HANDOVER_READY"
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+    watcher.state.update({"rolloverPending": True, "rolloverDue": True, "handoverRequested": True,
+                          "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS", "architectConversationId": "OLD"})
+
+    class Page:
+        def __init__(self, url): self.url, self.context = url, None
+        def evaluate(self, script):
+            if 'data-message-author-role="user"' in script: return [bootstrap]
+            if 'data-message-author-role="assistant"' in script: return [{"text": "ARCHITECT_SESSION_READY"}]
+            return False
+
+    old = Page("https://chatgpt.com/c/OLD")
+    first, second = Page("https://chatgpt.com/c/FIRST"), Page("https://chatgpt.com/c/SECOND")
+    context = type("Context", (), {"pages": [old, first, second]})()
+    for page in (old, first, second): page.context = context
+    assert watcher.session_rollover._existing_fresh_candidate_page(ArchitectPlaywright(old), handover) is None
+    assert watcher.state["rolloverFreshCandidateDiscoveryState"] == "AMBIGUOUS"
+
+
 def test_rollover_timeout_closes_only_fresh_page_and_preserves_authority(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "ARCHITECT_RUNNING", "handoverRequested": True, "rolloverPending": True,

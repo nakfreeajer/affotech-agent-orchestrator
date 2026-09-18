@@ -417,6 +417,13 @@ def architect_session_ready(response: str) -> bool:
     return str(response or "").strip() == READY
 
 
+def fresh_architect_bootstrap_payload(handover: str) -> str:
+    """Build the deterministic wire payload used by every fresh Architect tab."""
+    return (f"{handover}\n\n"
+            "Fresh Architect session bootstrap protocol:\n"
+            f"After accepting this handover, reply exactly:\n{READY}")
+
+
 def resolve_architect_browser_root_pid(endpoint: str) -> int:
     """Resolve the unique Windows listener owner for the governed CDP endpoint."""
     parts = urlsplit(endpoint)
@@ -1010,8 +1017,16 @@ class ArchitectSessionRollover:
         task_id = str(self.watcher.state.get("taskId") or "")
         if not task_id or self.watcher.state.get("rolloverAttemptedForTaskId") != task_id:
             return False
+        handover = self.watcher.state.get("pending_handover")
+        if not isinstance(handover, str) or not architect_handover_ready(handover):
+            entries = bridge._assistant_entries()
+            handover = next((entry.get("text") for entry in reversed(entries)
+                             if isinstance(entry, dict) and isinstance(entry.get("text"), str)
+                             and architect_handover_ready(entry["text"])), None)
         candidate_state = self.watcher.state.get("rolloverFreshCandidateState")
-        candidate_page = self._existing_fresh_candidate_page(bridge) if candidate_state else None
+        candidate_page = self._existing_fresh_candidate_page(bridge, handover)
+        if self.watcher.state.get("rolloverFreshCandidateDiscoveryState") == "AMBIGUOUS":
+            return False
         if candidate_state in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"} and candidate_page is None:
             return False
         if candidate_page is not None and not self.watcher.state.get("rolloverFreshCandidateConversationId"):
@@ -1027,12 +1042,6 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverHandoverResponseIdentity", None)
             self.watcher.save()
             candidate_state = None
-        handover = self.watcher.state.get("pending_handover")
-        if not isinstance(handover, str) or not architect_handover_ready(handover):
-            entries = bridge._assistant_entries()
-            handover = next((entry.get("text") for entry in reversed(entries)
-                             if isinstance(entry, dict) and isinstance(entry.get("text"), str)
-                             and architect_handover_ready(entry["text"])), None)
         if not handover:
             return False
         response_identity = hashlib.sha256(handover.encode("utf-8")).hexdigest()
@@ -1063,7 +1072,7 @@ class ArchitectSessionRollover:
         self.watcher.save()
         return conversation_id
 
-    def _existing_fresh_candidate_page(self, bridge: "ArchitectPlaywright") -> Any | None:
+    def _existing_fresh_candidate_page(self, bridge: "ArchitectPlaywright", handover: str | None = None) -> Any | None:
         candidate_id = self.watcher.state.get("rolloverFreshCandidateConversationId")
         context = getattr(getattr(bridge, "page", None), "context", None)
         pages = getattr(context, "pages", []) if context is not None else []
@@ -1074,17 +1083,56 @@ class ArchitectSessionRollover:
                 old_id = architect_conversation_id_from_url(getattr(bridge.page, "url", ""))
             except (RuntimeError, StopIteration):
                 pass
+        if candidate_id:
+            for page in pages:
+                try:
+                    actual_id = architect_conversation_id_from_url(getattr(page, "url", ""))
+                except (RuntimeError, StopIteration, TypeError):
+                    continue
+                if architect_conversation_ids_equivalent(str(candidate_id), actual_id):
+                    return page
+            return None
+        if (not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending")
+                or not self.watcher.state.get("handoverRequested")
+                or not isinstance(handover, str) or not architect_handover_ready(handover)):
+            return None
+        bootstrap = fresh_architect_bootstrap_payload(handover)
+        bootstrap_hash = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
+        stored_hash = self.watcher.state.get("rolloverFreshBootstrapPayloadHash")
+        if stored_hash and stored_hash != bootstrap_hash:
+            return None
+        if not stored_hash:
+            self.watcher.state["rolloverFreshBootstrapPayloadHash"] = bootstrap_hash
+            self.watcher.save()
+        proven = []
         for page in pages:
             try:
                 actual_id = architect_conversation_id_from_url(getattr(page, "url", ""))
-            except RuntimeError:
+            except (RuntimeError, StopIteration, TypeError):
                 continue
-            if candidate_id and architect_conversation_ids_equivalent(str(candidate_id), actual_id):
-                matches.append(page)
-            elif (not candidate_id and self.watcher.state.get("rolloverFreshCandidateState") in {"SUBMISSION_AMBIGUOUS", "ACK_PENDING"}
-                  and (not old_id or not architect_conversation_ids_equivalent(old_id, actual_id))):
-                matches.append(page)
-        return matches[0] if len(matches) == 1 else None
+            if old_id and architect_conversation_ids_equivalent(old_id, actual_id):
+                continue
+            candidate_bridge = ArchitectPlaywright(page)
+            try:
+                user_messages = candidate_bridge.user_message_texts()
+                entries = candidate_bridge._assistant_entries()
+            except Exception:
+                continue
+            if not any(isinstance(text, str) and normalize_prompt(text) == normalize_prompt(bootstrap) for text in user_messages):
+                continue
+            completed = [entry.get("text", "") for entry in entries if isinstance(entry, dict) and isinstance(entry.get("text"), str)]
+            if not completed or not architect_session_ready(completed[-1]):
+                continue
+            proven.append(page)
+        if len(proven) > 1:
+            self.watcher.state["rolloverFreshCandidateDiscoveryState"] = "AMBIGUOUS"
+            self.watcher.save()
+            print(f"ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS count={len(proven)}")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS", self.watcher.state, count=len(proven))
+            return None
+        self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
+        self.watcher.save()
+        return proven[0] if proven else None
 
     def complete_from_response(self, bridge: "ArchitectPlaywright", response: str, emit: Callable[[str], None] = print) -> bool:
         if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
@@ -1092,6 +1140,8 @@ class ArchitectSessionRollover:
         self.watcher.state["handoverReady"] = True
         self.watcher.state["pending_handover"] = response
         self.watcher.state["rolloverHandoverResponseIdentity"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        bootstrap = fresh_architect_bootstrap_payload(response)
+        self.watcher.state["rolloverFreshBootstrapPayloadHash"] = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_READY", self.watcher.state)
         old_page = bridge.page
@@ -1104,7 +1154,7 @@ class ArchitectSessionRollover:
         }
         self.watcher.state["rolloverInProgress"] = True
         try:
-            new_page = self._existing_fresh_candidate_page(bridge)
+            new_page = self._existing_fresh_candidate_page(bridge, response)
             if new_page is None:
                 new_page = bridge.open_fresh_with_handover(response)
             else:
@@ -1164,6 +1214,8 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverFreshCandidateState", None)
             self.watcher.state.pop("rolloverFreshCandidateRetryAfter", None)
             self.watcher.state.pop("rolloverFreshCandidateAttemptCount", None)
+            self.watcher.state.pop("rolloverFreshBootstrapPayloadHash", None)
+            self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
             committed = True
@@ -2012,9 +2064,7 @@ class ArchitectPlaywright:
         new_page = self.page.context.new_page()
         self._fresh_candidate_page = new_page
         self._fresh_candidate_submission_ambiguous = False
-        bootstrap = (f"{handover}\n\n"
-                     "Fresh Architect session bootstrap protocol:\n"
-                     f"After accepting this handover, reply exactly:\n{READY}")
+        bootstrap = fresh_architect_bootstrap_payload(handover)
         fresh_bridge = None
         try:
             new_page.goto("https://chatgpt.com/")
