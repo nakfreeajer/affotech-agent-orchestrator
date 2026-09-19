@@ -37,6 +37,8 @@ ROLLOVER_RECOVERY_MAX_ATTEMPTS = 2
 ROLLOVER_RECOVERY_WINDOW_SECONDS = 300.0
 ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS = 5.0
 ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS = 5.0
+FRESH_BOOTSTRAP_OBSERVATION_TIMEOUT_SECONDS = 2.0
+FRESH_BOOTSTRAP_OBSERVATION_POLL_SECONDS = 0.1
 AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
@@ -2220,6 +2222,20 @@ class ArchitectPlaywright:
         target = normalize_prompt(payload)
         return any(normalize_prompt(text) == target for text in self.user_message_texts())
 
+    def observe_exact_user_message(self, payload: str, timeout: float = FRESH_BOOTSTRAP_OBSERVATION_TIMEOUT_SECONDS, poll_interval: float = FRESH_BOOTSTRAP_OBSERVATION_POLL_SECONDS) -> bool:
+        """Wait briefly for the submitted user message to mount on this page."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if self.exact_user_message_payload_observed(payload):
+                    return True
+            except Exception:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+
     def reconcile_unsent_submission(self, payload: str, timeout: float = 1.0) -> str:
         """Reconcile one ambiguous send on this page without allocating a tab."""
         try:
@@ -2656,10 +2672,7 @@ class ArchitectPlaywright:
                         "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED" if reconciliation == "SEND_FAILED" else "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
                     ) from submission_error
             else:
-                try:
-                    exact_submitted = fresh_bridge.exact_user_message_payload_observed(bootstrap)
-                except Exception:
-                    exact_submitted = False
+                exact_submitted = fresh_bridge.observe_exact_user_message(bootstrap)
                 if not exact_submitted:
                     try:
                         reconciliation = fresh_bridge.reconcile_unsent_submission(bootstrap)

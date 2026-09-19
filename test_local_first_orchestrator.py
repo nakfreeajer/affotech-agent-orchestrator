@@ -1640,11 +1640,37 @@ def test_fresh_weak_acknowledgement_requires_exact_user_message(tmp_path, monkey
     handover = "complete old handover\nARCHITECT_HANDOVER_READY"
     calls = []
 
+    class Locator:
+        def __init__(self, page): self.page = page
+        def count(self): return self.page.assistant_count
+
+    class Composer:
+        def __init__(self, page): self.page = page
+        def inner_text(self, **_): return self.page.composer_text
+
+    class Stop:
+        def __init__(self, page): self.page = page
+        def count(self): return 1 if self.page.generation else 0
+        def is_visible(self, **_): return self.page.generation
+
     class Page:
         url = "https://chatgpt.com/"
-        def __init__(self): self.closed = False; self.context = None; self.weak_signal = weak_signal
+        def __init__(self):
+            self.closed = False
+            self.context = None
+            self.composer_text = ""
+            self.generation = False
+            self.assistant_count = 0
         def goto(self, _url): pass
         def close(self): self.closed = True
+        def get_by_role(self, role, **_):
+            if role == "textbox": return Composer(self)
+            return Stop(self)
+        def locator(self, _selector): return Locator(self)
+        def evaluate(self, script):
+            if 'data-message-author-role="user"' in script: return []
+            if 'data-testid="stop-button"' in script: return self.generation
+            return []
 
     old, fresh = Page(), Page()
     class Context:
@@ -1656,15 +1682,56 @@ def test_fresh_weak_acknowledgement_requires_exact_user_message(tmp_path, monkey
         calls.append("initial")
         _self.initialSendMethod = "playwright.click"
         _self.initialSendActionReturned = True
+        if weak_signal == "generation_visible":
+            _self.page.generation = True
+            assert _self.generation_visible() is True
+        elif weak_signal == "assistant_started":
+            _self.page.assistant_count = 1
+            assert _self.assistant_count() == 1
+        else:
+            assert _self.page.composer_text == ""
     monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", submit)
-    monkeypatch.setattr(ArchitectPlaywright, "exact_user_message_payload_observed", lambda _self, _payload: False)
-    monkeypatch.setattr(ArchitectPlaywright, "reconcile_unsent_submission", lambda _self, _payload: "AMBIGUOUS")
 
     assert watcher.session_rollover.complete_from_response(ArchitectPlaywright(old), handover) is False
     assert calls == ["initial"]
     assert len(context.pages) == 2
     assert watcher.state["state"] == "HUMAN_REQUIRED"
     assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
+
+
+def test_fresh_initial_send_waits_for_delayed_exact_user_message_without_fallback(tmp_path, monkeypatch):
+    sent = []
+    observations = []
+
+    class Page:
+        url = "https://chatgpt.com/"
+        def __init__(self): self.closed = False; self.context = None
+        def goto(self, _url): pass
+        def close(self): self.closed = True
+
+    old, fresh = Page(), Page()
+    class Context:
+        def __init__(self): self.pages = [old]
+        def new_page(self): self.pages.append(fresh); fresh.context = self; return fresh
+    context = Context(); old.context = context
+
+    def submit(_self, payload):
+        sent.append(payload)
+        _self.initialSendMethod = "playwright.click"
+        _self.initialSendActionReturned = True
+
+    def exact(_self, _payload):
+        observations.append(1)
+        return len(observations) >= 3
+
+    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", submit)
+    monkeypatch.setattr(ArchitectPlaywright, "exact_user_message_payload_observed", exact)
+    monkeypatch.setattr(ArchitectPlaywright, "reconcile_unsent_submission", lambda *_args: pytest.fail("same-page fallback was not expected"))
+    bridge = ArchitectPlaywright(old)
+    assert bridge.open_fresh_with_handover("handover\nARCHITECT_HANDOVER_READY") is fresh
+    assert len(context.pages) == 2
+    assert len(sent) == 1
+    assert len(observations) == 3
 
 
 def test_fresh_click_noop_uses_one_same_page_enter_and_launches_staged_task_once(tmp_path, monkeypatch):
