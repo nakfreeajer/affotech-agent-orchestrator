@@ -2,7 +2,7 @@
 
 Original incident date: 2026-09-13
 
-Stabilization closure update: 2026-09-18
+Latest incident/governance update: 2026-09-19
 
 ## Purpose
 
@@ -18,35 +18,32 @@ Universal-template readiness lives in:
 
 Do not use an older incident-state snapshot below to override the current runtime contract.
 
-## Stabilization outcome
+## Current incident status
 
-The original 2026-09-13 incident chain no longer represents the current operational condition, but later production use on 2026-09-18 exposed additional restart/rollover recovery defects that required bounded repair.
+The original September 13 core-workflow stabilization remains accepted. September 18 and September 19 production use exposed additional Architect-rollover defects.
 
-Accepted runtime/source checkpoint after the latest recovery chain:
+Current accepted source/test checkpoint for the rollover repair chain:
 
-`2cebe036eb89535ddd90cd52a679b6451ff112d6` — `fix(orchestrator): recover stale fresh candidate identity`
+`49bf2c72699fdd8e0df2cbb31091b6751ffd6797` — `fix(orchestrator): wait for fresh bootstrap proof`
 
-At that checkpoint the specific September 18 deadlock was closed by deterministic qualification against the exact observed production state:
+Current production rollover status:
 
-- completed task `000052` remained completed and was not rerun;
-- staged next task `000053` remained preserved;
-- stale completed Executor PID ownership was retired without killing any process;
-- stale persisted fresh-Architect candidate identity was corrected by exact bootstrap + `ARCHITECT_SESSION_READY` content proof;
-- the already-open fresh Architect session was reused;
-- no additional fresh Architect tab was created;
-- no duplicate handover was sent;
-- old Architect closure occurred only after durable authority commit;
-- rollover due/pending state cleared;
-- the next Executor launch became eligible;
-- first-suite, focused rollover/recovery tests and Node tests passed apart from one unrelated order-sensitive Windows Git relay fixture already known outside this repair boundary.
+`PRODUCTION_QUALIFICATION_IN_PROGRESS`
 
-After production restart on the accepted checkpoint, Rony reported that the watcher was running again. This is evidence that the proven deadlock boundary was recovered; it is not permission to reopen or redesign unrelated accepted workflow foundations.
+On the current September 19 qualification run, after Rony manually closed two stale fresh tabs created by an older broken build, the watcher remained running and the staged Codex child for task `000054` launched. This is meaningful progress beyond the previous failure boundary, but the incident is not yet declared closed until the entire real rollover transaction is independently verified.
 
-Architect classification for the Orchestrator core remains:
+Required closure evidence:
 
-`PRODUCTION_MATURE_REFERENCE_IMPLEMENTATION`
+1. exactly one fresh Architect tab for the current transaction;
+2. exact fresh bootstrap submitted exactly once;
+3. `ARCHITECT_SESSION_READY` observed;
+4. new Architect conversation identity durably committed;
+5. old Architect closed only after authority commit;
+6. task `000053` not rerun;
+7. task `000054` launched exactly once;
+8. no technical rollover safety cutout during the successful transaction.
 
-New Orchestrator engineering must be justified by direct regression evidence, a clearly bounded maintenance need, or the universal-template extraction objective—not by speculative hardening.
+Universal-template extraction is paused until this production qualification closes.
 
 ## Incident 1 — Playwright Sync bridge crossed thread ownership
 
@@ -61,8 +58,6 @@ The remote discussion-control monitor created/first used a Playwright Sync bridg
 ### Repair
 
 `1ec880e7d2bede1d56078cab433f3d2793ec008b` — `fix(orchestrator): keep remote control Playwright thread-affine`
-
-The remote worker owns bridge create/use/reattach/close for its full lifetime.
 
 ### Permanent lesson
 
@@ -81,8 +76,6 @@ A two-second readiness wait was shorter than real Playwright attachment latency 
 ### Repair
 
 `54a82e81be99eb1a85831cf27ccf37a634082191` — `fix(orchestrator): harden Architect bridge startup`
-
-Startup gained a realistic bounded budget and failure now proves/requests bounded worker shutdown rather than merely stopping the wait.
 
 ### Permanent lesson
 
@@ -147,8 +140,6 @@ The old path inferred envelope presence only after successful strict parsing. An
 
 `216a57d0635bfa0e6342f276ab880b250afe4003` — `fix(orchestrator): fail closed on invalid Architect envelope`
 
-The literal opening marker now distinguishes intended machine authority before strict parsing succeeds.
-
 ### Permanent lesson
 
 There are three distinct input classes:
@@ -165,9 +156,7 @@ Malformed authority must never silently become non-authority.
 
 The Architect returned all required fields but in a different order from the parser contract.
 
-### Action
-
-A format-correction-only instruction preserved the already-decided audit and next prompt while correcting the canonical order:
+### Canonical order
 
 ```text
 <ORCHESTRATOR_RESULT>
@@ -213,11 +202,9 @@ Recorded PID is historical metadata until paired with current liveness and owner
 
 Never kill broad Codex process groups based solely on a stored PID. Process identity requires current liveness and ownership evidence.
 
-## Later stabilization failures and repairs
+## Later stabilization repairs before the September 18 rollover chain
 
-The 2026-09-13 incidents were followed by additional real-production defects during result delivery and rollover interaction. Those repairs are part of the same stabilization story even though they occurred after the original incident note.
-
-Key accepted additions before the September 18 restart/rollover chain:
+Key accepted additions:
 
 - `fce038e29698f18e13c7f9624bf6a80337b2cdc6` — exact result-delivery proof / recovery foundation;
 - `87a214fe98a190827dd06f0456e0d34a687410d5` — same-task false-reconciliation correction;
@@ -259,8 +246,6 @@ Accepted repair:
 
 `528c0b93ee013640c765fa0f4e81c5dc499b5a50` — `fix(orchestrator): preserve confirmed delivery after cleanup`
 
-A cleanup failure after confirmed result delivery could still be interpreted as transport exhaustion. Cleanup became best-effort after terminal delivery proof, and the watcher remained resident after genuine exhaustion.
-
 Permanent countermeasure:
 
 **Once delivery is durably confirmed, later UI cleanup cannot revoke that workflow fact.**
@@ -284,15 +269,11 @@ Permanent countermeasure:
 
 **Fresh-session recovery must use transaction/content proof, not tab count or visual heuristics.**
 
-### Failure C — rollover failure could erase the authority needed to recover it
+### Failure C — rollover failure could erase authority needed to recover it
 
 Accepted repair:
 
 `0bd18dad0b3f2766aedc1609f01b72ae1f44d3d7` — `fix(orchestrator): recover lost rollover handover authority`
-
-A deferred rollover failure cleared `handoverRequested` and could remove `pending_handover` while candidate-recovery evidence remained. On restart, the watcher rediscovered the old handover but candidate lookup was still gated by the lost authority flag.
-
-The repair reconstructs rollover authority from a valid visible/persisted handover before attempting candidate proof and preserves candidate-recovery evidence through deferred failure.
 
 Permanent countermeasure:
 
@@ -304,24 +285,7 @@ Accepted repair:
 
 `5eeeae0401eb595389c8839822f93d70c8395219` — `fix(orchestrator): retire stale completed Executor ownership`
 
-Exact live evidence showed:
-
-```text
-state=NEXT_PROMPT_READY
-lastCompletedTaskId=000052
-nextTaskId=000053
-executorProcessState=COMPLETED_WITH_RESULT
-codexPid=14872
-```
-
-Task `000052` could only have been recorded complete after its Executor was no longer active, but the historical PID remained in active ownership fields. If Windows later reused the same PID for another process, the NEXT_PROMPT_READY gate could interpret that unrelated process as the still-running Executor and silently block rollover/dispatch.
-
-The repair:
-
-- preserves the historical PID as `lastExecutorPid`;
-- clears active `codexPid` / `active_codex_pid` ownership on proven completion;
-- repairs old completed state on restart;
-- never kills a process merely because its PID equals historical Executor metadata.
+The repair preserves the historical PID as `lastExecutorPid`, clears active ownership after proven completion, repairs old completed state on restart, and never kills a process merely because its PID equals historical metadata.
 
 Permanent countermeasure:
 
@@ -333,88 +297,251 @@ Accepted repair:
 
 `2cebe036eb89535ddd90cd52a679b6451ff112d6` — `fix(orchestrator): recover stale fresh candidate identity`
 
-The exact persisted production state was:
+The persisted candidate ID no longer existed among live targets, while one live fresh Architect already contained the exact bootstrap and `ARCHITECT_SESSION_READY`.
 
-```text
-architectConversationId=6aac1369-7e48-83ec-b2bc-73797a88e6f5
-rolloverFreshCandidateState=SUBMISSION_AMBIGUOUS
-rolloverFreshCandidateConversationId=WEB:204cb572-6571-4b81-9bbd-25f5cedcb073
-handoverRequested=True
-pending_handover_present=True
-```
-
-The governed CDP endpoint `9333` showed the old Architect plus the actual already-ready fresh Architect:
-
-```text
-old = 6aac1369-7e48-83ec-b2bc-73797a88e6f5
-fresh = 6aac98c9-571c-83ec-b11a-4bb8bc7744d1
-```
-
-The persisted candidate `204cb572...` no longer existed among live targets.
-
-The bug was a stale-ID short circuit: when a persisted candidate ID existed but no live page matched it, candidate lookup returned `None` before reaching the deterministic bootstrap + `ARCHITECT_SESSION_READY` proof path. Because state remained `SUBMISSION_AMBIGUOUS`, reconciliation silently returned false forever.
-
-The repair now treats a persisted candidate ID as a strong hint, not irreversible authority:
+The repair treats a persisted candidate ID as a strong hint, not irreversible authority:
 
 1. if the persisted ID is live, reuse it;
 2. if it is stale, fall through to exact bootstrap + exact `ARCHITECT_SESSION_READY` proof;
-3. if exactly one candidate is proven, replace the stale ID with the live identity and continue normal rollover commit;
-4. if none are proven, fail closed with an explicit diagnostic;
+3. if exactly one candidate is proven, replace the stale ID with the live identity;
+4. if none are proven, fail closed;
 5. if multiple are proven, fail closed as ambiguous;
 6. do not create another tab merely because stale identity recovery is needed.
-
-The exact regression fixture preserves:
-
-```text
-old candidate authority = 6aac1369-7e48-83ec-b2bc-73797a88e6f5
-stale saved candidate   = WEB:204cb572-6571-4b81-9bbd-25f5cedcb073
-actual ready candidate  = 6aac98c9-571c-83ec-b11a-4bb8bc7744d1
-completed task          = 000052
-staged next task        = 000053
-```
 
 Permanent countermeasure:
 
 **Live transaction proof outranks stale persisted identity when the persisted identity is proven absent.**
 
-A saved ID may accelerate recovery, but it must not block stronger deterministic evidence that the transaction continued under a different live conversation identity.
+## 2026-09-19 rollover production regression chain
 
-### Why the regression appeared after rollover had previously worked
+September 19 proved that the September 18 recovery was not the final rollover qualification. The watcher later remained stuck overnight with task `000053` completed, task `000054` staged and rollover due. Browser memory grew to multiple GiB while visible browser activity continued and no project progress occurred.
 
-The original rollover happy path was simpler:
+The repair chain below was intentionally narrowed around directly observed production failures.
 
-```text
-old Architect -> open fresh -> send handover -> wait ACK -> commit new -> close old
-```
+### Failure F — broad assistant DOM extraction mixed semantic response with ChatGPT UI
 
-Later hardening added durable candidate identity/state so ambiguous submissions could survive restart without creating duplicate tabs. That improved safety but introduced new cross-state combinations. The content-proof recovery added later still retained an early stale-ID return, so the recovery machinery could block a happy path that had previously worked.
+Initial repair:
+
+`3da7f7a5cd9d9073264134e2f749df7b32c40196` — `fix(orchestrator): sanitize Architect assistant message extraction`
+
+Later production diagnostics proved button removal alone was insufficient. A valid `ARCHITECT_HANDOVER_READY` writing-block response was followed in the broad assistant surface by ChatGPT suggested-followup UI. The strict handover predicate therefore rejected a semantically valid handover.
+
+DOM diagnostics established the authoritative semantic boundary:
+
+`[data-testid="writing-block-container"]`
+
+and the contaminating UI boundaries:
+
+- `[data-testid="writing-block-suggested-followups"]`;
+- `[data-testid="writing-block-suggested-followups-surface"]`;
+- visible follow-up buttons;
+- `aria-hidden=true` helper duplicates.
 
 Permanent countermeasure:
 
-**Every new durable recovery field creates cross-state combinations that must be qualified together, not only in isolated unit fixtures.**
+**Extract the semantic response payload structurally; never weaken a strict authority predicate merely because surrounding product UI contains extra text.**
 
-## Why these defects escaped earlier tests
+### Failure G — rollover recovery could repeat while browser memory/resource usage grew
 
-Earlier qualification was strong at the component level: parser behavior, IDLE continuation, transport, pause controls, remote monitoring, rollover helpers and recovery all had deterministic tests.
+Accepted repair:
 
-The missing proof was repeated composition through the real ChatGPT DOM, real process lifetime, real durable state and real project work.
+`1cdd74ecbb0fe286426bf4219feb370fb5adc3e1` — `fix(orchestrator): bound rollover recovery failure`
 
-The September 18 chain exposed a more specific qualification weakness: synthetic fixtures reproduced individual failure modes but did not initially replay the exact persisted production state across all interacting recovery fields. In particular, candidate-reacquisition tests covered no-ID recovery and still-live persisted IDs, but not the combination:
+The repair introduced bounded recovery attempts, retry timing, a safety window, memory safety cutout and terminal `HUMAN_REQUIRED` behavior while preserving the staged next task and completed task identity.
+
+Permanent countermeasure:
+
+**Maintenance recovery must be bounded. A broken rollover may fail closed, but it may not retry indefinitely or rerun completed project work.**
+
+### Failure H — production behavior was not observable enough to diagnose safely
+
+Accepted instrumentation:
+
+`c7c6bbbc2959d1eb9e8b181802a8e2015df3580e` — `chore(orchestrator): add opt-in rollover diagnostic trace`
+
+Diagnostic mode:
+
+`ORCHESTRATOR_DIAGNOSTIC_TRACE=1`
+
+Diagnostic root:
+
+`.agent-work/orchestrator/logs/diagnostic/<runId>/`
+
+The trace records state transitions, Playwright attach/close, handover/fresh-session operations, memory samples, snapshots, errors and shutdown evidence. Later tracing also included remote-control poll activity and exact assistant-entry errors.
+
+Permanent countermeasure:
+
+**A browser-mediated state machine must expose the exact operation boundary that failed; generic `Error` labels are not sufficient repair authority.**
+
+### Failure I — semantic extraction source was correct in concept but invalid JavaScript in production
+
+Initial semantic repair:
+
+`ee59ce4c20f13e408f2f61af0c26d260440d2fbe` — `fix(orchestrator): extract semantic Architect responses`
+
+Production immediately failed inside the first `_assistant_entries()` `page.evaluate()`.
+
+Architect source inspection found the exact defect: the embedded JavaScript lived in a normal Python triple-quoted string and contained:
 
 ```text
-persisted candidate ID exists
-+ persisted ID is stale
-+ exact ready fresh candidate still exists
-+ candidate state is SUBMISSION_AMBIGUOUS
-+ completed task and staged next task must both remain preserved
+.join('\n')
 ```
 
-Permanent lessons:
+Python converted the escape before Playwright received it, producing a literal newline inside a JavaScript quoted string and making the emitted script syntactically invalid.
 
-- regression qualification is necessary, but browser-mediated orchestration also needs governed real production use;
-- once a live incident supplies an exact `state.json` snapshot, that state should become a regression fixture;
-- production diagnostics must identify fail-closed dispositions instead of silently returning in a polling loop;
-- a real regression should reopen only the proven failing boundary—not trigger a full redesign of accepted foundations.
+The previous unit test had not parsed or executed the emitted JavaScript. Its fake `Page.evaluate()` merely asserted strings were present and returned a fabricated semantic result, allowing all tests to pass while production JavaScript was broken.
+
+Accepted repair:
+
+`9f1026cec05c56e67a164cead1fe61d5c0ba2ff4` — `fix(orchestrator): repair executable semantic extraction script`
+
+The runtime JavaScript was factored into the exact string used by production, emitted safely, and parsed by Node in regression qualification. Diagnostic error tracing was also added for assistant-entry evaluation failures.
+
+Permanent countermeasures:
+
+- **Injected JavaScript must be parsed/executed by a real JavaScript engine in qualification; fake `evaluate()` return values are not sufficient.**
+- **Executor/Maintainer PASS reports are claims, not acceptance evidence; the Architect must inspect the actual repo and the complete affected control path.**
+
+### Failure J — fresh bootstrap was pasted but Send acknowledgement timed out
+
+After semantic extraction was repaired, production progressed further. The watcher found `ARCHITECT_HANDOVER_READY`, opened a fresh Architect tab and pasted the handover/bootstrap, but the prompt did not visibly submit.
+
+The runtime logged:
+
+```text
+ARCHITECT_SESSION_ROLLOVER_FAILED
+phase=OPEN_FRESH_WITH_HANDOVER
+errorClass=ResultSubmissionError
+errorMessage=ARCHITECT_SUBMISSION_ACK_TIMEOUT:TimeoutError
+```
+
+The broken recovery then opened another fresh tab on the next attempt, producing two stale fresh tabs with pasted handovers.
+
+Source inspection found two defects:
+
+1. if `send.click()` returned without actually submitting, Enter fallback was not attempted because fallback was only tied to a click exception;
+2. an unsent fresh page at `https://chatgpt.com/` had no conversation ID and could not satisfy existing candidate proof, so recovery could allocate another fresh page.
+
+Accepted repair:
+
+`710b177ad041ce2b8a7ab070f58e7d4b638e4b5a` — `fix(orchestrator): enforce single fresh rollover tab`
+
+The repair:
+
+- enforces at most one fresh page per rollover transaction;
+- reuses the in-process owned page;
+- forbids replacement fresh-page allocation once creation is recorded;
+- adds same-page unsent submission reconciliation;
+- fails closed if restart cannot safely identify the previous ambiguous page.
+
+Permanent countermeasure:
+
+**A rollover transaction owns one fresh tab. Submission ambiguity is reconciled on that same page or fails closed; it never authorizes another fresh page.**
+
+### Failure K — weak UI signals could falsely count as fresh-bootstrap delivery
+
+Source review of `710b177a...` found that `submit_result_bounded()` could still treat any of these as acknowledgement:
+
+- composer empty;
+- generation visible;
+- assistant count increased.
+
+Those signals did not prove the exact fresh bootstrap existed as a submitted user message.
+
+Accepted repair:
+
+`55ab455f6c8799805379481bc6f219f0b7e4aa7b` — `fix(orchestrator): require exact fresh bootstrap proof`
+
+`open_fresh_with_handover()` now requires the exact deterministic bootstrap to be observed as a submitted user message. If exact proof is absent, only same-page reconciliation is allowed.
+
+Permanent countermeasure:
+
+**Fresh-bootstrap authority requires exact submitted-user-message proof. Composer state or generation state alone is supporting evidence, not delivery authority.**
+
+### Failure L — immediate exact-message check could create a false negative during normal DOM delay
+
+Architect review of `55ab455f...` found a timing race: after a successful send, ChatGPT could clear the composer before mounting the submitted user-message DOM. A single immediate exact-message check could therefore fail and classify a successful send as ambiguous.
+
+Accepted source/test repair:
+
+`49bf2c72699fdd8e0df2cbb31091b6751ffd6797` — `fix(orchestrator): wait for fresh bootstrap proof`
+
+The repair adds:
+
+- `FRESH_BOOTSTRAP_OBSERVATION_TIMEOUT_SECONDS = 2.0`;
+- `FRESH_BOOTSTRAP_OBSERVATION_POLL_SECONDS = 0.1`;
+- bounded polling for the exact submitted bootstrap before same-page reconciliation;
+- regression where exact message observation is false, false, then true without invoking the fallback;
+- real weak-signal fixtures for composer-empty, generation-visible and assistant-started behavior.
+
+Permanent countermeasure:
+
+**Dynamic DOM proof must use a bounded observation window where eventual mounting is expected. Immediate absence is not proof of failed submission.**
+
+## Why the September 19 defects escaped earlier tests
+
+Earlier qualification was strong at the component level, but several tests simulated away the browser behavior that production depended on.
+
+The most important examples were:
+
+- fake `Page.evaluate()` returned the desired semantic result without parsing the JavaScript sent to Playwright;
+- a successful rollover fixture could immediately create the fresh conversation ID and `ARCHITECT_SESSION_READY`, bypassing the timing and acknowledgement behavior of the real ChatGPT UI;
+- weak-signal tests initially named composer/generation/assistant conditions without actually driving those runtime signals;
+- separate helper PASS results were treated too readily as evidence that the whole rollover transaction worked.
+
+The corrected acceptance rule is:
+
+**For browser-mediated rollover, component tests are necessary but not sufficient. Production closure requires the complete real transaction to succeed as one observable unit.**
+
+Executor/Maintainer reports remain useful evidence pointers, but the Architect must inspect the GitHub implementation, trace the complete affected control path and independently determine what the tests really prove before acceptance.
+
+## Current one-rollover contract
+
+The intended transaction is now:
+
+```text
+old Architect
+-> obtain/reuse one authoritative handover
+-> create ONE fresh tab
+-> populate deterministic fresh bootstrap
+-> perform initial send
+-> wait bounded time for exact submitted-user-message proof
+-> if safely unsent, perform at most one same-page alternate send
+-> require exact bootstrap as submitted user message
+-> wait for exact ARCHITECT_SESSION_READY
+-> durably commit new Architect identity
+-> close old Architect
+-> allow normal dispatcher to launch the already-staged next task exactly once
+```
+
+Failure rules:
+
+- no second fresh tab in one rollover transaction;
+- no duplicate bootstrap submission;
+- no task rerun;
+- no authority switch without exact fresh-session ready proof;
+- no replacement-tab creation after restart when an ambiguous prior page cannot be identified;
+- fail closed to technical `HUMAN_REQUIRED` when exact authority cannot be proven.
+
+## Current production qualification evidence
+
+Before the current clean qualification:
+
+- the two stale fresh tabs from the previous broken run were manually closed by Rony;
+- task `000053` remained completed;
+- task `000054` remained staged;
+- the task `000054` prompt SHA-256 remained unchanged through state recovery;
+- `freshCandidateConversationId=None`;
+- `freshPageCreated=None`;
+- valid `pending_handover` remained present and ended with `ARCHITECT_HANDOVER_READY`;
+- `handoverRequested=False`, which matches the source branch that reconstructs persisted handover authority safely.
+
+Current live observation:
+
+- watcher is running;
+- a Codex child for the staged next task has launched.
+
+This is not yet enough to mark the rollover incident closed. Final verification still requires the one-tab / one-bootstrap / ready / authority-switch / old-tab-close / exactly-once `000054` launch evidence described at the top of this document.
 
 ## Permanent governance lessons
 
@@ -442,24 +569,38 @@ Permanent lessons:
 22. Ambiguous browser recovery must be based on exact transaction/content proof, not tab count or visual proximity.
 23. Exact live incident state should be promoted into a deterministic regression fixture before further hardening.
 24. Silent polling deadlocks are unacceptable at recovery boundaries; fail-closed outcomes need bounded diagnostics.
+25. Semantic response extraction must exclude product UI structurally rather than weakening machine-authority predicates.
+26. Browser-injected JavaScript must be validated as the exact emitted script by a real JavaScript engine.
+27. One rollover transaction owns at most one fresh tab.
+28. Exact fresh-bootstrap submitted-user-message proof outranks composer/generation/assistant transition signals.
+29. Dynamic ChatGPT DOM transitions require bounded observation before absence becomes failure evidence.
+30. Executor/Maintainer PASS reports are claims; Architect acceptance requires independent repository and control-path inspection.
+31. Browser-mediated feature acceptance is end-to-end: helper/unit PASS counts cannot substitute for a successful real transaction.
 
 Canonical design target:
 
 `recover -> run one task -> capture one result -> deliver once -> wait -> stage one next action`
 
-## Stabilization closure and universal-template implication
+## Universal-template implication
 
-Universalization remains valid as the next separate engineering phase, but the extraction baseline must be refreshed before runtime implementation is copied into a generic repository.
+The reference design remains suitable for future universal extraction, but extraction is paused until the current rollover production qualification closes.
 
-The earlier universal-template extraction checkpoint `57a3a914...` predates the September 18 production lessons above. Any future `Orchestrator-Watcher` runtime extraction must start from a newly accepted production checkpoint that includes:
+Any future universal runtime must start from the then-current accepted production checkpoint and preserve at minimum:
 
 - confirmed-delivery terminal semantics;
+- semantic response boundaries rather than broad product-surface text;
+- executable/validated injected JavaScript;
 - deterministic fresh-session bootstrap proof;
 - lost-handover authority reconstruction;
 - completed Executor ownership retirement;
 - stale fresh-candidate identity correction;
+- one-fresh-tab rollover transaction;
+- same-page ambiguous-send reconciliation;
+- exact fresh-bootstrap submitted-user-message proof;
+- bounded observation for delayed DOM mounting;
 - exact-state regression fixtures;
-- bounded diagnostics for fail-closed recovery dispositions.
+- bounded diagnostics for fail-closed recovery dispositions;
+- one real browser-mediated smoke path before declaring a new project's production readiness.
 
 This does **not** mean the AFFOTECH source should be copied wholesale. AFFOTECH-specific repository paths, remote identity, Executor session, Architect conversation identity, bootstrap naming and project-specific validation assumptions must still be extracted into project profiles/configuration.
 
@@ -467,29 +608,12 @@ See:
 
 `docs/ORCHESTRATOR_UNIVERSAL_TEMPLATE_READINESS.md`
 
-The future template qualification suite must preserve at minimum:
+## Remaining qualification boundary
 
-- thread-aware browser ownership;
-- realistic startup/failure shutdown behavior;
-- current actionable composer resolution;
-- exact owned-payload cleanup;
-- malformed-envelope fail-closed behavior;
-- canonical producer/parser compatibility;
-- resident HUMAN_REQUIRED continuation;
-- exactly-once result delivery;
-- discussion pause during live Executor/result-ready boundaries;
-- fact-based recovery;
-- completed process-ownership retirement;
-- content-proven fresh-session reacquisition;
-- stale persisted identity correction;
-- one writer/project/task;
-- project-profile isolation;
-- one real browser-mediated smoke path before declaring a new project's production readiness.
+The September 19 source/test repair is accepted at `49bf2c72...`.
 
-## Remaining maintenance qualification gap
+The real production rollover qualification is still open while the current run proceeds.
 
-Deferred Architect rollover is now qualified through the exact September 18 NEXT_PROMPT_READY recovery state that had previously deadlocked, and production restart progressed again after the accepted stale-candidate-identity repair.
+Protected invariant:
 
-That does not prove every future browser/runtime failure mode. The protected invariant remains:
-
-**rollover may be due, but maintenance must never halt or own project workflow authority.**
+**rollover may be due, but maintenance must never rerun completed work, duplicate the fresh Architect page/bootstrap, or own project workflow authority.**
