@@ -1614,17 +1614,57 @@ def test_fresh_bootstrap_adds_ready_instruction_without_changing_handover_body(t
 
     class Page:
         url = "https://chatgpt.com/"
-        def __init__(self): self.closed = False; self.context = Context(self)
+        def __init__(self): self.closed = False; self.context = Context(self); self.users = []
         def goto(self, _url): pass
         def close(self): self.closed = True
 
     old = Page(); fresh = Page(); old.context = Context(fresh)
-    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", lambda _self, payload: sent.append(payload))
+    def submit(_self, payload):
+        sent.append(payload)
+        _self.page.users.append(payload)
+    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", submit)
+    monkeypatch.setattr(ArchitectPlaywright, "exact_user_message_payload_observed", lambda _self, payload: payload in _self.page.users)
     bridge = ArchitectPlaywright(old)
     handover = "complete old handover\nARCHITECT_HANDOVER_READY"
     assert bridge.open_fresh_with_handover(handover) is fresh
     assert sent[0].startswith(handover)
     assert sent[0].endswith("ARCHITECT_SESSION_READY")
+
+
+@pytest.mark.parametrize("weak_signal", ["composer_empty", "generation_visible", "assistant_started"])
+def test_fresh_weak_acknowledgement_requires_exact_user_message(tmp_path, monkeypatch, weak_signal):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"handoverRequested": True, "rolloverPending": True,
+                          "architectConversationId": "OLD", "taskId": "000049"})
+    watcher.save()
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/"
+        def __init__(self): self.closed = False; self.context = None; self.weak_signal = weak_signal
+        def goto(self, _url): pass
+        def close(self): self.closed = True
+
+    old, fresh = Page(), Page()
+    class Context:
+        def __init__(self): self.pages = [old]
+        def new_page(self): self.pages.append(fresh); fresh.context = self; return fresh
+    context = Context(); old.context = context
+
+    def submit(_self, _payload):
+        calls.append("initial")
+        _self.initialSendMethod = "playwright.click"
+        _self.initialSendActionReturned = True
+    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", submit)
+    monkeypatch.setattr(ArchitectPlaywright, "exact_user_message_payload_observed", lambda _self, _payload: False)
+    monkeypatch.setattr(ArchitectPlaywright, "reconcile_unsent_submission", lambda _self, _payload: "AMBIGUOUS")
+
+    assert watcher.session_rollover.complete_from_response(ArchitectPlaywright(old), handover) is False
+    assert calls == ["initial"]
+    assert len(context.pages) == 2
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
 
 
 def test_fresh_click_noop_uses_one_same_page_enter_and_launches_staged_task_once(tmp_path, monkeypatch):

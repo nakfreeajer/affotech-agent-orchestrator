@@ -2655,6 +2655,21 @@ class ArchitectPlaywright:
                     raise ResultSubmissionError(
                         "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED" if reconciliation == "SEND_FAILED" else "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
                     ) from submission_error
+            else:
+                try:
+                    exact_submitted = fresh_bridge.exact_user_message_payload_observed(bootstrap)
+                except Exception:
+                    exact_submitted = False
+                if not exact_submitted:
+                    try:
+                        reconciliation = fresh_bridge.reconcile_unsent_submission(bootstrap)
+                    except Exception:
+                        reconciliation = "AMBIGUOUS"
+                    if reconciliation != "SENT":
+                        self._fresh_candidate_submission_ambiguous = True
+                        raise ResultSubmissionError(
+                            "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED" if reconciliation == "SEND_FAILED" else "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
+                        )
             if self.diagnostic_trace:
                 self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_BOOTSTRAP_SEND_END", "END", {}, payloadLength=len(bootstrap), payloadSha256=hashlib.sha256(bootstrap.encode()).hexdigest())
         except Exception as error:
