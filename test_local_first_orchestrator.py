@@ -1184,6 +1184,148 @@ def test_legacy_rollover_cutout_recovers_only_with_valid_newer_staged_task(tmp_p
     assert prompt.read_bytes() == before
 
 
+def test_legacy_rollover_cutout_retires_memory_authority_and_dispatches_without_maintenance(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "000053-result.txt"
+    prompt = tmp_path / "000054.txt"
+    result.write_text("completed result", encoding="utf-8")
+    prompt.write_bytes(b"staged task 000054")
+    prompt_before = prompt.read_bytes()
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "taskId": "000053",
+        "lastCompletedTaskId": "000053",
+        "nextTaskId": "000054",
+        "nextPromptPath": str(prompt),
+        "executorResultPath": str(result),
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+        "architectResponseCount": 12,
+        "rolloverDue": True,
+        "rolloverTrigger": "MEMORY_THRESHOLD",
+        "rolloverPending": True,
+        "rolloverInProgress": True,
+        "handoverRequested": True,
+        "handoverReady": True,
+        "pending_handover": "stale handover",
+        "rolloverAttemptedForTaskId": "000053",
+        "rolloverTransactionId": "old-transaction",
+        "rolloverTransactionTaskId": "000053",
+        "rolloverHandoverSendState": "ACKNOWLEDGED",
+        "rolloverHandoverResponseIdentity": "old-response",
+        "rolloverHandoverRecoveryDisposition": "RETRYABLE",
+        "rolloverFreshCandidateConversationId": "old-candidate",
+        "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+        "rolloverFreshCandidateDiscoveryState": "STALE",
+        "rolloverFreshBootstrapPayloadHash": "old-bootstrap",
+        "rolloverFreshPageCreated": True,
+        "rolloverRecoveryState": "CUTOUT",
+        "rolloverRecoveryAttemptCount": 2,
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverLastFailureReason": "old failure",
+        "rolloverDeferredForTaskId": "000053",
+        "rolloverAutoAttemptCount": 2,
+    })
+    watcher.save()
+
+    assert watcher.recover_legacy_rollover_cutout() is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["rolloverRecoveryState"] == "PENDING"
+    assert watcher.state.get("rolloverDue") is False
+    assert watcher.state.get("rolloverPending") is False
+    assert watcher.state.get("rolloverTrigger") is None
+    for key in (
+        "handoverRequested", "handoverReady", "pending_handover",
+        "rolloverAttemptedForTaskId", "rolloverTransactionId",
+        "rolloverTransactionTaskId", "rolloverHandoverSendState",
+        "rolloverHandoverResponseIdentity", "rolloverFreshCandidateConversationId",
+        "rolloverFreshCandidateState", "rolloverFreshCandidateDiscoveryState",
+        "rolloverFreshBootstrapPayloadHash", "rolloverFreshPageCreated",
+        "rolloverMaintenanceState", "rolloverLastFailureReason",
+        "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+    ):
+        assert watcher.state.get(key) in (None, False)
+
+    maintenance_calls = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: maintenance_calls.append(1) or False)
+    launches = []
+
+    class Process:
+        pid = 54054
+
+    process = watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
+    )
+    assert process is not None
+    assert maintenance_calls == []
+    assert launches == [1]
+    assert watcher.state["lastCompletedTaskId"] == "000053"
+    assert watcher.state["taskId"] == "000054"
+    assert prompt.read_bytes() == prompt_before
+
+
+def test_legacy_rollover_cutout_rederives_response_count_authority(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "000053-result.txt"
+    prompt = tmp_path / "000054.txt"
+    result.write_text("completed result", encoding="utf-8")
+    prompt.write_text("staged task 000054", encoding="utf-8")
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "taskId": "000053", "lastCompletedTaskId": "000053", "nextTaskId": "000054",
+        "nextPromptPath": str(prompt), "executorResultPath": str(result),
+        "executorProcessState": "COMPLETED_WITH_RESULT", "architectResponseCount": 30,
+        "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD", "rolloverPending": True,
+        "pending_handover": "stale handover", "rolloverTransactionId": "old-transaction",
+    })
+    assert watcher.recover_legacy_rollover_cutout() is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverTrigger"] == "RESPONSE_COUNT_FALLBACK"
+    assert watcher.state["rolloverPending"] is False
+
+    maintenance_calls = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: maintenance_calls.append(1) or False)
+    launches = []
+
+    class Process:
+        pid = 54054
+
+    process = watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
+    )
+    assert process is not None
+    assert maintenance_calls == [1]
+    assert launches == [1]
+    assert watcher.state["rolloverTrigger"] == "RESPONSE_COUNT_FALLBACK"
+
+
+def test_legacy_rollover_cutout_recovery_fails_closed_for_incomplete_proof(tmp_path):
+    cases = [
+        {"executorResultPath": "missing-result"},
+        {"nextPromptPath": "missing-prompt"},
+        {"nextTaskId": "000053"},
+        {"architectDecisionAuthorityInvalid": True},
+    ]
+    for index, overrides in enumerate(cases):
+        watcher = LocalFirstOrchestrator(str(tmp_path / str(index)), tmp_path / str(index) / "work")
+        result = tmp_path / str(index) / "000053-result.txt"
+        prompt = tmp_path / str(index) / "000054.txt"
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text("completed result", encoding="utf-8")
+        prompt.write_text("staged task 000054", encoding="utf-8")
+        watcher.state.update({
+            "state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+            "taskId": "000053", "lastCompletedTaskId": "000053", "nextTaskId": "000054",
+            "nextPromptPath": str(prompt), "executorResultPath": str(result),
+            "executorProcessState": "COMPLETED_WITH_RESULT",
+        })
+        watcher.state.update(overrides)
+        assert watcher.recover_legacy_rollover_cutout() is False
+        assert watcher.state["state"] == "HUMAN_REQUIRED"
+
+
 def test_deferred_rollover_can_attempt_once_at_live_executor_boundary(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,

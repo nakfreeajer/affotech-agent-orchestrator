@@ -1272,7 +1272,10 @@ class ArchitectSessionRollover:
             if not next_task or not isinstance(prompt_path, str) or not Path(prompt_path).is_file() or self.watcher.state.get("handoverRequested"):
                 return False
         count = int(self.watcher.state.get("architectResponseCount", 0))
-        trigger = self.watcher.state.get("rolloverTrigger") or self.rollover_trigger(None, count)
+        # Rollover authority is derived from the current session response
+        # count.  A persisted trigger is only historical maintenance
+        # evidence and must not resurrect obsolete memory authority.
+        trigger = self.rollover_trigger(None, count)
         if not trigger:
             return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
@@ -3953,17 +3956,41 @@ class LocalFirstOrchestrator:
                 or not next_task_id or next_task_id == task_id or not prompt_ready or not result_ready
                 or executor_active or self.state.get("architectDecisionAuthorityInvalid")):
             return False
+        try:
+            response_count = int(self.state.get("architectResponseCount", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        response_trigger = self.session_rollover.rollover_trigger(None, response_count)
         self.state.update({
             "state": "NEXT_PROMPT_READY",
             "humanRequiredReason": None,
             "rolloverRecoveryState": "PENDING",
             "legacyRolloverCutoutRecovered": True,
+            "rolloverDue": bool(response_trigger),
+            "rolloverPending": False,
+            "rolloverInProgress": False,
+            "handoverRequested": False,
+            "handoverReady": False,
         })
-        for key in ("rolloverRecoveryStartedAt", "rolloverRecoveryAttemptCount", "rolloverRecoveryLastAttemptAt", "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason", "rolloverMaintenanceState", "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount"):
+        if response_trigger:
+            self.state["rolloverTrigger"] = "RESPONSE_COUNT_FALLBACK"
+        else:
+            self.state.pop("rolloverTrigger", None)
+        for key in (
+            "pending_handover", "rolloverAttemptedForTaskId", "rolloverTransactionId",
+            "rolloverTransactionTaskId", "rolloverHandoverSendState",
+            "rolloverHandoverResponseIdentity", "rolloverHandoverRecoveryDisposition",
+            "rolloverHandoverRecoveryReason", "rolloverHandoverRecoveryRetryAfter",
+            "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState",
+            "rolloverFreshCandidateDiscoveryState", "rolloverFreshCandidateAttemptCount",
+            "rolloverFreshCandidateRetryAfter", "rolloverFreshBootstrapPayloadHash",
+            "rolloverFreshPageCreated", "rolloverRecoveryStartedAt",
+            "rolloverRecoveryAttemptCount", "rolloverRecoveryLastAttemptAt",
+            "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason",
+            "rolloverMaintenanceState", "rolloverLastFailureReason",
+            "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+        ):
             self.state.pop(key, None)
-        self.state.pop("rolloverAttemptedForTaskId", None)
-        self.state.pop("rolloverTransactionId", None)
-        self.state.pop("rolloverTransactionTaskId", None)
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "LEGACY_ROLLOVER_CUTOUT_RECOVERED", self.state, taskId=task_id)
         return True

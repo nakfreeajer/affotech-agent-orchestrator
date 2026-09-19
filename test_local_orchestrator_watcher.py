@@ -666,7 +666,7 @@ def test_architect_rollover_accepts_next_prompt_ready_without_executor(tmp_path)
         "nextTaskId": "task-2",
         "nextPromptPath": str(prompt),
         "rolloverDue": True,
-        "rolloverTrigger": "MEMORY_THRESHOLD",
+        "architectResponseCount": 30,
         "architectConversationId": "current",
         "codexPid": None,
     })
