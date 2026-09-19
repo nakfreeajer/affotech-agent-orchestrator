@@ -2,16 +2,18 @@
 
 ## Status
 
-The current AFFOTECH Local Orchestrator is **ready to become the canonical reference implementation for a universal project Orchestrator template**.
+The AFFOTECH Local Orchestrator remains the **canonical reference design** for a future universal project Orchestrator template, but implementation extraction is currently **paused pending closure of the September 19 Architect-rollover production qualification**.
 
 It is **not yet a drop-in universal template**.
 
 The distinction is intentional:
 
-- the workflow model, state machine, transport rules, recovery rules, human-control boundaries and production lessons are mature enough to preserve as the universal design;
-- the current source still contains AFFOTECH-specific constants, repository paths, session identity, browser conversation identity and bootstrap assumptions that must be parameterized before another project can adopt it safely.
+- the workflow model, state machine, transport rules, recovery rules, human-control boundaries and production lessons remain the protected reference design;
+- the September 19 production incident proved that browser-mediated rollover still required source/test repair beyond the earlier September 18 checkpoint;
+- the current source now contains the one-fresh-tab / exact-bootstrap-delivery repair chain, but the real production qualification is still being verified end to end;
+- AFFOTECH-specific constants, repository paths, session identity, browser conversation identity and bootstrap assumptions still must be parameterized before another project can adopt the runtime safely.
 
-Universalization must therefore be an extraction/configuration milestone, not a redesign of the proven workflow.
+Universalization must therefore remain an extraction/configuration milestone, not a redesign of the proven workflow, and must not resume until the current rollover production qualification is closed.
 
 ## Current source authority
 
@@ -19,27 +21,56 @@ Repository: `nakfreeajer/affotech-agent-orchestrator`
 
 Branch: `main`
 
-Accepted runtime/source checkpoint:
+Accepted source/test checkpoint:
 
-`57a3a914b35ed0c715aaaf0267ed0bd36a39cc78` — `fix(orchestrator): keep human decisions resident`
+`49bf2c72699fdd8e0df2cbb31091b6751ffd6797` — `fix(orchestrator): wait for fresh bootstrap proof`
 
-Deterministic qualification at that checkpoint:
+Direct parent:
+
+`55ab455f6c8799805379481bc6f219f0b7e4aa7b` — `fix(orchestrator): require exact fresh bootstrap proof`
+
+Relevant immediately preceding rollover repairs:
+
+- `710b177ad041ce2b8a7ab070f58e7d4b638e4b5a` — enforce one fresh rollover tab and same-page send reconciliation;
+- `9f1026cec05c56e67a164cead1fe61d5c0ba2ff4` — repair executable semantic-response extraction JavaScript and diagnostic error tracing;
+- `ee59ce4c20f13e408f2f61af0c26d260440d2fbe` — semantic Architect-response extraction and remote-control poll diagnostics;
+- `c7c6bbbc2959d1eb9e8b181802a8e2015df3580e` — opt-in rollover diagnostic trace;
+- `1cdd74ecbb0fe286426bf4219feb370fb5adc3e1` — bounded rollover recovery safety cutout.
+
+Deterministic qualification reported and independently source-reviewed for `49bf2c72...` includes:
 
 - Python compile PASS;
-- `244 passed / 0 failed`;
-- `git diff --check` PASS;
-- resident HUMAN_REQUIRED regression PASS;
-- ordinary discussion regression PASS;
-- later same-task EXECUTE-envelope regression PASS;
-- repeated HUMAN_REQUIRED regression PASS;
-- STOP-remains-resident regression PASS;
-- attach/read retry regression PASS;
-- exactly-one-next-task launch regression PASS;
-- existing recovery, rollover and durable receipt regressions PASS.
+- first suite `281` passing;
+- watcher suite `116` passing;
+- Node suite `158` passing;
+- focused fresh-bootstrap qualification PASS;
+- bounded exact submitted-user-message observation: 2.0 s total / 0.1 s polling;
+- delayed exact-message DOM appearance regression PASS;
+- composer-empty without exact user-message proof rejected;
+- generation-visible without exact user-message proof rejected;
+- assistant-started without exact user-message proof rejected;
+- same-page unsent fallback preserved;
+- one-fresh-tab invariant preserved;
+- restart with an unidentifiable prior fresh candidate fails closed rather than creating a replacement tab.
 
-The final human authority has subsequently reported the production watcher running smoothly and mature in normal AFFOTECH operation after the resident HUMAN_REQUIRED repair and the matching AFFOTECH Architect-governance synchronization.
+### Current production qualification status
 
-This operational evidence is sufficient to move the project from **stabilization** to **universalization readiness**. It does not erase explicitly documented qualification gaps such as deferred live-Executor rollover servicing.
+On 2026-09-19, after manual closure of two stale fresh tabs created by an older broken build, the recovered production state preserved completed task `000053` and staged task `000054` without rerun or prompt mutation.
+
+The current live qualification has progressed further than the previous failed runs: Rony reported that the watcher remained running and a Codex child for the staged next task was launched.
+
+That is strong progress evidence, but it is **not yet final rollover closure**. The production milestone remains open until authoritative evidence confirms the complete transaction:
+
+1. exactly one fresh Architect tab for the current transaction;
+2. exact bootstrap submitted exactly once;
+3. `ARCHITECT_SESSION_READY` observed;
+4. new Architect conversation identity committed;
+5. old Architect closed after authority commit;
+6. task `000053` not rerun;
+7. task `000054` launched exactly once;
+8. no technical `HUMAN_REQUIRED` cutout during the successful transaction.
+
+Until that verification is complete, universal-template extraction remains paused.
 
 ## Mature universal invariants
 
@@ -65,6 +96,11 @@ The following behavior should be treated as the template's protected core rather
 18. Ambiguous external actions reconcile read-only before retry.
 19. Durable privacy-safe runtime logging is mandatory.
 20. Project-specific governance remains in the project, not in generic Orchestrator business logic.
+21. One rollover transaction may create at most one fresh Architect tab.
+22. Fresh-bootstrap delivery authority requires the exact bootstrap to be observed as a submitted user message on that same page.
+23. Composer-empty, generation-visible or assistant-started signals are supporting evidence only and cannot substitute for exact fresh-bootstrap submission proof.
+24. A successful but delayed ChatGPT DOM transition must be given a bounded observation window before a send is classified ambiguous.
+25. After ambiguous fresh-session submission, recovery must reuse the same page or fail closed; it must never create a replacement tab automatically.
 
 ## Why the current source is not yet drop-in universal
 
@@ -139,7 +175,7 @@ The universal Orchestrator must never absorb those decisions.
 
 ## Minimum extraction milestone
 
-A first universalization milestone should be deliberately narrow:
+A first universalization milestone remains deliberately narrow:
 
 `ORCH.UNIVERSAL.TEMPLATE.EXTRACTION.1A`
 
@@ -154,13 +190,15 @@ Expected scope:
 - make runtime consume the profile;
 - keep AFFOTECH as the first concrete profile and prove behavior is unchanged;
 - create a synthetic second project profile for deterministic qualification only;
-- do not redesign state names, envelope schema, result-delivery proof, recovery semantics, resident HUMAN_REQUIRED behavior or discussion-pause behavior.
+- do not redesign state names, envelope schema, result-delivery proof, recovery semantics, resident HUMAN_REQUIRED behavior, discussion-pause behavior or the one-fresh-tab rollover contract.
+
+This milestone is **not currently authorized to start** while September 19 rollover production qualification remains open.
 
 ## Universal template qualification gates
 
 Do not call the extracted version universal until it proves at least:
 
-- AFFOTECH profile regression parity with the accepted runtime;
+- AFFOTECH profile regression parity with the then-current accepted production runtime;
 - synthetic second-project isolation;
 - no AFFOTECH-specific repository/path/session identity in generic runtime logic;
 - task/state directories separated by project profile;
@@ -172,24 +210,31 @@ Do not call the extracted version universal until it proves at least:
 - restart/recovery preserved;
 - malformed envelope fail-closed behavior preserved;
 - one writer/project/task preserved;
+- one-fresh-tab rollover invariant preserved;
+- exact fresh-bootstrap submitted-user-message proof preserved;
+- no replacement-tab creation after ambiguous fresh-session submission;
 - project-specific bootstrap/governance remains outside generic runtime;
 - one real browser-mediated smoke path for the first non-AFFOTECH project before declaring that project's production readiness.
 
 ## Deferred rollover qualification
 
-The current known deferred-rollover/live-Executor reachability concern remains a maintenance qualification gap.
+The old documentation described deferred rollover as a limited maintenance gap. Real production use on September 19 proved a broader issue: the actual rollover transaction itself had multiple browser/DOM/recovery defects despite earlier component-level PASS results.
 
-Universalization must not use that gap as a reason to reopen the mature workflow core.
+The repaired source now enforces the intended transaction:
 
-The generic template should preserve the rule:
+`old Architect -> authoritative handover -> one fresh tab -> exact bootstrap submission -> ARCHITECT_SESSION_READY -> authority commit -> old Architect close -> resume staged project work`
 
-**rollover may be due, but maintenance must never halt or own project workflow authority.**
+Current status:
 
-A separate bounded rollover-maintenance milestone may later improve safe-boundary servicing if production evidence makes it necessary.
+`PRODUCTION_QUALIFICATION_IN_PROGRESS`
+
+The generic template must preserve the rule:
+
+**rollover may be due, but maintenance must never rerun completed work, duplicate a fresh Architect tab, duplicate the handover/bootstrap, or invent project authority.**
 
 ## Migration strategy for future projects
 
-For a future project:
+For a future project, after the current AFFOTECH production qualification is closed:
 
 1. instantiate the universal runtime with a new project profile;
 2. provide that project's Executor bootstrap and canonical governance docs;
@@ -198,20 +243,24 @@ For a future project:
 5. perform one bounded real project milestone as production qualification;
 6. preserve the same human/Architect/Executor authority separation.
 
-A future project should not spend weeks rebuilding transport, recovery, rollover, discussion pause, result delivery or HUMAN_REQUIRED semantics.
+A future project should not spend weeks rebuilding transport, recovery, rollover, discussion pause, result delivery or HUMAN_REQUIRED semantics. The purpose of the template is to preserve the already-proven contract, not copy unresolved runtime defects.
 
 ## Decision
 
-Current maturity classification:
+Current design maturity classification:
 
-`REFERENCE_IMPLEMENTATION_MATURE`
+`REFERENCE_DESIGN_MATURE`
+
+Current AFFOTECH runtime source/test checkpoint:
+
+`49bf2c72699fdd8e0df2cbb31091b6751ffd6797`
 
 Universalization readiness:
 
-`READY_FOR_EXTRACTION`
+`PAUSED_PENDING_ROLLOVER_PRODUCTION_QUALIFICATION`
 
 Drop-in template status:
 
 `NOT_YET_EXTRACTED`
 
-The next Orchestrator engineering objective may therefore be universal template extraction, provided it remains bounded and does not interrupt authorized AFFOTECH product work.
+The next Orchestrator engineering objective is **not** universal extraction until the current rollover production qualification is verified and documented closed. AFFOTECH product progress remains the higher priority once the maintenance incident is resolved.
