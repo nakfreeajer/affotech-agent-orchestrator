@@ -3960,6 +3960,11 @@ class LocalFirstOrchestrator:
             response_count = int(self.state.get("architectResponseCount", 0) or 0)
         except (TypeError, ValueError):
             return False
+        try:
+            if next_task_id != self._canonical_next_task_id(task_id):
+                return False
+        except (TypeError, ValueError):
+            return False
         response_trigger = self.session_rollover.rollover_trigger(None, response_count)
         self.state.update({
             "state": "NEXT_PROMPT_READY",
@@ -4001,6 +4006,19 @@ class LocalFirstOrchestrator:
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_INVALID", self.state, hash=fingerprint)
         print("IDLE_GATE=invalid_architect_envelope taskId=%s responseHash=%s correctionRequired=True" % (self.state.get("taskId"), fingerprint))
         return "HUMAN_REQUIRED"
+
+    def _canonical_next_task_id(self, task_id: str | None = None) -> str:
+        """Return the single next-task ID used by Architect EXECUTE staging."""
+        raw_sequence = self.state.get("taskSequence", 0)
+        if isinstance(raw_sequence, bool):
+            raise ValueError("TASK_SEQUENCE_INVALID")
+        current_sequence = int(raw_sequence)
+        if current_sequence < 0:
+            raise ValueError("TASK_SEQUENCE_INVALID")
+        current_task = str(task_id or self.state.get("taskId") or "")
+        if current_task.isdigit():
+            current_sequence = max(current_sequence, int(current_task))
+        return f"{current_sequence + 1:06d}"
 
     def consume_idle_architect_response(self, response: str, launcher: Callable[[str, Path], Any] | None = None) -> str:
         """Use the canonical Architect decision staging path after IDLE recovery."""
@@ -4876,12 +4894,7 @@ class LocalFirstOrchestrator:
             self.state.update({"documentationClosurePending": False, "documentationClosureCompletedTaskId": task_id, "documentationClosureFingerprint": fingerprint})
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_ACCEPTED", self.state, taskId=task_id, disposition=documentation)
         if decision["action"] == "EXECUTE":
-            current_sequence = int(self.state.get("taskSequence", 0))
-            current_task = str(self.state.get("taskId") or "")
-            if current_task.isdigit():
-                current_sequence = max(current_sequence, int(current_task))
-            sequence = current_sequence + 1
-            next_id = f"{sequence:06d}"
+            next_id = self._canonical_next_task_id(task_id)
             path = self.prompts_dir / f"{next_id}.txt"
             target = self._owned_task_worktree(next_id, decision["prompt"], context_task_id=str(self.state.get("taskId") or ""))
             if target is None:

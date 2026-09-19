@@ -1326,6 +1326,69 @@ def test_legacy_rollover_cutout_recovery_fails_closed_for_incomplete_proof(tmp_p
         assert watcher.state["state"] == "HUMAN_REQUIRED"
 
 
+def test_legacy_rollover_cutout_validates_canonical_next_task_and_dispatches_once(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "000054-result.txt"
+    prompt = tmp_path / "000055.txt"
+    result.write_text("completed result", encoding="utf-8")
+    prompt.write_bytes(b"canonical staged task 000055")
+    prompt_before = prompt.read_bytes()
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "taskId": "000054", "lastCompletedTaskId": "000054", "nextTaskId": "000055",
+        "taskSequence": 54, "nextPromptPath": str(prompt), "executorResultPath": str(result),
+        "executorProcessState": "COMPLETED_WITH_RESULT", "architectResponseCount": 12,
+        "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD", "rolloverPending": True,
+        "pending_handover": "stale handover", "rolloverTransactionId": "old-transaction",
+    })
+
+    assert watcher.recover_legacy_rollover_cutout() is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000055"
+    assert watcher.state["rolloverDue"] is False
+    assert watcher.state.get("rolloverTrigger") is None
+
+    maintenance_calls = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: maintenance_calls.append(1) or False)
+    launches = []
+
+    class Process:
+        pid = 55055
+
+    process = watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
+    )
+    assert process is not None
+    assert maintenance_calls == []
+    assert launches == [1]
+    assert watcher.state["lastCompletedTaskId"] == "000054"
+    assert watcher.state["taskId"] == "000055"
+    assert prompt.read_bytes() == prompt_before
+
+
+@pytest.mark.parametrize("next_task_id,task_sequence,expected", [
+    ("000054", 54, False),
+    ("000053", 54, False),
+    ("000056", 54, False),
+    ("000056", 55, True),
+    ("000055", "not-a-number", False),
+])
+def test_legacy_rollover_cutout_rejects_incompatible_canonical_task_sequence(tmp_path, next_task_id, task_sequence, expected):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "000054-result.txt"
+    prompt = tmp_path / f"{next_task_id}.txt"
+    result.write_text("completed result", encoding="utf-8")
+    prompt.write_text("staged prompt", encoding="utf-8")
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "taskId": "000054", "lastCompletedTaskId": "000054", "nextTaskId": next_task_id,
+        "taskSequence": task_sequence, "nextPromptPath": str(prompt), "executorResultPath": str(result),
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+    })
+    assert watcher.recover_legacy_rollover_cutout() is expected
+    assert watcher.state["state"] == ("NEXT_PROMPT_READY" if expected else "HUMAN_REQUIRED")
+
+
 def test_deferred_rollover_can_attempt_once_at_live_executor_boundary(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "task-1", "codexPid": 1234,
