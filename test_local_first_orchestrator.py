@@ -1325,6 +1325,66 @@ def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monk
     assert closed == []
 
 
+def test_deferred_rollover_gets_fresh_transaction_and_rejects_stale_handover(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt_a = tmp_path / "000041.txt"
+    prompt_b = tmp_path / "000042.txt"
+    prompt_a.write_text("task A", encoding="utf-8")
+    prompt_b.write_text("task B", encoding="utf-8")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000040", "lastCompletedTaskId": "000040",
+        "nextTaskId": "000041", "nextPromptPath": str(prompt_a), "rolloverDue": True,
+        "architectResponseCount": 30, "architectConversationId": "OLD",
+    })
+    watcher.save()
+
+    class FailedSend:
+        def submit_result_bounded(self, _payload):
+            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE")
+
+    assert watcher.session_rollover.request_if_due(FailedSend(), True, False, safe_boundary_state="NEXT_PROMPT_READY") is False
+    transaction_a = watcher.state["rolloverTransactionId"]
+    launches = []
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1) or type("Process", (), {"pid": 4100})())
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is not None
+    assert launches == [1]
+    assert watcher.state.get("humanRequiredReason") is None
+
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000041", "lastCompletedTaskId": "000041",
+        "nextTaskId": "000042", "nextPromptPath": str(prompt_b), "rolloverDue": True,
+        "rolloverPending": True, "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": "000041", "rolloverHandoverSendState": "UNSENT",
+        "handoverRequested": False, "architectResponseCount": 30,
+    })
+    watcher.save()
+    old_page = _AckPage("https://chatgpt.com/c/OLD")
+    fresh_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ready", "text": "ARCHITECT_SESSION_READY"}])
+    opened = []
+
+    class FreshBridge:
+        page = old_page
+        def submit_result_bounded(self, _payload):
+            pass
+        def open_fresh_with_handover(self, _handover):
+            opened.append(1)
+            return fresh_page
+
+    bridge = FreshBridge()
+    assert watcher.session_rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY") is True
+    transaction_b = watcher.state["rolloverTransactionId"]
+    assert transaction_b != transaction_a
+    stale = f"old handover\nRollover transaction ID: {transaction_a}\nARCHITECT_HANDOVER_READY"
+    assert watcher.session_rollover.complete_from_response(bridge, stale) is False
+    assert opened == []
+    assert watcher.state["architectConversationId"] == "OLD"
+    matching = f"new handover\nRollover transaction ID: {transaction_b}\nARCHITECT_HANDOVER_READY"
+    assert watcher.session_rollover.complete_from_response(bridge, matching) is True
+    assert opened == [1]
+    assert watcher.state["architectConversationId"] == "NEW"
+    assert watcher.state.get("humanRequiredReason") is None
+
+
 def test_acknowledged_handover_recovery_reconstructs_and_launches_staged_next_task(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     prompt = tmp_path / "000054.txt"

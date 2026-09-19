@@ -80,7 +80,7 @@ class DiagnosticTracer:
             "state", "taskId", "lastCompletedTaskId", "nextTaskId", "rolloverDue", "rolloverPending",
             "rolloverInProgress", "rolloverAttemptedForTaskId", "rolloverRecoveryState",
             "rolloverRecoveryAttemptCount", "rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt",
-            "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason", "handoverRequested", "handoverReady",
+            "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason", "rolloverTransactionId", "rolloverTransactionTaskId", "handoverRequested", "handoverReady",
             "rolloverHandoverSendState", "rolloverHandoverRecoveryDisposition", "rolloverHandoverRecoveryReason",
             "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState", "rolloverFreshCandidateDiscoveryState",
             "rolloverFreshCandidateAttemptCount", "codexPid", "active_codex_pid", "lastExecutorPid",
@@ -1004,12 +1004,19 @@ End with:
 ARCHITECT_HANDOVER_READY"""
 
 
-def rollover_transaction_id(state: dict[str, Any]) -> str:
-    """Return the durable correlation identity for one rollover transaction."""
+def rollover_transaction_id(state: dict[str, Any], task_id: str | None = None) -> str:
+    """Return the correlation identity only for the current task boundary."""
+    current_task = str(task_id or state.get("nextTaskId") or state.get("taskId") or "")
     existing = str(state.get("rolloverTransactionId") or "").strip()
-    if existing:
+    owner = str(state.get("rolloverTransactionTaskId") or "").strip()
+    attempted = str(state.get("rolloverAttemptedForTaskId") or "").strip()
+    if existing and state.get("rolloverInProgress") is True and (
+            (owner and owner == current_task) or (not owner and attempted == current_task)):
         return existing
-    basis = "|".join(str(state.get(key) or "") for key in ("taskId", "nextTaskId", "architectConversationId", "architectResponseCount", "rolloverTrigger"))
+    basis = "|".join(("ROLLOVER_TRANSACTION_V2", current_task, existing,
+                       str(state.get("architectConversationId") or ""),
+                       str(state.get("architectResponseCount") or ""),
+                       str(state.get("rolloverTrigger") or "")))
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
 
@@ -1218,6 +1225,39 @@ class ArchitectSessionRollover:
         self.watcher.save()
         return True
 
+    def _retire_stale_transaction_for_task(self, task_id: str) -> bool:
+        """Remove terminal evidence that belongs to an earlier task boundary."""
+        state = self.watcher.state
+        transaction_id = str(state.get("rolloverTransactionId") or "").strip()
+        owner = str(state.get("rolloverTransactionTaskId") or "").strip()
+        attempted = str(state.get("rolloverAttemptedForTaskId") or "").strip()
+        if not task_id or not transaction_id or not ((owner and owner != task_id) or (not owner and attempted and attempted != task_id)):
+            return False
+        for key in (
+            "rolloverTransactionId", "rolloverTransactionTaskId", "rolloverAttemptedForTaskId",
+            "pending_handover", "rolloverHandoverResponseIdentity", "rolloverFreshCandidateConversationId",
+            "rolloverFreshCandidateState", "rolloverFreshCandidateDiscoveryState",
+            "rolloverFreshCandidateAttemptCount", "rolloverFreshCandidateRetryAfter",
+            "rolloverFreshBootstrapPayloadHash", "rolloverFreshPageCreated",
+            "rolloverHandoverRecoveryDisposition", "rolloverHandoverRecoveryReason",
+            "rolloverHandoverRecoveryRetryAfter", "rolloverRecoveryState",
+            "rolloverRecoveryStartedAt", "rolloverRecoveryAttemptCount",
+            "rolloverRecoveryLastAttemptAt", "rolloverRecoveryRetryAfter",
+            "rolloverRecoveryTerminalReason", "rolloverMaintenanceState",
+            "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+        ):
+            state.pop(key, None)
+        state.update({
+            "handoverRequested": False,
+            "handoverReady": False,
+            "rolloverInProgress": False,
+            "rolloverDue": True,
+            "rolloverPending": True,
+            "rolloverHandoverSendState": "UNSENT",
+        })
+        self.watcher.save()
+        return True
+
     def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False, safe_boundary_state: str | None = None) -> bool:
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
@@ -1236,6 +1276,7 @@ class ArchitectSessionRollover:
         if not trigger:
             return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
+        self._retire_stale_transaction_for_task(task_id)
         if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id:
             return False
         if architect_generating or not latest_prompt_dispatched or self.watcher.state.get("handoverRequested"):
@@ -1249,10 +1290,26 @@ class ArchitectSessionRollover:
                     return False
             except (TypeError, ValueError):
                 return False
-        transaction_id = rollover_transaction_id(self.watcher.state)
+        previous_transaction_id = str(self.watcher.state.get("rolloverTransactionId") or "").strip()
+        transaction_id = rollover_transaction_id(self.watcher.state, task_id)
+        if previous_transaction_id and transaction_id != previous_transaction_id:
+            # A deferred transaction is terminal authority.  Do not let its
+            # response, candidate, or bootstrap evidence participate in the
+            # next task boundary's transaction.
+            for key in (
+                "pending_handover", "rolloverHandoverResponseIdentity",
+                "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState",
+                "rolloverFreshCandidateDiscoveryState", "rolloverFreshCandidateAttemptCount",
+                "rolloverFreshCandidateRetryAfter", "rolloverFreshBootstrapPayloadHash",
+                "rolloverFreshPageCreated", "rolloverHandoverRecoveryDisposition",
+                "rolloverHandoverRecoveryReason", "rolloverHandoverRecoveryRetryAfter",
+            ):
+                self.watcher.state.pop(key, None)
+            self.watcher.state["rolloverHandoverSendState"] = "UNSENT"
         if task_id:
             self.watcher.state["rolloverAttemptedForTaskId"] = task_id
         self.watcher.state["rolloverTransactionId"] = transaction_id
+        self.watcher.state["rolloverTransactionTaskId"] = task_id
         self.watcher.state["rolloverDue"] = True
         self.watcher.state["rolloverInProgress"] = True
         self.watcher.state["rolloverPending"] = True
@@ -1637,6 +1694,7 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
             self.watcher.state.pop("rolloverFreshPageCreated", None)
             self.watcher.state.pop("rolloverTransactionId", None)
+            self.watcher.state.pop("rolloverTransactionTaskId", None)
             self.watcher.state.pop("rolloverHandoverRecoveryDisposition", None)
             self.watcher.state.pop("rolloverHandoverRecoveryReason", None)
             self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
@@ -3905,6 +3963,7 @@ class LocalFirstOrchestrator:
             self.state.pop(key, None)
         self.state.pop("rolloverAttemptedForTaskId", None)
         self.state.pop("rolloverTransactionId", None)
+        self.state.pop("rolloverTransactionTaskId", None)
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "LEGACY_ROLLOVER_CUTOUT_RECOVERED", self.state, taskId=task_id)
         return True
@@ -5185,6 +5244,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         return False
     watcher.retire_completed_executor_ownership()
     next_task_id = str(watcher.state.get("nextTaskId") or "")
+    watcher.session_rollover._retire_stale_transaction_for_task(next_task_id)
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (active_pid and watcher.state.get("executorProcessState") == "RUNNING"
             and LocalWatcher.process_alive(int(active_pid))):
