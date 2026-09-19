@@ -4385,6 +4385,28 @@ def test_remote_commands_require_exact_user_message_and_ignore_assistant(tmp_pat
     assert watcher.discussion_pause_active() is False
 
 
+def test_remote_monitor_diagnostic_trace_wraps_existing_user_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR_DIAGNOSTIC_TRACE", "1")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    tracer = watcher_module.DiagnosticTracer(tmp_path, "remote-trace")
+    watcher.diagnostic_trace = tracer
+    bridge = _RemoteControlBridge([{"id": "base", "text": "ordinary discussion"}])
+    bridge._diagnostic_connection_id = "PW-CONN-REMOTE"
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: bridge, emit=lambda _message: None)
+    monitor.establish_startup_baseline(bridge)
+    assert monitor.poll_once() == 0
+    tracer.shutdown(watcher.state)
+    records = [json.loads(line) for line in (tmp_path / "logs" / "diagnostic" / "remote-trace" / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    operations = [record["operation"] for record in records]
+    assert "REMOTE_CONTROL_POLL_BEGIN" in operations
+    assert "REMOTE_CONTROL_USER_READ_BEGIN" in operations
+    assert "REMOTE_CONTROL_USER_READ_END" in operations
+    assert "REMOTE_CONTROL_POLL_END" in operations
+    read_end = next(record for record in records if record["operation"] == "REMOTE_CONTROL_USER_READ_END")
+    assert read_end["connectionId"] == "PW-CONN-REMOTE"
+    assert read_end["userMessageCount"] == 1
+
+
 def test_remote_command_identity_is_consumed_once_and_restart_baseline_ignores_old_command(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     messages = [{"id": "base", "text": "hello"}]

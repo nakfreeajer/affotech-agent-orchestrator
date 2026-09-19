@@ -1904,6 +1904,57 @@ def test_assistant_snapshot_removes_structural_ui_chrome_but_preserves_semantic_
     assert architect_handover_ready(entry["text"])
 
 
+def test_assistant_writing_block_extraction_excludes_chatgpt_followups_without_string_filtering():
+    from local_orchestrator_watcher import ArchitectPlaywright, architect_handover_ready
+
+    semantic = ("AFFOTECH ARCHITECT SESSION HANDOVER\n\n"
+                "The assistant may discuss a button named Shorten this handover.\n"
+                "The literal attribute aria-hidden is part of this semantic text.\n\n"
+                "ARCHITECT_HANDOVER_READY")
+    contaminated = semantic + ("\nShorten this handover for faster bootstrapping\n"
+                                "Separate current state from historical evidence\n"
+                                "Add a compact decision summary")
+    assert "ARCHITECT_HANDOVER_READY" in contaminated
+    assert not architect_handover_ready(contaminated)
+
+    class Page:
+        def evaluate(self, script):
+            assert '[data-testid="writing-block-container"]' in script
+            assert '[data-testid="writing-block-suggested-followups"]' in script
+            assert '[data-testid="writing-block-suggested-followups-surface"]' in script
+            assert '[aria-hidden="true"]' in script
+            return [{"id": "c3814397-278a-474f-8a25-8e01222bdf02",
+                     "rawText": contaminated, "text": semantic,
+                     "semanticSource": "WRITING_BLOCK"}]
+        def locator(self, _selector):
+            raise AssertionError("semantic extraction must use one DOM evaluation")
+
+    entry = ArchitectPlaywright(Page())._assistant_entries()[0]
+    assert entry["id"] == "c3814397-278a-474f-8a25-8e01222bdf02"
+    assert entry["semanticSource"] == "WRITING_BLOCK"
+    assert entry["text"] == semantic
+    assert architect_handover_ready(entry["text"])
+    assert "Shorten this handover for faster bootstrapping" not in entry["text"]
+    assert "Separate current state from historical evidence" not in entry["text"]
+    assert "Add a compact decision summary" not in entry["text"]
+    assert "button named Shorten this handover" in entry["text"]
+    assert "aria-hidden" in entry["text"]
+
+
+def test_assistant_writing_blocks_preserve_dom_order_and_strict_terminal_marker():
+    from local_orchestrator_watcher import ArchitectPlaywright, architect_handover_ready
+
+    class Page:
+        def evaluate(self, _script):
+            return [{"id": "multi", "rawText": "first second trailing control",
+                     "text": "first semantic\nsecond semantic", "semanticSource": "WRITING_BLOCK"}]
+
+    entry = ArchitectPlaywright(Page())._assistant_entries()[0]
+    assert entry["text"] == "first semantic\nsecond semantic"
+    assert entry["id"] == "multi"
+    assert not architect_handover_ready(entry["text"])
+
+
 def test_virtualized_snapshot_race_continues_and_finds_later_prompt(tmp_path):
     from local_orchestrator_watcher import ArchitectPlaywright
     class Page:

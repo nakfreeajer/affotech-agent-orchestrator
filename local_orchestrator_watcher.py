@@ -147,18 +147,19 @@ class DiagnosticTracer:
         if changed:
             self.record("STATE", "save", "STATE_WRITE", "END", after, changed=changed)
 
-    def snapshot_text(self, label: str, text: str) -> str | None:
+    def snapshot_text(self, label: str, text: str, raw_text: str | None = None) -> str | None:
         payload = str(text or "")
+        raw_payload = str(raw_text if raw_text is not None else payload)
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)[:80]
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         directory = self.root / "snapshots"
         existing = sum(path.stat().st_size for path in directory.glob("*") if path.is_file())
-        if existing + len(payload.encode("utf-8")) * 2 > DIAGNOSTIC_SNAPSHOT_MAX_BYTES:
+        if existing + len(raw_payload.encode("utf-8")) + len(payload.encode("utf-8")) > DIAGNOSTIC_SNAPSHOT_MAX_BYTES:
             self.record("DIAGNOSTIC", "snapshot_text", "SNAPSHOT", "SKIP", {}, reason="SNAPSHOT_LIMIT_REACHED", sha256=digest, length=len(payload))
             return None
         raw_path = directory / f"{safe_label}-{digest[:12]}-rawText.txt"
         sanitized_path = directory / f"{safe_label}-{digest[:12]}-sanitizedText.txt"
-        raw_path.write_text(payload, encoding="utf-8")
+        raw_path.write_text(raw_payload, encoding="utf-8")
         sanitized_path.write_text(payload, encoding="utf-8")
         return str(sanitized_path.relative_to(self.root))
 
@@ -1930,16 +1931,33 @@ class ArchitectPlaywright:
         evaluate = getattr(self.page, "evaluate", None)
         if evaluate is not None:
             script = """
-            () => [...document.querySelectorAll('[data-message-author-role="assistant"]')]
-              .filter((node) => node.isConnected)
-              .map((node) => {
-                const clone = node.cloneNode(true);
-                clone.querySelectorAll('button,[role="button"]').forEach(control => control.remove());
-                return {
-                  id: node.getAttribute('data-message-id'),
-                  text: clone.innerText || clone.textContent || ''
-                };
-              })
+            () => {
+              const clean = (source) => {
+                const clone = source.cloneNode(true);
+                clone.querySelectorAll(
+                  'button,[role="button"],[aria-hidden="true"],' +
+                  '[data-testid="writing-block-suggested-followups"],' +
+                  '[data-testid="writing-block-suggested-followups-surface"]'
+                ).forEach(control => control.remove());
+                return clone.innerText || clone.textContent || '';
+              };
+              return [...document.querySelectorAll('[data-message-author-role="assistant"]')]
+                .filter((node) => node.isConnected)
+                .map((node) => {
+                  const writingBlocks = [...node.querySelectorAll('[data-testid="writing-block-container"]')]
+                    .filter((block) => block.isConnected);
+                  const semanticSource = writingBlocks.length ? 'WRITING_BLOCK' : 'STANDARD_RESPONSE';
+                  const text = writingBlocks.length
+                    ? writingBlocks.map(clean).join('\n')
+                    : clean(node);
+                  return {
+                    id: node.getAttribute('data-message-id'),
+                    rawText: node.innerText || node.textContent || '',
+                    text,
+                    semanticSource
+                  };
+                });
+            }
             """
             last_error = None
             for _ in range(3):
@@ -1948,18 +1966,31 @@ class ArchitectPlaywright:
                     if not isinstance(result, list):
                         last_error = RuntimeError("ASSISTANT_SNAPSHOT_INVALID")
                         break
-                    entries = [
-                        {"id": item.get("id"), "text": item.get("text", "")}
-                        for item in (result or [])
-                        if isinstance(item, dict)
-                    ]
+                    entries = []
+                    for item in (result or []):
+                        if not isinstance(item, dict):
+                            continue
+                        entry = {"id": item.get("id"), "text": item.get("text", "")}
+                        if "rawText" in item:
+                            entry["rawText"] = item.get("rawText", "")
+                        if "semanticSource" in item:
+                            entry["semanticSource"] = item.get("semanticSource", "STANDARD_RESPONSE")
+                        entries.append(entry)
                     self._trace_operation("assistant_entries", "END", started, count=len(entries), mutation=False)
                     for entry in entries:
                         text = str(entry.get("text") or "")
+                        raw_text = str(entry.get("rawText") or "")
                         if self.diagnostic_trace:
-                            fields = {"messageId": entry.get("id"), "textLength": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest(), "containsHandoverReady": HANDOVER_READY in text, "architectHandoverReady": architect_handover_ready(text)}
+                            fields = {"messageId": entry.get("id"), "semanticSource": entry.get("semanticSource"),
+                                      "rawTextLength": len(raw_text), "semanticTextLength": len(text),
+                                      "rawSha256": hashlib.sha256(raw_text.encode()).hexdigest(),
+                                      "semanticSha256": hashlib.sha256(text.encode()).hexdigest(),
+                                      "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                                      "containsHandoverReady": HANDOVER_READY in text, "architectHandoverReady": architect_handover_ready(text)}
                             if architect_handover_ready(text):
-                                fields["snapshotPath"] = self.diagnostic_trace.snapshot_text(f"assistant-{entry.get('id') or 'unknown'}", text)
+                                fields["snapshotPath"] = self.diagnostic_trace.snapshot_text(f"assistant-{entry.get('id') or 'unknown'}", text, raw_text)
+                                fields["rawSnapshotPath"] = fields["snapshotPath"].replace("-sanitizedText.txt", "-rawText.txt") if fields["snapshotPath"] else None
+                                fields["semanticSnapshotPath"] = fields["snapshotPath"]
                             self.diagnostic_trace.record("HANDOVER", "_assistant_entries", "ASSISTANT_ENTRY", "END", {}, **fields)
                     return entries
                 except Exception as error:  # transient DOM replacement; retry the whole snapshot
@@ -4706,37 +4737,58 @@ class RemoteDiscussionControlMonitor:
         atomic_write(self.watcher.state_dir / "remote-control.json", json.dumps({"cursor": self._cursor, "count": len(messages)}).encode("utf-8"))
 
     def poll_once(self) -> int:
-        messages = self._messages(self.bridge)
-        start = 0
-        if self._cursor is not None:
-            positions = [index for index, message in enumerate(messages) if self._identity(message, index) == self._cursor]
-            if positions:
-                start = positions[-1] + 1
-            else:
-                start = len(messages)
-        observed = 0
-        for index, message in enumerate(messages[start:], start=start):
-            text = message.get("text")
-            if isinstance(text, str):
-                command = text.strip()
-                if command in {"ORCH:PAUSE", "ORCH:RESUME"}:
-                    identity = self._identity(message, index)
-                    if identity in self._consumed_command_ids:
-                        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_DUPLICATE_IGNORED", self.watcher.state, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
-                        continue
-                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_OBSERVED", self.watcher.state, command=command, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
-                    if command == "ORCH:PAUSE":
-                        self.watcher.request_remote_discussion_pause()
-                    else:
-                        self.watcher.request_remote_discussion_resume()
-                    self._consumed_command_ids.append(identity)
-                    self._consumed_command_ids = self._consumed_command_ids[-32:]
-                    observed += 1
-                    self._cursor = identity
-        if messages:
-            self._cursor = self._identity(messages[-1], len(messages) - 1)
-        atomic_write(self.watcher.state_dir / "remote-control.json", json.dumps({"cursor": self._cursor, "count": len(messages)}).encode("utf-8"))
-        return observed
+        tracer = diagnostic_trace_for(self.watcher) or diagnostic_trace_for(self.bridge)
+        poll_started = time.monotonic()
+        connection_id = getattr(self.bridge, "_diagnostic_connection_id", None)
+        if tracer:
+            tracer.record("REMOTE_CONTROL", "RemoteDiscussionControlMonitor.poll_once", "REMOTE_CONTROL_POLL_BEGIN", "BEGIN", self.watcher.state, connectionId=connection_id)
+        messages = []
+        try:
+            read_started = time.monotonic()
+            if tracer:
+                tracer.record("REMOTE_CONTROL", "RemoteDiscussionControlMonitor._messages", "REMOTE_CONTROL_USER_READ_BEGIN", "BEGIN", self.watcher.state, connectionId=connection_id)
+            try:
+                messages = self._messages(self.bridge)
+            except Exception as error:
+                if tracer:
+                    tracer.record("REMOTE_CONTROL", "RemoteDiscussionControlMonitor._messages", "REMOTE_CONTROL_USER_READ_ERROR", "ERROR", self.watcher.state, connectionId=connection_id, errorClass=type(error).__name__, errorMessage=str(error), stackTrace=traceback.format_exc())
+                raise
+            finally:
+                if tracer:
+                    tracer.record("REMOTE_CONTROL", "RemoteDiscussionControlMonitor._messages", "REMOTE_CONTROL_USER_READ_END", "END", self.watcher.state, connectionId=connection_id, userMessageCount=len(messages), duration_ms=(time.monotonic() - read_started) * 1000)
+            start = 0
+            if self._cursor is not None:
+                positions = [index for index, message in enumerate(messages) if self._identity(message, index) == self._cursor]
+                if positions:
+                    start = positions[-1] + 1
+                else:
+                    start = len(messages)
+            observed = 0
+            for index, message in enumerate(messages[start:], start=start):
+                text = message.get("text")
+                if isinstance(text, str):
+                    command = text.strip()
+                    if command in {"ORCH:PAUSE", "ORCH:RESUME"}:
+                        identity = self._identity(message, index)
+                        if identity in self._consumed_command_ids:
+                            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_DUPLICATE_IGNORED", self.watcher.state, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
+                            continue
+                        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "REMOTE_CONTROL_COMMAND_OBSERVED", self.watcher.state, command=command, messageHash=hashlib.sha256(text.encode("utf-8")).hexdigest())
+                        if command == "ORCH:PAUSE":
+                            self.watcher.request_remote_discussion_pause()
+                        else:
+                            self.watcher.request_remote_discussion_resume()
+                        self._consumed_command_ids.append(identity)
+                        self._consumed_command_ids = self._consumed_command_ids[-32:]
+                        observed += 1
+                        self._cursor = identity
+            if messages:
+                self._cursor = self._identity(messages[-1], len(messages) - 1)
+            atomic_write(self.watcher.state_dir / "remote-control.json", json.dumps({"cursor": self._cursor, "count": len(messages)}).encode("utf-8"))
+            return observed
+        finally:
+            if tracer:
+                tracer.record("REMOTE_CONTROL", "RemoteDiscussionControlMonitor.poll_once", "REMOTE_CONTROL_POLL_END", "END", self.watcher.state, connectionId=connection_id, userMessageCount=len(messages), duration_ms=(time.monotonic() - poll_started) * 1000)
 
     def start(self) -> bool:
         def run() -> None:
