@@ -1627,6 +1627,157 @@ def test_fresh_bootstrap_adds_ready_instruction_without_changing_handover_body(t
     assert sent[0].endswith("ARCHITECT_SESSION_READY")
 
 
+def test_fresh_click_noop_uses_one_same_page_enter_and_launches_staged_task_once(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000050.txt"
+    prompt.write_text("staged next task", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000049", "lastCompletedTaskId": "000049",
+                          "nextTaskId": "000050", "nextPromptPath": str(prompt), "rolloverDue": True,
+                          "rolloverPending": True, "handoverRequested": True, "architectConversationId": "OLD"})
+    watcher.save()
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+
+    class Composer:
+        def __init__(self, page): self.page, self.last = page, self
+        def is_visible(self, **_): return True
+        def is_editable(self, **_): return True
+        def focus(self, **_): return None
+        def inner_text(self, **_): return self.page.content
+        def press(self, key, **_):
+            if key == "ControlOrMeta+A": self.page.content = ""
+            elif key == "Backspace": self.page.content = ""
+            elif key == "Enter": self.page.submit()
+
+    class Button:
+        last = None
+        def __init__(self, page): self.page, self.last = page, self
+        def is_visible(self, **_): return True
+        def is_enabled(self, **_): return True
+        def click(self, **_): return None  # production defect: successful no-op
+
+    class Count:
+        def __init__(self, page, selector): self.page, self.selector = page, selector
+        def count(self): return len(self.page.assistants) if "assistant" in self.selector else 0
+
+    class Page:
+        def __init__(self, url):
+            self.url, self.closed, self.context = url, False, None
+            self.content, self.users, self.assistants = "", [], []
+            page = self
+            self.keyboard = type("Keyboard", (), {"insert_text": lambda _self, value: setattr(page, "content", value)})()
+        def goto(self, _url): self.url = "https://chatgpt.com/"
+        def close(self): self.closed = True
+        def submit(self):
+            self.users.append(self.content)
+            self.content = ""
+            self.url = "https://chatgpt.com/c/FRESH"
+            self.assistants.append({"id": "ready", "text": "ARCHITECT_SESSION_READY"})
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox": return Composer(self)
+            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return type("Stop", (), {"count": lambda _self: 0, "is_visible": lambda _self, **_: False})()
+            return Button(self)
+        def locator(self, selector): return Count(self, selector)
+        def evaluate(self, script):
+            if 'data-message-author-role="user"' in script: return list(self.users)
+            if 'data-message-author-role="assistant"' in script: return list(self.assistants)
+            if "stop-button" in script: return False
+            return False
+
+    old = Page("https://chatgpt.com/c/OLD")
+    fresh = Page("https://chatgpt.com/")
+    class Context:
+        def __init__(self): self.pages = [old]
+        def new_page(self): self.pages.append(fresh); fresh.context = self; return fresh
+    context = Context()
+    old.context = context
+    ticks = iter([index * 0.01 for index in range(10000)])
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    reconcile_results = []
+    original_reconcile = ArchitectPlaywright.reconcile_unsent_submission
+    def record_reconcile(self, payload):
+        result = original_reconcile(self, payload)
+        reconcile_results.append(result)
+        return result
+    monkeypatch.setattr(ArchitectPlaywright, "reconcile_unsent_submission", record_reconcile)
+    bridge = ArchitectPlaywright(old)
+    assert watcher.session_rollover.complete_from_response(bridge, handover) is True, reconcile_results
+    assert len(context.pages) == 2
+    assert fresh.users == [bootstrap]
+    assert watcher.state["architectConversationId"] == "FRESH"
+    assert old.closed is True and fresh.closed is False
+    assert watcher.state["nextTaskId"] == "000050"
+    launches = []
+    watcher.launch_next = lambda _launch: launches.append(1) or type("Process", (), {"pid": 5050})()
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is not None
+    assert launches == [1]
+
+
+def test_fresh_button_and_enter_noop_fail_closed_without_second_tab(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000049", "lastCompletedTaskId": "000049",
+                          "nextTaskId": "000050", "rolloverDue": True, "rolloverPending": True,
+                          "handoverRequested": True, "architectConversationId": "OLD"})
+    watcher.save()
+    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+
+    class Page:
+        def __init__(self, url):
+            self.url, self.closed, self.context, self.content = url, False, None, ""
+            page = self
+            self.keyboard = type("Keyboard", (), {"insert_text": lambda _self, value: setattr(page, "content", value)})()
+        def goto(self, _url): self.url = "https://chatgpt.com/"
+        def close(self): self.closed = True
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                page = self
+                return type("Composer", (), {"__init__": lambda _s: setattr(_s, "last", _s), "is_visible": lambda _s, **_: True, "is_editable": lambda _s, **_: True,
+                    "focus": lambda _s, **_: None, "inner_text": lambda _s, **_: page.content,
+                    "press": lambda _s, key, **_: (setattr(page, "content", "") if key in {"ControlOrMeta+A", "Backspace"} else None)})()
+            if role == "button" and "stop" in str(kwargs.get("name", "")).lower():
+                return type("Stop", (), {"count": lambda _s: 0, "is_visible": lambda _s, **_: False})()
+            return type("Send", (), {"__init__": lambda _s: setattr(_s, "last", _s), "is_visible": lambda _s, **_: True, "is_enabled": lambda _s, **_: True,
+                "click": lambda _s, **_: None})()
+        def locator(self, _selector): return type("Count", (), {"count": lambda _s: 0})()
+        def evaluate(self, script):
+            if "stop-button" in script: return False
+            if 'data-message-author-role="user"' in script: return []
+            if 'data-message-author-role="assistant"' in script: return []
+            return False
+
+    old, fresh = Page("https://chatgpt.com/c/OLD"), Page("https://chatgpt.com/")
+    class Context:
+        def __init__(self): self.pages = [old]
+        def new_page(self): self.pages.append(fresh); fresh.context = self; return fresh
+    context = Context(); old.context = context
+    ticks = iter([float(index) for index in range(1000)])
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    assert watcher.session_rollover.complete_from_response(ArchitectPlaywright(old), handover) is False
+    assert len(context.pages) == 2
+    assert fresh.closed is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
+
+
+def test_unidentified_prior_fresh_page_never_creates_replacement_tab_after_restart(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000049", "lastCompletedTaskId": "000049",
+                          "nextTaskId": "000050", "rolloverDue": True, "rolloverPending": True,
+                          "handoverRequested": True, "rolloverFreshPageCreated": True,
+                          "architectConversationId": "OLD"})
+    watcher.save()
+    calls = []
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD", "context": type("Context", (), {"pages": []})()})()
+        def open_fresh_with_handover(self, _handover): calls.append(1); return None
+    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert calls == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_PAGE_REPLACEMENT_FORBIDDEN"
+
+
 def test_ambiguous_fresh_submission_persists_candidate_without_closing_it(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"handoverRequested": True, "rolloverPending": True,

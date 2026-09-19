@@ -1410,6 +1410,9 @@ class ArchitectSessionRollover:
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover._existing_fresh_candidate_page", "FUNCTION", "BEGIN", self.watcher.state, persistedCandidateId=self.watcher.state.get("rolloverFreshCandidateConversationId"))
         candidate_id = self.watcher.state.get("rolloverFreshCandidateConversationId")
+        owned_page = getattr(bridge, "_fresh_candidate_page", None)
+        if owned_page is not None and not getattr(owned_page, "closed", False):
+            return owned_page
         stale_candidate_id = None
         context = getattr(getattr(bridge, "page", None), "context", None)
         pages = getattr(context, "pages", []) if context is not None else []
@@ -1518,6 +1521,10 @@ class ArchitectSessionRollover:
         try:
             new_page = self._existing_fresh_candidate_page(bridge, response)
             if new_page is None:
+                if self.watcher.state.get("rolloverFreshPageCreated"):
+                    raise RuntimeError("ARCHITECT_FRESH_PAGE_REPLACEMENT_FORBIDDEN")
+                self.watcher.state["rolloverFreshPageCreated"] = True
+                self.watcher.save()
                 new_page = bridge.open_fresh_with_handover(response)
             else:
                 if hasattr(bridge, "_fresh_candidate_submission_ambiguous"):
@@ -1592,6 +1599,7 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverFreshCandidateAttemptCount", None)
             self.watcher.state.pop("rolloverFreshBootstrapPayloadHash", None)
             self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
+            self.watcher.state.pop("rolloverFreshPageCreated", None)
             self.watcher.state.pop("rolloverHandoverRecoveryDisposition", None)
             self.watcher.state.pop("rolloverHandoverRecoveryReason", None)
             self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
@@ -1618,7 +1626,13 @@ class ArchitectSessionRollover:
         except Exception as error:
             if new_page is None:
                 new_page = getattr(bridge, "_fresh_candidate_page", None)
-            ambiguous_submission = bool(getattr(bridge, "_fresh_candidate_submission_ambiguous", False))
+            ambiguous_submission = bool(getattr(bridge, "_fresh_candidate_submission_ambiguous", False)) or (
+                isinstance(error, ResultSubmissionError) and error.code in {
+                    "ARCHITECT_SUBMISSION_ACK_TIMEOUT",
+                    "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS",
+                    "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED",
+                }
+            )
             if new_page is not None and not committed:
                 self._record_fresh_candidate(new_page, "SUBMISSION_AMBIGUOUS" if ambiguous_submission else "FAILED")
             if not committed and not ambiguous_submission and new_page is not None and new_page is not old_page and hasattr(new_page, "close"):
@@ -1635,6 +1649,16 @@ class ArchitectSessionRollover:
             self.watcher.state["rolloverDue"] = True
             self.watcher.state["rolloverPending"] = True
             self.watcher.state["handoverReady"] = False
+            if ambiguous_submission and not self.watcher.state.get("rolloverFreshCandidateConversationId"):
+                self.watcher.state.update({
+                    "state": "HUMAN_REQUIRED",
+                    "humanRequiredReason": "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS",
+                })
+            if str(error) == "ARCHITECT_FRESH_PAGE_REPLACEMENT_FORBIDDEN":
+                self.watcher.state.update({
+                    "state": "HUMAN_REQUIRED",
+                    "humanRequiredReason": "ARCHITECT_FRESH_PAGE_REPLACEMENT_FORBIDDEN",
+                })
             if not ambiguous_submission:
                 attempts = int(self.watcher.state.get("rolloverFreshCandidateAttemptCount", 0)) + 1
                 self.watcher.state.update({
@@ -1949,6 +1973,10 @@ class ArchitectPlaywright:
         self.last_state = "NOT_YET"
         self.diagnostic_trace = diagnostic_trace_for()
         self._diagnostic_connection_id = None
+        self.initialSendMethod = None
+        self.initialSendActionReturned = False
+        self.alternateSendAttempted = False
+        self.alternateSendMethod = None
 
     def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
         tracer = getattr(self, "diagnostic_trace", None)
@@ -2191,6 +2219,49 @@ class ArchitectPlaywright:
     def exact_user_message_payload_observed(self, payload: str) -> bool:
         target = normalize_prompt(payload)
         return any(normalize_prompt(text) == target for text in self.user_message_texts())
+
+    def reconcile_unsent_submission(self, payload: str, timeout: float = 1.0) -> str:
+        """Reconcile one ambiguous send on this page without allocating a tab."""
+        try:
+            already_submitted = self.exact_user_message_payload_observed(payload)
+        except Exception:
+            already_submitted = False
+        if already_submitted:
+            self.sendActionAcknowledged = True
+            return "SENT"
+        try:
+            composer = self._live_composer()
+            observed = composer.inner_text(timeout=1000)
+        except Exception:
+            return "AMBIGUOUS"
+        if not isinstance(observed, str) or normalize_prompt(observed) != normalize_prompt(payload):
+            return "AMBIGUOUS"
+        try:
+            composer.focus(timeout=1000)
+            self.sendActionAttempted = True
+            composer.press("Enter", timeout=1000)
+            self.last_send_method = "playwright.composer.press(Enter)"
+            self.alternateSendAttempted = True
+            self.alternateSendMethod = "playwright.composer.press(Enter)"
+        except Exception:
+            self.alternateSendAttempted = True
+            self.alternateSendMethod = "playwright.composer.press(Enter)"
+            return "SEND_FAILED"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.exact_user_message_payload_observed(payload):
+                    self.sendActionAcknowledged = True
+                    return "SENT"
+            except Exception:
+                pass
+            time.sleep(0.1)
+        try:
+            composer = self._live_composer()
+            still_present = composer.inner_text(timeout=1000)
+        except Exception:
+            return "AMBIGUOUS"
+        return "SEND_FAILED" if isinstance(still_present, str) and normalize_prompt(still_present) == normalize_prompt(payload) else "AMBIGUOUS"
 
     def control_user_messages(self) -> list[dict[str, str | None]]:
         """Read only user-message identities/text for the remote pause monitor."""
@@ -2453,6 +2524,8 @@ class ArchitectPlaywright:
                 self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send Architect payload", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
             send.click(timeout=1000)
             self.last_send_method = "playwright.click"
+            self.initialSendMethod = self.last_send_method
+            self.initialSendActionReturned = True
         except Exception as error:
             if type(error).__name__ != "TimeoutError":
                 raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(error).__name__) from error
@@ -2468,6 +2541,8 @@ class ArchitectPlaywright:
                     self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send fallback Enter", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
                 composer.press("Enter", timeout=1000)
                 self.last_send_method = "playwright.composer.press(Enter)"
+                self.initialSendMethod = self.last_send_method
+                self.initialSendActionReturned = True
             except Exception as fallback_error:
                 raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(fallback_error).__name__) from fallback_error
 
@@ -2566,14 +2641,31 @@ class ArchitectPlaywright:
                 self.diagnostic_trace.record("PLAYWRIGHT", "open_fresh_with_handover", "FRESH_SESSION_CREATE_END", "END", {}, durationMs=(time.monotonic() - started) * 1000, newPageUrl=getattr(new_page, "url", ""))
             fresh_bridge = ArchitectPlaywright(new_page)
             fresh_bridge.diagnostic_trace = self.diagnostic_trace
-            fresh_bridge.submit_result_bounded(bootstrap)
+            try:
+                fresh_bridge.submit_result_bounded(bootstrap)
+            except ResultSubmissionError as submission_error:
+                if submission_error.code != "ARCHITECT_SUBMISSION_ACK_TIMEOUT":
+                    raise
+                try:
+                    reconciliation = fresh_bridge.reconcile_unsent_submission(bootstrap)
+                except Exception:
+                    reconciliation = "AMBIGUOUS"
+                if reconciliation != "SENT":
+                    self._fresh_candidate_submission_ambiguous = True
+                    raise ResultSubmissionError(
+                        "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED" if reconciliation == "SEND_FAILED" else "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
+                    ) from submission_error
             if self.diagnostic_trace:
                 self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_BOOTSTRAP_SEND_END", "END", {}, payloadLength=len(bootstrap), payloadSha256=hashlib.sha256(bootstrap.encode()).hexdigest())
         except Exception as error:
             if self.diagnostic_trace:
                 self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_SESSION_CREATE_ERROR", "ERROR", {}, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc())
             attempted = bool(getattr(fresh_bridge, "sendActionAttempted", False)) or bool(getattr(fresh_bridge, "last_send_method", None))
-            ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+            ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code in {
+                "ARCHITECT_SUBMISSION_ACK_TIMEOUT",
+                "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS",
+                "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED",
+            })
             if ambiguous:
                 self._fresh_candidate_submission_ambiguous = True
                 raise
