@@ -5,6 +5,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from local_orchestrator_watcher import (
     BEGIN, COMPLETE, END, HANDOVER_BEGIN, HANDOVER_END, READY, CodexResult,
     CodexRunner, LocalWatcher, LoopGuard, RelayAuthorityError, RelayPromptSource,
@@ -1953,6 +1955,44 @@ def test_assistant_writing_blocks_preserve_dom_order_and_strict_terminal_marker(
     assert entry["text"] == "first semantic\nsecond semantic"
     assert entry["id"] == "multi"
     assert not architect_handover_ready(entry["text"])
+
+
+def test_assistant_entries_runtime_script_parses_and_old_python_escaping_is_rejected():
+    from local_orchestrator_watcher import assistant_entries_script
+
+    emitted = assistant_entries_script()
+    assert r"writingBlocks.map(clean).join('\n')" in emitted
+    node_program = 'const source = process.argv[1]; new Function("return (" + source + ")");'
+    valid = subprocess.run(["node", "-e", node_program, emitted], capture_output=True, text=True)
+    assert valid.returncode == 0, valid.stderr
+
+    broken = """() => ['a'].join('\n')"""
+    assert r"join('\n')" not in broken
+    invalid = subprocess.run(["node", "-e", node_program, broken], capture_output=True, text=True)
+    assert invalid.returncode != 0
+
+
+def test_assistant_entries_diagnostic_trace_records_each_evaluate_error_and_exhaustion(tmp_path):
+    from local_orchestrator_watcher import ArchitectPlaywright, DiagnosticTracer
+
+    tracer = DiagnosticTracer(tmp_path, "assistant-errors")
+
+    class Page:
+        def evaluate(self, _script):
+            raise RuntimeError("synthetic evaluate failure")
+
+    bridge = ArchitectPlaywright(Page())
+    bridge.diagnostic_trace = tracer
+    with pytest.raises(RuntimeError, match="synthetic evaluate failure"):
+        bridge._assistant_entries()
+    tracer.shutdown({})
+    records = [json.loads(line) for line in (tmp_path / "logs" / "diagnostic" / "assistant-errors" / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    errors = [record for record in records if record["operation"] == "ASSISTANT_ENTRIES_ERROR"]
+    assert len(errors) == 3
+    assert [record["attemptNumber"] for record in errors] == [1, 2, 3]
+    assert all(record["errorClass"] == "RuntimeError" and record["stackTrace"] for record in errors)
+    exhausted = [record for record in records if record["operation"] == "ASSISTANT_ENTRIES_EXHAUSTED"]
+    assert len(exhausted) == 1
 
 
 def test_virtualized_snapshot_race_continues_and_finds_later_prompt(tmp_path):

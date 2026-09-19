@@ -1909,28 +1909,9 @@ def discover_codex_launcher(executable: str = "codex") -> list[str]:
     return [node, script]
 
 
-class ArchitectPlaywright:
-    """Semantic Playwright boundary; it never targets AFFOTECH pages."""
-    def __init__(self, page: Any):
-        self.page = page
-        self.last_state = "NOT_YET"
-        self.diagnostic_trace = diagnostic_trace_for()
-        self._diagnostic_connection_id = None
-
-    def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
-        tracer = getattr(self, "diagnostic_trace", None)
-        if tracer:
-            tracer.record("PLAYWRIGHT", "ArchitectPlaywright", operation, phase, {}, duration_ms=(time.monotonic() - started) * 1000 if started else None, connectionId=getattr(self, "_diagnostic_connection_id", None), **fields)
-
-    def latest_response(self) -> str:
-        return self.page.get_by_role("main").inner_text()
-
-    def _assistant_entries(self) -> list[dict[str, str | None]]:
-        started = time.monotonic()
-        self._trace_operation("assistant_entries", "BEGIN", selector='[data-message-author-role="assistant"]', mutation=False)
-        evaluate = getattr(self.page, "evaluate", None)
-        if evaluate is not None:
-            script = """
+def assistant_entries_script() -> str:
+    """Return the exact read-only semantic assistant extraction script."""
+    return r"""
             () => {
               const clean = (source) => {
                 const clone = source.cloneNode(true);
@@ -1959,13 +1940,36 @@ class ArchitectPlaywright:
                 });
             }
             """
+
+
+class ArchitectPlaywright:
+    """Semantic Playwright boundary; it never targets AFFOTECH pages."""
+    def __init__(self, page: Any):
+        self.page = page
+        self.last_state = "NOT_YET"
+        self.diagnostic_trace = diagnostic_trace_for()
+        self._diagnostic_connection_id = None
+
+    def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
+        tracer = getattr(self, "diagnostic_trace", None)
+        if tracer:
+            tracer.record("PLAYWRIGHT", "ArchitectPlaywright", operation, phase, {}, duration_ms=(time.monotonic() - started) * 1000 if started else None, connectionId=getattr(self, "_diagnostic_connection_id", None), **fields)
+
+    def latest_response(self) -> str:
+        return self.page.get_by_role("main").inner_text()
+
+    def _assistant_entries(self) -> list[dict[str, str | None]]:
+        started = time.monotonic()
+        self._trace_operation("assistant_entries", "BEGIN", selector='[data-message-author-role="assistant"]', mutation=False)
+        evaluate = getattr(self.page, "evaluate", None)
+        if evaluate is not None:
+            script = assistant_entries_script()
             last_error = None
-            for _ in range(3):
+            for attempt_number in range(1, 4):
                 try:
                     result = evaluate(script)
                     if not isinstance(result, list):
-                        last_error = RuntimeError("ASSISTANT_SNAPSHOT_INVALID")
-                        break
+                        raise RuntimeError("ASSISTANT_SNAPSHOT_INVALID")
                     entries = []
                     for item in (result or []):
                         if not isinstance(item, dict):
@@ -1995,8 +1999,24 @@ class ArchitectPlaywright:
                     return entries
                 except Exception as error:  # transient DOM replacement; retry the whole snapshot
                     last_error = error
-                    time.sleep(0.05)
+                    if self.diagnostic_trace:
+                        self.diagnostic_trace.record(
+                            "HANDOVER", "_assistant_entries", "ASSISTANT_ENTRIES_ERROR", "ERROR", {},
+                            attemptNumber=attempt_number,
+                            connectionId=getattr(self, "_diagnostic_connection_id", None),
+                            errorClass=type(error).__name__, errorMessage=str(error),
+                            stackTrace=traceback.format_exc(),
+                        )
+                    if attempt_number < 3:
+                        time.sleep(0.05)
             if last_error:
+                if self.diagnostic_trace:
+                    self.diagnostic_trace.record(
+                        "HANDOVER", "_assistant_entries", "ASSISTANT_ENTRIES_EXHAUSTED", "ERROR", {},
+                        attemptNumber=3,
+                        connectionId=getattr(self, "_diagnostic_connection_id", None),
+                        errorClass=type(last_error).__name__, errorMessage=str(last_error),
+                    )
                 raise last_error
             raise RuntimeError("ASSISTANT_SNAPSHOT_INVALID")
         messages = self.page.locator('[data-message-author-role="assistant"]')
