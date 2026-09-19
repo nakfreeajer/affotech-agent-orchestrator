@@ -768,13 +768,14 @@ def test_confirmed_identical_result_delivery_is_terminally_idempotent(tmp_path):
 
 def test_localfirst_has_governed_memory_rollover_at_safe_boundary(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
-    watcher.state.update({"state": "EXECUTOR_RUNNING", "codexPid": os.getpid(), "architectResponseCount": 1})
+    prompt = tmp_path / "000002.txt"
+    prompt.write_text("next", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt), "architectResponseCount": 30})
     watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES)
     messages = []
     class Bridge:
         def submit_result_bounded(self, message): messages.append(message)
-    assert watcher.session_rollover.request_if_due(Bridge(), True, True, architect_generating=False) is True
+    assert watcher.session_rollover.request_if_due(Bridge(), True, False, architect_generating=False, safe_boundary_state="NEXT_PROMPT_READY") is True
     assert watcher.state["rolloverPending"] is True
     assert watcher.state["handoverRequested"] is True
     assert len(messages) == 1
@@ -1129,11 +1130,58 @@ def test_memory_due_does_not_preempt_workflow_state(tmp_path, workflow_state, re
     watcher.state.update({"state": workflow_state, "taskId": "task-1", "humanRequiredReason": reason})
     before = dict(watcher.state)
     watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES)
-    assert watcher.state["rolloverDue"] is True
+    assert watcher.state.get("rolloverDue") is None
     assert watcher.state["state"] == workflow_state
     assert watcher.state.get("humanRequiredReason") == reason
     assert watcher.state.get("rolloverPending", False) is False
     assert {key: watcher.state.get(key) for key in ("taskId", "state", "humanRequiredReason")} == {key: before.get(key) for key in ("taskId", "state", "humanRequiredReason")}
+
+
+def test_memory_telemetry_cannot_block_next_prompt_dispatch(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000002.txt"
+    prompt.write_text("next bounded task", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000001", "lastCompletedTaskId": "000001",
+                          "nextTaskId": "000002", "nextPromptPath": str(prompt), "executorProcessState": "COMPLETED_WITH_RESULT"})
+    watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES * 2)
+    assert watcher.state.get("rolloverDue") is None
+    maintenance_calls = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: maintenance_calls.append(1) or False)
+    class Process:
+        pid = 7001
+    launches = []
+    process = watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
+    )
+    assert process is not None
+    assert maintenance_calls == []
+    assert launches == [1]
+
+
+def test_legacy_rollover_cutout_recovers_only_with_valid_newer_staged_task(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    result = tmp_path / "000001-result.txt"
+    prompt = tmp_path / "000002.txt"
+    result.write_text("completed result", encoding="utf-8")
+    prompt.write_bytes(b"staged next prompt")
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "taskId": "000001",
+        "lastCompletedTaskId": "000001",
+        "nextTaskId": "000002",
+        "nextPromptPath": str(prompt),
+        "executorResultPath": str(result),
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+        "rolloverDue": True,
+    })
+    before = prompt.read_bytes()
+    assert watcher.recover_legacy_rollover_cutout() is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["taskId"] == "000001"
+    assert watcher.state["nextTaskId"] == "000002"
+    assert prompt.read_bytes() == before
 
 
 def test_deferred_rollover_can_attempt_once_at_live_executor_boundary(tmp_path, monkeypatch):
@@ -1144,9 +1192,8 @@ def test_deferred_rollover_can_attempt_once_at_live_executor_boundary(tmp_path, 
     sent = []
     class Bridge:
         def submit_result_bounded(self, message): sent.append(message)
-    assert watcher.session_rollover.request_if_due(Bridge(), True, True) is True
-    assert sent and watcher.state["rolloverInProgress"] is True
     assert watcher.session_rollover.request_if_due(Bridge(), True, True) is False
+    assert sent == []
 
 
 def test_failed_rollover_preserves_executor_workflow_and_due_state(tmp_path, monkeypatch):
@@ -1158,12 +1205,11 @@ def test_failed_rollover_preserves_executor_workflow_and_due_state(tmp_path, mon
         page = _AckPage("https://chatgpt.com/c/OLD")
         def submit_result_bounded(self, _response): pass
         def open_fresh_with_handover(self, _response): raise RuntimeError("fresh page unavailable")
-    assert watcher.session_rollover.request_if_due(Bridge(), True, True) is True
-    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.request_if_due(Bridge(), True, True) is False
     assert watcher.state["state"] == "EXECUTOR_RUNNING"
     assert watcher.state.get("humanRequiredReason") is None
     assert watcher.state["rolloverDue"] is True
-    assert watcher.state["rolloverInProgress"] is False
+    assert watcher.state.get("rolloverInProgress", False) is False
 
 
 def test_preempted_rollover_failure_restores_result_recovery_without_executor(tmp_path):
@@ -1273,10 +1319,10 @@ def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monk
         def wait_for_new_response(self, *_args, **_kwargs): return {"state": "COMPLETED", "text": "handover"}
         def close(self): closed.append(True)
     monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(lambda *_args: Bridge()))
-    monkeypatch.setattr(watcher.session_rollover, "request_if_due", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(watcher.session_rollover, "request_if_due", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("rollover must not run while executor is active")))
     monkeypatch.setattr(watcher, "process_pending_handover_response", lambda *_args: True)
-    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False) is True
-    assert closed == [True]
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False) is False
+    assert closed == []
 
 
 def test_acknowledged_handover_recovery_reconstructs_and_launches_staged_next_task(tmp_path, monkeypatch):
@@ -1400,7 +1446,7 @@ def test_next_prompt_ready_failed_rollover_does_not_launch_or_duplicate(tmp_path
     monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1))
     assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
-    assert launches == []
+    assert launches == [1]
     assert watcher.state["rolloverDue"] is True
     assert {key: watcher.state[key] for key in original} == original
     assert prompt.read_text(encoding="utf-8") == "next bounded task"
@@ -1695,8 +1741,8 @@ def test_fresh_weak_acknowledgement_requires_exact_user_message(tmp_path, monkey
     assert watcher.session_rollover.complete_from_response(ArchitectPlaywright(old), handover) is False
     assert calls == ["initial"]
     assert len(context.pages) == 2
-    assert watcher.state["state"] == "HUMAN_REQUIRED"
-    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state.get("humanRequiredReason") is None
 
 
 def test_fresh_initial_send_waits_for_delayed_exact_user_message_without_fallback(tmp_path, monkeypatch):
@@ -1864,8 +1910,8 @@ def test_fresh_button_and_enter_noop_fail_closed_without_second_tab(tmp_path, mo
     assert watcher.session_rollover.complete_from_response(ArchitectPlaywright(old), handover) is False
     assert len(context.pages) == 2
     assert fresh.closed is False
-    assert watcher.state["state"] == "HUMAN_REQUIRED"
-    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state.get("humanRequiredReason") is None
 
 
 def test_unidentified_prior_fresh_page_never_creates_replacement_tab_after_restart(tmp_path):
@@ -1881,8 +1927,8 @@ def test_unidentified_prior_fresh_page_never_creates_replacement_tab_after_resta
         def open_fresh_with_handover(self, _handover): calls.append(1); return None
     assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY") is False
     assert calls == []
-    assert watcher.state["state"] == "HUMAN_REQUIRED"
-    assert watcher.state["humanRequiredReason"] == "ARCHITECT_FRESH_PAGE_REPLACEMENT_FORBIDDEN"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state.get("humanRequiredReason") is None
 
 
 def test_ambiguous_fresh_submission_persists_candidate_without_closing_it(tmp_path, monkeypatch):
@@ -2356,7 +2402,7 @@ def test_memory_telemetry_is_throttled_deduplicated_and_recovers(tmp_path):
     log = Path(log_path).read_text(encoding="utf-8")
     assert log.count("event=ARCHITECT_MEMORY_SAMPLE ") == 4
     assert "memoryMiB=100" in log and "memoryMiB=115" in log and "memoryMiB=180" in log and "memoryMiB=1025" in log
-    assert log.count("event=ARCHITECT_MEMORY_THRESHOLD ") == 1
+    assert log.count("event=ARCHITECT_MEMORY_THRESHOLD_TELEMETRY ") == 1
     assert log.count("event=ARCHITECT_MEMORY_SAMPLE_FAILED ") == 1
 
 
@@ -2410,7 +2456,7 @@ def test_bound_cdp_owner_drives_threshold_rollover(tmp_path, monkeypatch):
     monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "7171")
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
-    assert watcher.session_rollover.sample_memory() == "MEMORY_THRESHOLD"
+    assert watcher.session_rollover.sample_memory() is None
 
 
 def test_process_tree_memory_json_boundary_includes_descendants_only(monkeypatch):
@@ -4531,14 +4577,15 @@ def test_documentation_complete_execute_stages_next_ordinary_task_once(tmp_path)
 def test_discussion_pause_dispatch_is_durable_and_survives_restart(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "EXECUTOR_RUNNING", "taskId": "000025", "lastCompletedTaskId": "000024", "codexPid": 1234})
+    watcher.save()
     controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
     assert controller.dispatch("F9") is True
-    assert watcher.state["discussionPauseActive"] is True
+    assert watcher.discussion_pause_active() is True
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
-    assert restarted.state["discussionPauseActive"] is True
+    assert restarted.discussion_pause_active() is True
     assert restarted.state["taskId"] == "000025"
     assert controller.dispatch("F10") is True
-    assert watcher.state["discussionPauseActive"] is False
+    assert watcher.discussion_pause_active() is False
 
 
 def test_discussion_pause_allows_executor_observation_but_blocks_new_actions(tmp_path, monkeypatch):
@@ -4572,6 +4619,7 @@ def test_discussion_pause_does_not_abort_executor_completion(tmp_path, monkeypat
 def test_discussion_resume_restores_normal_result_delivery_eligibility(tmp_path):
     watcher = ready(tmp_path)
     watcher.state["discussionPauseActive"] = True
+    watcher._write_discussion_pause_marker(True)
     watcher.request_discussion_resume()
     sent = []
     class Bridge:
@@ -4586,6 +4634,7 @@ def test_discussion_resume_restores_normal_result_delivery_eligibility(tmp_path)
 def test_discussion_resume_does_not_change_human_required(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "discussionPauseActive": True})
+    watcher._write_discussion_pause_marker(True)
     watcher.request_discussion_resume()
     assert watcher.state["state"] == "HUMAN_REQUIRED"
     assert watcher.state["humanRequiredReason"] == "ARCHITECT_DECISION_HUMAN_REQUIRED"
@@ -4608,6 +4657,37 @@ class _RemoteControlBridge:
 
     def close(self):
         self.closed = True
+
+
+def test_remote_monitor_incremental_reads_skip_unchanged_history(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+
+    class Bridge:
+        def __init__(self):
+            self.messages = [{"id": f"history-{index}", "text": "ordinary"} for index in range(1000)]
+            self.reads = []
+
+        def control_user_message_count(self):
+            return len(self.messages)
+
+        def control_user_messages(self, start=0):
+            self.reads.append(start)
+            return list(self.messages[start:])
+
+        def close(self):
+            pass
+
+    bridge = Bridge()
+    monitor = RemoteDiscussionControlMonitor(watcher, lambda: bridge, emit=lambda _message: None)
+    monitor.establish_startup_baseline(bridge)
+    assert bridge.reads == [0]
+    assert monitor.poll_once() == 0
+    assert bridge.reads == [0]
+    bridge.messages.append({"id": "pause-new", "text": "ORCH:PAUSE"})
+    assert monitor.poll_once() == 1
+    assert bridge.reads == [0, 1000]
+    assert monitor.poll_once() == 0
+    assert bridge.reads == [0, 1000]
 
 
 def test_remote_exact_user_commands_share_durable_pause_authority(tmp_path):
