@@ -30,8 +30,8 @@ DOCUMENTATION_SYNC = "DOCUMENTATION_SYNC_COMPLETE"
 RELAY_REPOSITORY = "https://github.com/nakfreeajer/affotech-agent-relay.git"
 RELAY_POINTER = "relay/current/LATEST_ARCHITECT_PROMPT.json"
 RESULT_SCHEMA_VERSION = "1.0"
-ARCHITECT_MEMORY_THRESHOLD_BYTES = 1_073_741_824
-ARCHITECT_MEMORY_THRESHOLD_MIB = 1024
+ARCHITECT_MEMORY_THRESHOLD_BYTES = 891_289_600
+ARCHITECT_MEMORY_THRESHOLD_MIB = 850
 ARCHITECT_MEMORY_SAFETY_CEILING_BYTES = ARCHITECT_MEMORY_THRESHOLD_BYTES * 2
 ROLLOVER_RECOVERY_MAX_ATTEMPTS = 2
 ROLLOVER_RECOVERY_WINDOW_SECONDS = 300.0
@@ -490,6 +490,9 @@ def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requ
         watcher.state["architectConversationId"] = actual_id
         watcher.save()
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_ID_CANONICALIZED", watcher.state, **{"from": requested_id, "to": actual_id})
+    bind_memory = getattr(watcher, "bind_architect_session_memory", None)
+    if callable(bind_memory):
+        bind_memory(bridge, actual_id)
     if tracer:
         tracer.record("ROLLOVER", "canonicalize_attached_architect_conversation", "FUNCTION", "END", getattr(watcher, "state", {}), durationMs=(time.monotonic() - started) * 1000, requestedConversationId=requested_id, actualConversationId=actual_id, result=True)
     return actual_id
@@ -1040,11 +1043,16 @@ class ArchitectSessionRollover:
         self._next_memory_sample_at = 0.0
 
     def initialize_current_session(self) -> None:
+        self.watcher.architect_memory_reader = None
+        self.watcher.architect_memory_session_id = None
         self.watcher.state["architectResponseCount"] = 0
         self.watcher.state["handoverRequested"] = False
         self.watcher.state["handoverReady"] = False
         self.watcher.state["rolloverPending"] = False
         self.watcher.state.pop("rolloverTrigger", None)
+        self.watcher.state.pop("architectMemoryBytes", None)
+        self.watcher.state.pop("architectMemoryMiB", None)
+        self.watcher.state.pop("architectMemorySessionId", None)
         self.watcher.save()
 
     def sample_memory(self, memory_reader: Callable[[], int] | None = None, emit: Callable[[str], None] = print) -> str | None:
@@ -1092,11 +1100,8 @@ class ArchitectSessionRollover:
             self._last_logged_memory_bytes = memory_bytes
         previous_memory_bytes = self._last_sampled_memory_bytes
         self._last_sampled_memory_bytes = memory_bytes
-        # Browser-process memory is telemetry only.  It is not a workflow or
-        # rollover authority: the dedicated Chrome tree survives a session
-        # switch and therefore cannot be used as a session-local threshold.
         response_count = int(self.watcher.state.get("architectResponseCount", 0))
-        trigger = self.rollover_trigger(None, response_count)
+        trigger = self.rollover_trigger(memory_bytes, response_count)
         if memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES and (previous_memory_bytes is None or previous_memory_bytes < ARCHITECT_MEMORY_THRESHOLD_BYTES):
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_THRESHOLD_TELEMETRY", self.watcher.state, memoryMiB=memory_mib, thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB)
         if trigger and not self.watcher.state.get("rolloverDue"):
@@ -1210,8 +1215,9 @@ class ArchitectSessionRollover:
 
     @staticmethod
     def rollover_trigger(memory_bytes: int, response_count: int = 0) -> str | None:
-        if response_count >= 30:
-            return "RESPONSE_COUNT_FALLBACK"
+        del response_count
+        if isinstance(memory_bytes, int) and memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES:
+            return "MEMORY_THRESHOLD"
         return None
 
     def observe_complete_response(self, response: str, response_id: str | None = None) -> bool:
@@ -1272,10 +1278,7 @@ class ArchitectSessionRollover:
             if not next_task or not isinstance(prompt_path, str) or not Path(prompt_path).is_file() or self.watcher.state.get("handoverRequested"):
                 return False
         count = int(self.watcher.state.get("architectResponseCount", 0))
-        # Rollover authority is derived from the current session response
-        # count.  A persisted trigger is only historical maintenance
-        # evidence and must not resurrect obsolete memory authority.
-        trigger = self.rollover_trigger(None, count)
+        trigger = self.rollover_trigger(self.watcher.state.get("architectMemoryBytes"), count)
         if not trigger:
             return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
@@ -1678,6 +1681,9 @@ class ArchitectSessionRollover:
             if tracer:
                 tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id)
             self.watcher.state["architectConversationId"] = conversation_id
+            self.watcher.state["architectMemorySessionId"] = conversation_id
+            self.watcher.state.pop("architectMemoryBytes", None)
+            self.watcher.state.pop("architectMemoryMiB", None)
             self.watcher.state.pop("currentArchitectConversationId", None)
             self.watcher.state["architectResponseCount"] = 0
             self.watcher.state["handoverRequested"] = False
@@ -1707,6 +1713,9 @@ class ArchitectSessionRollover:
             if tracer:
                 tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_END", "END", self.watcher.state, conversationId=conversation_id)
             bridge.page = new_page
+            bind_memory = getattr(self.watcher, "bind_architect_session_memory", None)
+            if callable(bind_memory):
+                bind_memory(bridge, conversation_id)
             if hasattr(old_page, "close"):
                 if tracer:
                     tracer.record("PLAYWRIGHT", "complete_from_response", "OLD_ARCHITECT_CLOSE_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id, mutation=True)
@@ -2077,6 +2086,28 @@ class ArchitectPlaywright:
 
     def latest_response(self) -> str:
         return self.page.get_by_role("main").inner_text()
+
+    def current_session_memory_bytes(self) -> int:
+        """Return memory owned by the attached Architect document only."""
+        started = time.monotonic()
+        self._trace_operation("current_session_memory_bytes", "BEGIN", mutation=False)
+        result = self.page.evaluate(
+            """async () => {
+                const performance = globalThis.performance;
+                if (performance && typeof performance.measureUserAgentSpecificMemory === 'function') {
+                    const sample = await performance.measureUserAgentSpecificMemory();
+                    if (sample && Number.isFinite(sample.bytes)) return Math.floor(sample.bytes);
+                }
+                const memory = performance && performance.memory;
+                if (!memory || !Number.isFinite(memory.usedJSHeapSize)) return null;
+                return Math.floor(memory.usedJSHeapSize);
+            }"""
+        )
+        if not isinstance(result, int) or result < 0:
+            self._trace_operation("current_session_memory_bytes", "ERROR", started, mutation=False, error="ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+            raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+        self._trace_operation("current_session_memory_bytes", "END", started, mutation=False, memoryBytes=result)
+        return result
 
     def _assistant_entries(self) -> list[dict[str, str | None]]:
         started = time.monotonic()
@@ -2867,9 +2898,12 @@ class LocalWatcher:
         if "architectResponseCount" not in self.state:
             self.state["architectResponseCount"] = 0
         self.loop_guard = LoopGuard(self.state)
-        root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
-        self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(int(root_pid))) if root_pid else None
-        self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
+        self.architect_memory_reader = None
+        self.architect_memory_session_id = None
+        self.state.pop("architectMemoryBytes", None)
+        self.state.pop("architectMemoryMiB", None)
+        self.state.pop("architectMemorySessionId", None)
+        self.state["memoryThresholdBytes"] = ARCHITECT_MEMORY_THRESHOLD_BYTES
         self.runner = runner or CodexRunner(project_dir, child_project_dir=AFFOTECH_CHILD_PROJECT_DIR, session_id=AFFOTECH_EXECUTOR_SESSION_ID)
         if durable_decision_reader is not None:
             self.durable_decision_reader = durable_decision_reader
@@ -2880,6 +2914,19 @@ class LocalWatcher:
         self.durable_terminal_publisher = durable_terminal_publisher or (lambda publication_id, result_text, envelope: publish_durable_executor_terminal(evidence_repo, publication_id, result_text, envelope))
         self.session_rollover = ArchitectSessionRollover(self)
         self.documentation_doorbell = DocumentationDoorbell(self)
+
+    def bind_architect_session_memory(self, bridge: Any, conversation_id: str | None = None) -> bool:
+        reader = getattr(bridge, "current_session_memory_bytes", None)
+        if not callable(reader):
+            return False
+        self.architect_memory_reader = reader
+        self.architect_memory_session_id = conversation_id
+        self.state["architectMemoryOwnership"] = "SESSION_SCOPED"
+        self.state["architectMemoryOwnershipSource"] = "ARCHITECT_PAGE_RENDERER"
+        if conversation_id:
+            self.state["architectMemorySessionId"] = conversation_id
+        self.save()
+        return True
 
     def startup_candidate(self, bridge: ArchitectPlaywright, scan_history: bool = True, emit: Callable[[str], None] | None = None) -> str | None:
         """Find a fresh completed prompt without requiring a new response."""
@@ -3468,48 +3515,39 @@ class LocalFirstOrchestrator:
         self.state = self._load_state()
         self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
         self.state.setdefault("executorSessionMode", "PERSISTENT")
-        root_pid = os.environ.get("ARCHITECT_BROWSER_ROOT_PID")
-        if root_pid:
-            try:
-                self.architect_browser_root_pid = int(root_pid)
-            except ValueError:
-                self.architect_browser_root_pid = None
-                root_pid = None
-            if self.architect_browser_root_pid is not None and self.architect_browser_root_pid <= 0:
-                self.architect_browser_root_pid = None
-                root_pid = None
-        else:
-            self.architect_browser_root_pid = None
-        self.architect_memory_reader = (lambda: architect_process_tree_memory_bytes(self.architect_browser_root_pid)) if self.architect_browser_root_pid else None
-        self.memory_ownership_required = not bool(root_pid)
-        if not root_pid:
-            self.state["architectMemoryOwnership"] = "UNCONFIGURED"
-            self.state["architectMemoryError"] = "ARCHITECT_BROWSER_ROOT_PID_REQUIRED"
-        else:
-            self.state["architectMemoryOwnership"] = "CONFIGURED"
-            self.state.pop("architectMemoryError", None)
-        self.state.setdefault("memoryThresholdBytes", ARCHITECT_MEMORY_THRESHOLD_BYTES)
+        self.architect_memory_reader = None
+        self.architect_memory_session_id = None
+        self.memory_ownership_required = False
+        if self.state.get("architectMemoryOwnership") != "SESSION_SCOPED":
+            self.state["architectMemoryOwnership"] = "UNBOUND"
+            self.state.pop("architectMemoryOwnershipSource", None)
+        self.state.pop("architectMemoryBytes", None)
+        self.state.pop("architectMemoryMiB", None)
+        self.state.pop("architectMemorySessionId", None)
+        self.state["memoryThresholdBytes"] = ARCHITECT_MEMORY_THRESHOLD_BYTES
         self.session_rollover = ArchitectSessionRollover(self)
 
-    def bind_architect_memory_owner(self, endpoint: str, emit: Callable[[str], None] = print) -> int:
-        """Bind rollover sampling to the explicit PID or exact CDP listener owner."""
-        if self.architect_browser_root_pid is not None:
-            pid = self.architect_browser_root_pid
-            source = "ENVIRONMENT"
-        else:
-            pid = resolve_architect_browser_root_pid(endpoint)
-            source = "CDP_LISTENER"
-        self.architect_browser_root_pid = pid
-        self.architect_memory_reader = lambda: architect_process_tree_memory_bytes(pid)
-        self.memory_ownership_required = False
-        self.state["architectMemoryOwnership"] = "CONFIGURED"
-        self.state["architectMemoryOwnershipSource"] = source
-        self.state["architectBrowserRootPid"] = pid
+    def bind_architect_session_memory(self, bridge: Any, conversation_id: str | None = None) -> bool:
+        """Bind memory authority to the currently attached Architect page."""
+        reader = getattr(bridge, "current_session_memory_bytes", None)
+        if not callable(reader):
+            return False
+        actual_id = conversation_id
+        if not actual_id:
+            actual_id = architect_conversation_id_from_url(str(getattr(getattr(bridge, "page", None), "url", "")))
+        self.architect_memory_reader = reader
+        self.architect_memory_session_id = actual_id
+        self.state["architectMemoryOwnership"] = "SESSION_SCOPED"
+        self.state["architectMemoryOwnershipSource"] = "ARCHITECT_PAGE_RENDERER"
+        self.state["architectMemorySessionId"] = actual_id
         self.state.pop("architectMemoryError", None)
-        self.state.pop("architectMemoryOwnershipWarningEmitted", None)
         self.save()
-        emit(f"ARCHITECT_MEMORY_OWNER pid={pid} source={source}")
-        return pid
+        return True
+
+    def bind_architect_memory_owner(self, endpoint: str, emit: Callable[[str], None] = print) -> int:
+        """Reject the obsolete browser-tree ownership API."""
+        del endpoint, emit
+        raise RuntimeError("ARCHITECT_SESSION_MEMORY_REQUIRES_ATTACHED_PAGE")
 
     def _configured_fallback_project(self) -> Path | None:
         """Use a caller-provided project root, never this Orchestrator source root."""
@@ -3965,20 +4003,20 @@ class LocalFirstOrchestrator:
                 return False
         except (TypeError, ValueError):
             return False
-        response_trigger = self.session_rollover.rollover_trigger(None, response_count)
+        memory_trigger = self.session_rollover.rollover_trigger(self.state.get("architectMemoryBytes"), response_count)
         self.state.update({
             "state": "NEXT_PROMPT_READY",
             "humanRequiredReason": None,
             "rolloverRecoveryState": "PENDING",
             "legacyRolloverCutoutRecovered": True,
-            "rolloverDue": bool(response_trigger),
+            "rolloverDue": bool(memory_trigger),
             "rolloverPending": False,
             "rolloverInProgress": False,
             "handoverRequested": False,
             "handoverReady": False,
         })
-        if response_trigger:
-            self.state["rolloverTrigger"] = "RESPONSE_COUNT_FALLBACK"
+        if memory_trigger:
+            self.state["rolloverTrigger"] = memory_trigger
         else:
             self.state.pop("rolloverTrigger", None)
         for key in (
@@ -5414,15 +5452,6 @@ def main() -> None:
     if diagnostic_trace:
         diagnostic_trace.record("MAIN", "main", "DIAGNOSTIC_TRACE_ENABLED", "BEGIN", watcher.state, traceDirectory=str(diagnostic_trace.root))
     endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
-    bind_memory_owner = getattr(watcher, "bind_architect_memory_owner", None)
-    if bind_memory_owner is not None:
-        try:
-            bind_memory_owner(endpoint)
-        except RuntimeError as error:
-            print(f"ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED reason={error}")
-            watcher.state["architectMemoryOwnership"] = "INCONCLUSIVE"
-            watcher.state["architectMemoryError"] = str(error)
-            watcher.save()
     recovery_state = watcher.state.get("state", "IDLE")
     recovery_action = {
         "EXECUTOR_RUNNING": "WAIT_EXISTING_EXECUTOR",
@@ -5473,10 +5502,6 @@ def main() -> None:
             if diagnostic_trace:
                 diagnostic_trace.record("MAIN", "main", "LOOP_BEGIN", "BEGIN", watcher.state, discussionPauseActive=bool(discussion_paused()), rolloverRecoveryState=watcher.state.get("rolloverRecoveryState"))
             state = watcher.state.get("state", "IDLE")
-            # Memory is telemetry only.  Avoid even telemetry state writes
-            # while a HUMAN_REQUIRED state is being passively held.
-            if rollover is not None and state != "HUMAN_REQUIRED":
-                rollover.sample_memory_for_loop()
             if state != "HUMAN_REQUIRED" and human_wait_bridge is not None:
                 try:
                     human_wait_bridge.close()
@@ -5513,6 +5538,10 @@ def main() -> None:
                     try:
                         idle_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                         conversation_id = canonicalize_attached_architect_conversation(watcher, idle_bridge, conversation_id)
+                        if rollover is not None:
+                            reader = getattr(idle_bridge, "current_session_memory_bytes", None)
+                            if callable(reader):
+                                rollover.sample_memory(memory_reader=reader)
                     except Exception as error:
                         if idle_bridge is not None:
                             idle_bridge.close()
@@ -5575,6 +5604,10 @@ def main() -> None:
                         try:
                             human_wait_bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
                             conversation_id = canonicalize_attached_architect_conversation(watcher, human_wait_bridge, conversation_id)
+                            if rollover is not None:
+                                reader = getattr(human_wait_bridge, "current_session_memory_bytes", None)
+                                if callable(reader):
+                                    rollover.sample_memory(memory_reader=reader)
                             runtime_log(logger, run_id, "ARCHITECT_HUMAN_WAIT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                         except Exception as error:
                             if human_wait_bridge is not None:
@@ -5690,13 +5723,15 @@ def main() -> None:
                 runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 raise
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
+            if rollover is not None:
+                reader = getattr(bridge, "current_session_memory_bytes", None)
+                if callable(reader):
+                    rollover.sample_memory(memory_reader=reader)
             if bridge.generation_visible():
                 runtime_log(logger, run_id, "ARCHITECT_GENERATION_STARTED", watcher.state, conversationId=conversation_id)
             watcher.state["architectConversationId"] = conversation_id
             watcher.save()
             try:
-                if rollover is not None:
-                    rollover.sample_memory_for_loop()
                 if (watcher.state.get("state") == "RESULT_READY" and not discussion_paused()
                         and (not watcher.state.get("handoverRequested", False) or not watcher.state.get("rolloverInProgress", False))):
                     bridge = watcher.deliver_result_with_recovery(

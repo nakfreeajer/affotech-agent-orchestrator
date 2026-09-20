@@ -518,15 +518,13 @@ def test_architect_rollover_counts_to_thirty_and_requests_once(tmp_path):
     prompt = tmp_path / "next.txt"
     prompt.write_text("next", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt)})
+    watcher.state["architectMemoryBytes"] = 891289599
     class Bridge:
         def __init__(self): self.requests = []
         def submit_result_bounded(self, value): self.requests.append(value)
     bridge = Bridge()
-    for index in range(29):
-        assert rollover.observe_complete_response(f"response {index}\n{COMPLETE}")
-        assert not rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
-    assert watcher.state["architectResponseCount"] == 29
-    assert rollover.observe_complete_response(f"response 30\n{COMPLETE}")
+    assert not rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
+    watcher.state["architectMemoryBytes"] = 891289600
     assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
     assert not rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
     assert bridge.requests[0].startswith(STANDARD_HANDOVER_REQUEST)
@@ -539,6 +537,7 @@ def test_architect_rollover_requires_running_executor_and_dedupes_events(tmp_pat
     rollover = ArchitectSessionRollover(watcher); rollover.initialize_current_session()
     prompt = tmp_path / "next.txt"; prompt.write_text("next", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt)})
+    watcher.state["architectMemoryBytes"] = 891289600
     for index in range(30): rollover.observe_complete_response(f"same-{index}\n{COMPLETE}")
     class Bridge:
         def __init__(self): self.calls = 0
@@ -641,6 +640,7 @@ def test_conclusive_unsent_handover_remains_retryable(tmp_path):
     rollover.initialize_current_session()
     prompt = tmp_path / "next.txt"; prompt.write_text("next", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt), "architectResponseCount": 30})
+    watcher.state["architectMemoryBytes"] = 891289600
 
     class Bridge:
         sendActionAttempted = False
@@ -670,6 +670,7 @@ def test_architect_rollover_accepts_next_prompt_ready_without_executor(tmp_path)
         "architectConversationId": "current",
         "codexPid": None,
     })
+    watcher.state["architectMemoryBytes"] = 891289600
     rollover = ArchitectSessionRollover(watcher)
     class Bridge:
         def __init__(self): self.calls = 0
@@ -840,8 +841,8 @@ def test_memory_safety_ceiling_enters_rollover_cutout(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_SAFETY_CEILING_BYTES, LocalWatcher
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     rollover = ArchitectSessionRollover(watcher)
-    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_SAFETY_CEILING_BYTES) is None
-    assert watcher.state.get("rolloverDue") is None
+    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_SAFETY_CEILING_BYTES) == "MEMORY_THRESHOLD"
+    assert watcher.state.get("rolloverDue") is True
     assert watcher.state.get("state") != "HUMAN_REQUIRED"
 
 
@@ -861,19 +862,18 @@ def test_memory_threshold_is_primary_and_creates_one_deferred_rollover(tmp_path)
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     rollover = ArchitectSessionRollover(watcher)
     lines = []
-    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES, lines.append) is None
-    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES + 1, lines.append) is None
-    assert watcher.state.get("rolloverDue") is None
-    assert watcher.state.get("rolloverTrigger") is None
-    assert watcher.state.get("rolloverPending", False) is False
-    assert lines == []
+    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES - 1, lines.append) is None
+    assert rollover.sample_memory(lambda: ARCHITECT_MEMORY_THRESHOLD_BYTES, lines.append) == "MEMORY_THRESHOLD"
+    assert watcher.state.get("rolloverDue") is True
+    assert watcher.state.get("rolloverTrigger") == "MEMORY_THRESHOLD"
+    assert lines == ["ROLLOVER_DUE trigger=MEMORY_THRESHOLD"]
 
 
 def test_rollover_waits_for_generation_and_requests_once_after_threshold(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_THRESHOLD_BYTES
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     rollover = ArchitectSessionRollover(watcher)
-    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(tmp_path / "next.txt"), "architectResponseCount": 30})
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(tmp_path / "next.txt"), "architectMemoryBytes": ARCHITECT_MEMORY_THRESHOLD_BYTES})
     Path(watcher.state["nextPromptPath"]).write_text("next", encoding="utf-8")
     class Bridge:
         def __init__(self): self.calls = 0
@@ -885,14 +885,15 @@ def test_rollover_waits_for_generation_and_requests_once_after_threshold(tmp_pat
     assert bridge.calls == 1
 
 
-def test_response_count_remains_fallback_when_memory_is_below_threshold(tmp_path):
-    from local_orchestrator_watcher import ArchitectSessionRollover
+def test_response_count_does_not_override_memory_threshold(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, ARCHITECT_MEMORY_THRESHOLD_BYTES
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     rollover = ArchitectSessionRollover(watcher)
     watcher.state["architectResponseCount"] = 29
     assert rollover.rollover_trigger(0, 29) is None
-    assert rollover.rollover_trigger(0, 30) == "RESPONSE_COUNT_FALLBACK"
-    assert rollover.rollover_trigger(1_073_741_824, 0) is None
+    assert rollover.rollover_trigger(0, 30) is None
+    assert rollover.rollover_trigger(ARCHITECT_MEMORY_THRESHOLD_BYTES - 1, 30) is None
+    assert rollover.rollover_trigger(ARCHITECT_MEMORY_THRESHOLD_BYTES, 0) == "MEMORY_THRESHOLD"
 
 
 def test_pending_rollover_blocks_new_relay_execution(tmp_path):
@@ -955,6 +956,7 @@ def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab
     rollover = ArchitectSessionRollover(watcher); rollover.initialize_current_session()
     prompt = tmp_path / "next.txt"; prompt.write_text("next", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt), "architectResponseCount": 30})
+    watcher.state["architectMemoryBytes"] = 891289600
     class OldPage:
         def __init__(self): self.closed = False
         def close(self): self.closed = True
@@ -977,6 +979,7 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
     rollover = ArchitectSessionRollover(watcher); rollover.initialize_current_session()
     prompt = tmp_path / "next.txt"; prompt.write_text("next", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt), "architectResponseCount": 30})
+    watcher.state["architectMemoryBytes"] = 891289600
     class Page:
         def __init__(self, url): self.url = url; self.closed = False
         def close(self): self.closed = True
@@ -987,12 +990,16 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
         page = old
         def submit_result_bounded(self, value): pass
         def open_fresh_with_handover(self, value): return new
+        def current_session_memory_bytes(self): return 7
     bridge = Bridge(); assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
     assert rollover.complete_from_response(bridge, f"handover\nRollover transaction ID: {watcher.state['rolloverTransactionId']}\nARCHITECT_HANDOVER_READY")
     assert bridge.page is new and old.closed
     assert watcher.state["architectResponseCount"] == 0
     assert watcher.state["handoverRequested"] is False
     assert watcher.state["architectConversationId"] == "NEW"
+    assert watcher.state["architectMemoryOwnership"] == "SESSION_SCOPED"
+    assert watcher.state["architectMemorySessionId"] == "NEW"
+    assert watcher.state.get("architectMemoryBytes") is None
     assert "currentArchitectConversationId" not in watcher.state
 
 
@@ -1004,6 +1011,7 @@ def test_rollover_identity_is_the_next_resident_attach_target(tmp_path):
     rollover.initialize_current_session()
     prompt = tmp_path / "next.txt"; prompt.write_text("next", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "nextTaskId": "task-2", "nextPromptPath": str(prompt), "architectResponseCount": 30})
+    watcher.state["architectMemoryBytes"] = 891289600
 
     class Page:
         def __init__(self, url): self.url = url; self.closed = False

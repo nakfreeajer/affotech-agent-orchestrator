@@ -1125,12 +1125,13 @@ def test_generation_visible_new_architect_blocks_result_delivery(tmp_path):
     ("ARCHITECT_RUNNING", None),
     ("NEXT_PROMPT_READY", None),
 ])
-def test_memory_due_does_not_preempt_workflow_state(tmp_path, workflow_state, reason):
+def test_memory_due_records_maintenance_without_preempting_workflow_state(tmp_path, workflow_state, reason):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": workflow_state, "taskId": "task-1", "humanRequiredReason": reason})
     before = dict(watcher.state)
     watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES)
-    assert watcher.state.get("rolloverDue") is None
+    assert watcher.state.get("rolloverDue") is True
+    assert watcher.state.get("rolloverTrigger") == "MEMORY_THRESHOLD"
     assert watcher.state["state"] == workflow_state
     assert watcher.state.get("humanRequiredReason") == reason
     assert watcher.state.get("rolloverPending", False) is False
@@ -1144,7 +1145,7 @@ def test_memory_telemetry_cannot_block_next_prompt_dispatch(tmp_path, monkeypatc
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000001", "lastCompletedTaskId": "000001",
                           "nextTaskId": "000002", "nextPromptPath": str(prompt), "executorProcessState": "COMPLETED_WITH_RESULT"})
     watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES * 2)
-    assert watcher.state.get("rolloverDue") is None
+    assert watcher.state.get("rolloverDue") is True
     maintenance_calls = []
     monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: maintenance_calls.append(1) or False)
     class Process:
@@ -1154,7 +1155,7 @@ def test_memory_telemetry_cannot_block_next_prompt_dispatch(tmp_path, monkeypatc
         watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
     )
     assert process is not None
-    assert maintenance_calls == []
+    assert maintenance_calls == [1]
     assert launches == [1]
 
 
@@ -1265,7 +1266,7 @@ def test_legacy_rollover_cutout_retires_memory_authority_and_dispatches_without_
     assert prompt.read_bytes() == prompt_before
 
 
-def test_legacy_rollover_cutout_rederives_response_count_authority(tmp_path, monkeypatch):
+def test_legacy_rollover_cutout_rederives_memory_authority(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     result = tmp_path / "000053-result.txt"
     prompt = tmp_path / "000054.txt"
@@ -1276,13 +1277,14 @@ def test_legacy_rollover_cutout_rederives_response_count_authority(tmp_path, mon
         "taskId": "000053", "lastCompletedTaskId": "000053", "nextTaskId": "000054",
         "nextPromptPath": str(prompt), "executorResultPath": str(result),
         "executorProcessState": "COMPLETED_WITH_RESULT", "architectResponseCount": 30,
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
         "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD", "rolloverPending": True,
         "pending_handover": "stale handover", "rolloverTransactionId": "old-transaction",
     })
     assert watcher.recover_legacy_rollover_cutout() is True
     assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state["rolloverDue"] is True
-    assert watcher.state["rolloverTrigger"] == "RESPONSE_COUNT_FALLBACK"
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
     assert watcher.state["rolloverPending"] is False
 
     maintenance_calls = []
@@ -1298,7 +1300,7 @@ def test_legacy_rollover_cutout_rederives_response_count_authority(tmp_path, mon
     assert process is not None
     assert maintenance_calls == [1]
     assert launches == [1]
-    assert watcher.state["rolloverTrigger"] == "RESPONSE_COUNT_FALLBACK"
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
 
 
 def test_legacy_rollover_cutout_recovery_fails_closed_for_incomplete_proof(tmp_path):
@@ -1539,7 +1541,7 @@ def test_deferred_rollover_gets_fresh_transaction_and_rejects_stale_handover(tmp
     watcher.state.update({
         "state": "NEXT_PROMPT_READY", "taskId": "000040", "lastCompletedTaskId": "000040",
         "nextTaskId": "000041", "nextPromptPath": str(prompt_a), "rolloverDue": True,
-        "architectResponseCount": 30, "architectConversationId": "OLD",
+        "architectResponseCount": 30, "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES, "architectConversationId": "OLD",
     })
     watcher.save()
 
@@ -1561,6 +1563,7 @@ def test_deferred_rollover_gets_fresh_transaction_and_rejects_stale_handover(tmp
         "rolloverPending": True, "rolloverMaintenanceState": "DEFERRED",
         "rolloverDeferredForTaskId": "000041", "rolloverHandoverSendState": "UNSENT",
         "handoverRequested": False, "architectResponseCount": 30,
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
     })
     watcher.save()
     old_page = _AckPage("https://chatgpt.com/c/OLD")
@@ -2671,57 +2674,48 @@ def test_memory_telemetry_is_throttled_deduplicated_and_recovers(tmp_path):
     assert log.count("event=ARCHITECT_MEMORY_SAMPLE_FAILED ") == 1
 
 
-def test_localfirst_samples_explicit_governed_architect_root_pid(tmp_path, monkeypatch):
-    observed = []
+def test_localfirst_does_not_bind_browser_tree_as_session_authority(tmp_path, monkeypatch):
     monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "4242")
-    monkeypatch.setattr(watcher_module, "architect_process_tree_memory_bytes", lambda pid: observed.append(pid) or 123)
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    assert watcher.state["architectMemoryOwnership"] == "CONFIGURED"
-    assert watcher.session_rollover.sample_memory() is None
-    assert observed == [4242]
+    assert watcher.state["architectMemoryOwnership"] == "UNBOUND"
+    assert watcher.architect_memory_reader is None
 
 
-def test_cdp_listener_resolves_unique_architect_memory_owner(tmp_path, monkeypatch):
-    monkeypatch.delenv("ARCHITECT_BROWSER_ROOT_PID", raising=False)
-    monkeypatch.setattr(watcher_module.os, "name", "nt")
-    monkeypatch.setattr(watcher_module.subprocess, "check_output", lambda *args, **kwargs: "5151\n")
+def test_attached_architect_page_binds_session_memory(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    lines = []
-    assert watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lines.append) == 5151
-    assert watcher.state["architectMemoryOwnershipSource"] == "CDP_LISTENER"
-    assert watcher.state["architectBrowserRootPid"] == 5151
-    assert lines == ["ARCHITECT_MEMORY_OWNER pid=5151 source=CDP_LISTENER"]
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/11111111-1111-1111-1111-111111111111"})()
+        def current_session_memory_bytes(self): return 123
+    assert watcher.bind_architect_session_memory(Bridge(), "11111111-1111-1111-1111-111111111111")
+    assert watcher.state["architectMemoryOwnership"] == "SESSION_SCOPED"
+    assert watcher.state["architectMemoryOwnershipSource"] == "ARCHITECT_PAGE_RENDERER"
+    assert watcher.state["architectMemorySessionId"] == "11111111-1111-1111-1111-111111111111"
     assert watcher.architect_memory_reader is not None
 
 
-def test_cdp_listener_requires_exactly_one_owner(tmp_path, monkeypatch):
-    monkeypatch.delenv("ARCHITECT_BROWSER_ROOT_PID", raising=False)
-    monkeypatch.setattr(watcher_module.os, "name", "nt")
-    for output in ("", "5151\n5152\n"):
-        monkeypatch.setattr(watcher_module.subprocess, "check_output", lambda *args, _output=output, **kwargs: _output)
-        watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / ("work-" + str(len(output))))
-        with pytest.raises(RuntimeError, match="ARCHITECT_BROWSER_MEMORY_OWNERSHIP_UNRESOLVED"):
-            watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lambda _: None)
-
-
-def test_explicit_architect_root_pid_wins_over_cdp_lookup(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "6161")
-    monkeypatch.setattr(watcher_module.os, "name", "nt")
-    def unexpected_lookup(*_args, **_kwargs):
-        raise AssertionError("CDP lookup must not override explicit PID")
-    monkeypatch.setattr(watcher_module.subprocess, "check_output", unexpected_lookup)
+def test_obsolete_process_owner_binding_is_rejected(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    lines = []
-    assert watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lines.append) == 6161
-    assert watcher.state["architectMemoryOwnershipSource"] == "ENVIRONMENT"
-    assert lines == ["ARCHITECT_MEMORY_OWNER pid=6161 source=ENVIRONMENT"]
+    with pytest.raises(RuntimeError, match="ARCHITECT_SESSION_MEMORY_REQUIRES_ATTACHED_PAGE"):
+        watcher.bind_architect_memory_owner("http://127.0.0.1:9333", lambda _: None)
 
 
-def test_bound_cdp_owner_drives_threshold_rollover(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARCHITECT_BROWSER_ROOT_PID", "7171")
+def test_attached_page_memory_reader_drives_threshold_rollover(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    class Page:
+        def evaluate(self, script):
+            assert "usedJSHeapSize" in script
+            return watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    bridge = watcher_module.ArchitectPlaywright(Page())
+    watcher.bind_architect_session_memory(bridge, "11111111-1111-1111-1111-111111111111")
+    assert watcher.session_rollover.sample_memory() == "MEMORY_THRESHOLD"
+
+
+def test_response_count_does_not_drive_threshold_rollover(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state["architectResponseCount"] = 30
+    watcher.architect_memory_reader = lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES - 1
     assert watcher.session_rollover.sample_memory() is None
+    assert watcher.state.get("rolloverDue") is not True
 
 
 def test_process_tree_memory_json_boundary_includes_descendants_only(monkeypatch):
