@@ -1151,6 +1151,65 @@ def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab
     assert watcher.state["rolloverDue"] is True
 
 
+def test_formatted_rollover_transaction_token_is_accepted_and_reaches_fresh_path(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, handover_transaction_matches
+    transaction_id = "4b7971a1ac59ac799bc02f58"
+    production_format = """AFFOTECH ARCHITECT SESSION HANDOVER
+
+ROLLOVER TRANSACTION
+
+`4b7971a1ac59ac799bc02f58`
+
+ARCHITECT_HANDOVER_READY"""
+    canonical_format = f"handover\nRollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"
+    assert handover_transaction_matches(production_format, transaction_id)
+    assert handover_transaction_matches(canonical_format, transaction_id)
+    assert not handover_transaction_matches("handover\nARCHITECT_HANDOVER_READY", transaction_id)
+    assert not handover_transaction_matches("handover\nRollover transaction ID: wrong\nARCHITECT_HANDOVER_READY", transaction_id)
+    assert not handover_transaction_matches(f"handover\n`{transaction_id[:-1]}`\nARCHITECT_HANDOVER_READY", transaction_id)
+    assert not handover_transaction_matches(f"handover\n`{transaction_id}a`\nARCHITECT_HANDOVER_READY", transaction_id)
+
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000069", "nextTaskId": "000070",
+        "handoverRequested": True, "rolloverPending": True,
+        "rolloverTransactionId": transaction_id,
+    })
+    watcher.save()
+    rollover = ArchitectSessionRollover(watcher)
+    reached = []
+    rollover._existing_fresh_candidate_page = lambda _bridge, _handover: reached.append(True) or None
+    class OldPage:
+        def close(self): pass
+    class Bridge:
+        page = OldPage()
+        def open_fresh_with_handover(self, _handover):
+            reached.append("fresh")
+            raise RuntimeError("fresh path reached")
+    assert rollover.complete_from_response(Bridge(), production_format) is False
+    assert reached == [True, "fresh"]
+
+
+def test_transaction_match_failure_is_diagnosed_without_handover_text(tmp_path):
+    from local_orchestrator_watcher import ArchitectSessionRollover, DiagnosticTracer
+    watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "handoverRequested": True, "rolloverTransactionId": "4b7971a1ac59ac799bc02f58"})
+    watcher.save()
+    tracer = DiagnosticTracer(tmp_path, "transaction-mismatch")
+    watcher.diagnostic_trace = tracer
+    class Bridge:
+        page = object()
+    assert ArchitectSessionRollover(watcher).complete_from_response(Bridge(), "wrong-id\nARCHITECT_HANDOVER_READY") is False
+    tracer.shutdown(watcher.state)
+    records = [json.loads(line) for line in (tmp_path / "logs" / "diagnostic" / "transaction-mismatch" / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    record = next(item for item in records if item.get("operation") == "TRANSACTION_MATCH")
+    assert record["expectedTransactionId"] == "4b7971a1ac59ac799bc02f58"
+    assert record["transactionTokenPresent"] is False
+    assert record["handoverReady"] is True
+    assert record["reason"] == "TRANSACTION_TOKEN_MISSING_OR_INVALID"
+    assert "wrong-id" not in json.dumps(record)
+
+
 def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_count(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())

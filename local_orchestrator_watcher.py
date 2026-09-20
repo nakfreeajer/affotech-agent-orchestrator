@@ -1256,7 +1256,30 @@ def handover_request_for_transaction(transaction_id: str) -> str:
 def handover_transaction_matches(response: str, transaction_id: str | None) -> bool:
     if not transaction_id:
         return True
-    return re.search(rf"Rollover transaction ID:\s*{re.escape(transaction_id)}\b", str(response or "")) is not None
+    token = str(transaction_id).strip()
+    if not token or re.fullmatch(r"[0-9A-Fa-f]+", token) is None:
+        return False
+    return re.search(rf"(?<![0-9A-Fa-f]){re.escape(token)}(?![0-9A-Fa-f])", str(response or "")) is not None
+
+
+def trace_transaction_match_failure(watcher: Any, response: str, transaction_id: str | None, reason: str) -> None:
+    tracer = diagnostic_trace_for(watcher)
+    if not tracer:
+        return
+    token = str(transaction_id or "").strip()
+    token_present = bool(token and re.search(rf"(?<![0-9A-Fa-f]){re.escape(token)}(?![0-9A-Fa-f])", str(response or "")))
+    tracer.record(
+        "HANDOVER",
+        "handover_transaction_matches",
+        "TRANSACTION_MATCH",
+        "DECISION",
+        watcher.state,
+        expectedTransactionId=token or None,
+        transactionTokenPresent=token_present,
+        handoverReady=architect_handover_ready(response),
+        decision="REJECT",
+        reason=reason,
+    )
 
 
 class ArchitectSessionRollover:
@@ -1643,6 +1666,7 @@ class ArchitectSessionRollover:
             return False
         transaction_id = self.watcher.state.get("rolloverTransactionId")
         if isinstance(handover, str) and architect_handover_ready(handover) and not handover_transaction_matches(handover, transaction_id):
+            trace_transaction_match_failure(self.watcher, handover, transaction_id, "TRANSACTION_TOKEN_MISSING_OR_INVALID")
             self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_TRANSACTION_MISMATCH")
             return False
         if isinstance(handover, str) and architect_handover_ready(handover) and not self.watcher.state.get("handoverRequested"):
@@ -1833,7 +1857,9 @@ class ArchitectSessionRollover:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.complete_from_response", "HANDOVER_WAIT_COMPLETE", "BEGIN", self.watcher.state, responseLength=len(response), responseSha256=hashlib.sha256(response.encode()).hexdigest(), handoverReady=architect_handover_ready(response))
         if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
             return False
-        if not handover_transaction_matches(response, self.watcher.state.get("rolloverTransactionId")):
+        transaction_id = self.watcher.state.get("rolloverTransactionId")
+        if not handover_transaction_matches(response, transaction_id):
+            trace_transaction_match_failure(self.watcher, response, transaction_id, "TRANSACTION_TOKEN_MISSING_OR_INVALID")
             return False
         self.watcher.state["handoverReady"] = True
         self.watcher.state["pending_handover"] = response
