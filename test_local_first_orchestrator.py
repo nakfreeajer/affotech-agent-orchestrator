@@ -2729,11 +2729,9 @@ def test_obsolete_process_owner_binding_is_rejected(tmp_path):
 
 def test_attached_page_memory_reader_drives_threshold_rollover(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    class Page:
-        def evaluate(self, script):
-            assert "usedJSHeapSize" in script
-            return watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
-    bridge = watcher_module.ArchitectPlaywright(Page())
+    class Bridge:
+        def current_session_memory_bytes(self): return watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    bridge = Bridge()
     watcher.bind_architect_session_memory(bridge, "11111111-1111-1111-1111-111111111111")
     assert watcher.session_rollover.sample_memory() == "MEMORY_THRESHOLD"
 

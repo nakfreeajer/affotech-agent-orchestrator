@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+import local_orchestrator_watcher as watcher_module
 
 from local_orchestrator_watcher import (
     BEGIN, COMPLETE, END, HANDOVER_BEGIN, HANDOVER_END, READY, CodexResult,
@@ -896,31 +897,43 @@ def test_response_count_does_not_override_memory_threshold(tmp_path):
     assert rollover.rollover_trigger(ARCHITECT_MEMORY_THRESHOLD_BYTES, 0) == "MEMORY_THRESHOLD"
 
 
-def test_current_session_memory_prefers_measurement_api(tmp_path):
+def test_current_session_memory_uses_tab_renderer_working_set(tmp_path, monkeypatch):
     from local_orchestrator_watcher import ArchitectPlaywright, ARCHITECT_MEMORY_THRESHOLD_BYTES
     class Page:
-        def evaluate(self, script):
-            assert "measureUserAgentSpecificMemory" in script
-            assert "usedJSHeapSize" in script
-            return ARCHITECT_MEMORY_THRESHOLD_BYTES
-    assert ArchitectPlaywright(Page()).current_session_memory_bytes() == ARCHITECT_MEMORY_THRESHOLD_BYTES
+        url = "https://chatgpt.com/c/current"
+    class Session:
+        def send(self, method):
+            assert method == "SystemInfo.getProcessInfo"
+            return {"processInfo": [{"type": "browser", "id": 10}, {"type": "renderer", "id": 11}]}
+        def detach(self): pass
+    page = Page()
+    class Browser:
+        def __init__(self): self.contexts = [type("Context", (), {"pages": [page]})()]
+        def new_browser_cdp_session(self): return Session()
+    monkeypatch.setattr(watcher_module, "architect_renderer_working_set_bytes", lambda *_args: ARCHITECT_MEMORY_THRESHOLD_BYTES)
+    bridge = ArchitectPlaywright(page)
+    bridge._browser = Browser()
+    assert bridge.current_session_memory_bytes() == ARCHITECT_MEMORY_THRESHOLD_BYTES
 
 
-def test_current_session_memory_reject_falls_back_to_renderer_heap(tmp_path):
-    from local_orchestrator_watcher import ArchitectPlaywright
-    class Page:
-        def evaluate(self, script):
-            assert "catch (_error)" in script
-            return 123456
-    assert ArchitectPlaywright(Page()).current_session_memory_bytes() == 123456
+def test_current_session_memory_requires_unique_substantial_renderer(tmp_path):
+    from local_orchestrator_watcher import architect_renderer_working_set_bytes
+    rows = [{"pid": 11, "parentPid": 10, "workingSet": 123456}]
+    with pytest.raises(RuntimeError, match="ARCHITECT_SESSION_MEMORY_UNAVAILABLE"):
+        architect_renderer_working_set_bytes(10, {11}, rows)
 
 
 def test_current_session_memory_unavailable_fails_closed(tmp_path):
     from local_orchestrator_watcher import ArchitectPlaywright
     class Page:
-        def evaluate(self, _script): return None
+        url = "https://chatgpt.com/c/current"
+    class Browser:
+        contexts = [type("Context", (), {"pages": [Page()]})()]
+        def new_browser_cdp_session(self): raise RuntimeError("no cdp")
+    bridge = ArchitectPlaywright(Browser.contexts[0].pages[0])
+    bridge._browser = Browser()
     with pytest.raises(RuntimeError, match="ARCHITECT_SESSION_MEMORY_UNAVAILABLE"):
-        ArchitectPlaywright(Page()).current_session_memory_bytes()
+        bridge.current_session_memory_bytes()
 
 
 def test_pending_rollover_blocks_new_relay_execution(tmp_path):

@@ -389,6 +389,45 @@ class DocumentationDoorbell:
         return "TRIGGER_SENT"
 
 
+def architect_windows_process_rows() -> list[dict[str, int]]:
+    if os.name != "nt":
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
+    script = ("Get-CimInstance Win32_Process | ForEach-Object { "
+              "$p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; "
+              "if ($p) { [pscustomobject][ordered]@{ pid=[int]$_.ProcessId; "
+              "parentPid=[int]$_.ParentProcessId; workingSet=[int64]$p.WorkingSet64 } } "
+              "} | ConvertTo-Json -Compress")
+    try:
+        raw = subprocess.check_output(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], text=True, encoding="utf-8", errors="strict")
+        decoded = json.loads(raw)
+        rows = decoded if isinstance(decoded, list) else [decoded]
+    except (OSError, subprocess.CalledProcessError, ValueError, UnicodeError) as error:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED") from error
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED")
+    return rows
+
+
+def architect_renderer_working_set_bytes(browser_pid: int, renderer_pids: set[int], process_rows: list[dict[str, Any]] | None = None) -> int:
+    """Return the unique substantial renderer working set for one governed tab."""
+    if not isinstance(browser_pid, int) or browser_pid <= 0 or not renderer_pids:
+        raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+    rows = process_rows if process_rows is not None else architect_windows_process_rows()
+    candidates = []
+    for row in rows:
+        try:
+            pid = int(row["pid"])
+            parent_pid = int(row["parentPid"])
+            working_set = int(row["workingSet"])
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED") from error
+        if pid in renderer_pids and parent_pid == browser_pid and working_set >= 64 * 1024 * 1024:
+            candidates.append((pid, working_set))
+    if len(candidates) != 1:
+        raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+    return candidates[0][1]
+
+
 def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[str, Any]] | None = None) -> int:
     """Return working-set bytes for one explicitly governed Windows process tree.
 
@@ -399,19 +438,10 @@ def architect_process_tree_memory_bytes(root_pid: int, process_rows: list[dict[s
     if not isinstance(root_pid, int) or root_pid <= 0:
         raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
     if process_rows is None:
-        if os.name != "nt":
-            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_OWNERSHIP_INCONCLUSIVE")
-        script = ("Get-CimInstance Win32_Process | ForEach-Object { "
-                  "$p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; "
-                  "if ($p) { [pscustomobject][ordered]@{ pid=[int]$_.ProcessId; "
-                  "parentPid=[int]$_.ParentProcessId; workingSet=[int64]$p.WorkingSet64 } } "
-                  "} | ConvertTo-Json -Compress")
         try:
-            raw = subprocess.check_output(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], text=True, encoding="utf-8", errors="strict")
-            decoded = json.loads(raw)
-            process_rows = decoded if isinstance(decoded, list) else [decoded]
-        except (OSError, subprocess.CalledProcessError, ValueError, UnicodeError) as error:
-            raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED") from error
+            process_rows = architect_windows_process_rows()
+        except RuntimeError:
+            raise
     if not isinstance(process_rows, list) or not process_rows:
         raise RuntimeError("ARCHITECT_BROWSER_MEMORY_SAMPLE_FAILED")
     normalized_rows: list[dict[str, int]] = []
@@ -2088,36 +2118,34 @@ class ArchitectPlaywright:
         return self.page.get_by_role("main").inner_text()
 
     def current_session_memory_bytes(self) -> int:
-        """Return memory owned by the attached Architect document only."""
+        """Return the OS working set of the renderer owned by the current tab."""
         started = time.monotonic()
         self._trace_operation("current_session_memory_bytes", "BEGIN", mutation=False)
-        result = self.page.evaluate(
-            """async () => {
-                const performance = globalThis.performance;
-                if (performance && typeof performance.measureUserAgentSpecificMemory === 'function') {
-                    try {
-                        const sample = await performance.measureUserAgentSpecificMemory();
-                        if (sample && Number.isFinite(sample.bytes) && sample.bytes >= 0) {
-                            return Math.floor(sample.bytes);
-                        }
-                    } catch (_error) {
-                        // Fall through to the renderer-local heap measurement.
-                    }
-                }
-                try {
-                    const memory = performance && performance.memory;
-                    if (memory && Number.isFinite(memory.usedJSHeapSize) && memory.usedJSHeapSize >= 0) {
-                        return Math.floor(memory.usedJSHeapSize);
-                    }
-                } catch (_error) {
-                    // The caller will fail closed when no valid measurement exists.
-                }
-                return null;
-            }"""
-        )
-        if not isinstance(result, int) or result < 0:
+        browser = getattr(self, "_browser", None)
+        if browser is None:
+            raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+        pages = [page for context in browser.contexts for page in context.pages
+                 if str(getattr(page, "url", "") or "").startswith("https://chatgpt.com/c/")]
+        if len(pages) != 1 or pages[0] is not self.page:
+            raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+        session = None
+        try:
+            session = browser.new_browser_cdp_session()
+            process_info = session.send("SystemInfo.getProcessInfo").get("processInfo", [])
+            browser_ids = {int(row["id"]) for row in process_info if row.get("type") == "browser"}
+            renderer_ids = {int(row["id"]) for row in process_info if row.get("type") == "renderer"}
+            if len(browser_ids) != 1:
+                raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+            result = architect_renderer_working_set_bytes(next(iter(browser_ids)), renderer_ids)
+        except (KeyError, TypeError, ValueError, RuntimeError):
             self._trace_operation("current_session_memory_bytes", "ERROR", started, mutation=False, error="ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
             raise RuntimeError("ARCHITECT_SESSION_MEMORY_UNAVAILABLE")
+        finally:
+            if session is not None:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
         self._trace_operation("current_session_memory_bytes", "END", started, mutation=False, memoryBytes=result)
         return result
 
