@@ -46,6 +46,7 @@ RUNTIME_LOGGER_NAME = "affotech.orchestrator.runtime"
 RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING = "DEFERRED_ARCHITECT_GENERATING"
 ARCHITECT_DELIVERY_PROOF_VERSION = "SHA256_MARKER_V1"
 DIAGNOSTIC_TRACE_ENV = "ORCHESTRATOR_DIAGNOSTIC_TRACE"
+ROLLOVER_DIAGNOSTIC_ONLY_ENV = "ORCHESTRATOR_ROLLOVER_DIAGNOSTIC_ONLY"
 DIAGNOSTIC_TRACE_MAX_BYTES = 100 * 1024 * 1024
 DIAGNOSTIC_SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024
 _ACTIVE_DIAGNOSTIC_TRACE = None
@@ -85,6 +86,10 @@ class DiagnosticTracer:
             "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState", "rolloverFreshCandidateDiscoveryState",
             "rolloverFreshCandidateAttemptCount", "codexPid", "active_codex_pid", "lastExecutorPid",
             "executorProcessState", "architectConversationId", "architectMemoryBytes",
+            "architectMemoryMiB", "architectMemoryOwnership", "architectMemoryOwnershipSource",
+            "architectMemorySessionId", "rolloverTrigger", "rolloverMaintenanceState",
+            "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+            "discussionPauseActive", "architectGenerating",
         )
         return {key: current.get(key) for key in keys}
 
@@ -194,6 +199,197 @@ class DiagnosticTracer:
 
 def diagnostic_trace_for(value: Any = None) -> DiagnosticTracer | None:
     return getattr(value, "diagnostic_trace", None) or _ACTIVE_DIAGNOSTIC_TRACE
+
+
+def rollover_diagnostic_only_enabled() -> bool:
+    return os.environ.get(ROLLOVER_DIAGNOSTIC_ONLY_ENV) == "1"
+
+
+def _diagnostic_memory_candidate(tracer: DiagnosticTracer, state: dict[str, Any], source: str, value: Any) -> None:
+    try:
+        numeric = int(value)
+        valid = numeric >= 0
+    except (TypeError, ValueError, OverflowError):
+        numeric = None
+        valid = False
+    tracer.record(
+        "ROLLOVER_DIAGNOSTIC",
+        "run_rollover_diagnostic_only",
+        "MEMORY_CANDIDATE",
+        "END",
+        state,
+        source=source,
+        bytes=numeric,
+        memoryMiB=round(numeric / (1024 * 1024), 2) if valid else None,
+        thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+        thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB,
+        aboveThreshold=bool(valid and numeric >= ARCHITECT_MEMORY_THRESHOLD_BYTES),
+    )
+
+
+def _disconnect_architect_bridge_read_only(bridge: Any, tracer: DiagnosticTracer, state: dict[str, Any]) -> None:
+    """Disconnect an attached browser without Browser.close() or page mutation."""
+    started = time.monotonic()
+    connection_id = getattr(bridge, "_diagnostic_connection_id", None)
+    try:
+        runtime = getattr(bridge, "_runtime", None)
+        if runtime is not None:
+            runtime.stop()
+        tracer.close_connection(connection_id, "diagnostic_only_disconnect", state=state, started=started)
+    except Exception as error:
+        tracer.close_connection(connection_id, "diagnostic_only_disconnect", state=state, started=started, error=error)
+
+
+def run_rollover_diagnostic_only(watcher: Any, endpoint: str, tracer: DiagnosticTracer) -> str:
+    """Collect one read-only rollover snapshot and perform no workflow action."""
+    state = dict(watcher.state)
+    try:
+        persisted = json.loads(Path(watcher.state_path).read_text(encoding="utf-8"))
+        if isinstance(persisted, dict):
+            state = persisted
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "STATE_READ_ERROR", "ERROR", state, errorClass="StateReadError", errorMessage="unable to reread canonical state")
+    requested_id = state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+    tracer.record(
+        "ROLLOVER_DIAGNOSTIC",
+        "run_rollover_diagnostic_only",
+        "SNAPSHOT_BEGIN",
+        "BEGIN",
+        state,
+        endpoint=endpoint,
+        requestedConversationId=requested_id,
+        thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+        thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB,
+        workflowActionCount=0,
+    )
+    bridge = None
+    try:
+        bridge = ArchitectPlaywright.attach(endpoint, requested_id)
+        page = bridge.page
+        actual_id = architect_conversation_id_from_url(str(getattr(page, "url", "")))
+        title = None
+        try:
+            title = page.title()
+        except Exception as error:
+            tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "PAGE_TITLE_ERROR", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc())
+        tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "ARCHITECT_IDENTITY", "END", state, endpoint=endpoint, requestedConversationId=requested_id, actualConversationId=actual_id, pageUrl=str(getattr(page, "url", "")), pageTitle=title, targetIdentity=getattr(page, "guid", None), connectionId=getattr(bridge, "_diagnostic_connection_id", None))
+
+        browser = getattr(bridge, "_browser", None)
+        pages = [candidate for context in browser.contexts for candidate in context.pages]
+        inventory = []
+        for index, candidate in enumerate(pages):
+            inventory.append({
+                "index": index,
+                "url": str(getattr(candidate, "url", "")),
+                "title": candidate.title() if candidate is page else None,
+                "conversationId": architect_conversation_id_from_url(str(getattr(candidate, "url", ""))) if ARCHITECT_CONVERSATION_URL_RE.search(str(getattr(candidate, "url", ""))) else None,
+                "isCurrent": candidate is page,
+            })
+        tracer.record("PLAYWRIGHT", "run_rollover_diagnostic_only", "TARGET_INVENTORY", "END", state, pageCount=len(pages), inventory=inventory, connectionId=getattr(bridge, "_diagnostic_connection_id", None))
+
+        api_script = """async () => {
+            const performanceObject = globalThis.performance;
+            const result = {
+                measureUserAgentSpecificMemoryAvailable: Boolean(performanceObject && typeof performanceObject.measureUserAgentSpecificMemory === 'function'),
+                measureUserAgentSpecificMemoryBytes: null,
+                measureUserAgentSpecificMemoryError: null,
+                performanceMemoryAvailable: Boolean(performanceObject && performanceObject.memory),
+                usedJSHeapSize: null,
+                totalJSHeapSize: null,
+                jsHeapSizeLimit: null
+            };
+            if (result.measureUserAgentSpecificMemoryAvailable) {
+                try {
+                    const sample = await performanceObject.measureUserAgentSpecificMemory();
+                    result.measureUserAgentSpecificMemoryBytes = sample && sample.bytes;
+                } catch (error) {
+                    result.measureUserAgentSpecificMemoryError = String(error && (error.stack || error.message || error));
+                }
+            }
+            try {
+                const memory = performanceObject && performanceObject.memory;
+                if (memory) {
+                    result.usedJSHeapSize = memory.usedJSHeapSize;
+                    result.totalJSHeapSize = memory.totalJSHeapSize;
+                    result.jsHeapSizeLimit = memory.jsHeapSizeLimit;
+                }
+            } catch (error) {
+                result.performanceMemoryError = String(error && (error.stack || error.message || error));
+            }
+            return result;
+        }"""
+        try:
+            api_values = page.evaluate(api_script)
+            tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "MEMORY_APIS", "END", state, **api_values)
+            if api_values.get("measureUserAgentSpecificMemoryBytes") is not None:
+                _diagnostic_memory_candidate(tracer, state, "performance.measureUserAgentSpecificMemory", api_values.get("measureUserAgentSpecificMemoryBytes"))
+            _diagnostic_memory_candidate(tracer, state, "performance.memory.usedJSHeapSize", api_values.get("usedJSHeapSize"))
+        except Exception as error:
+            tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "MEMORY_APIS", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc())
+
+        cdp_session = None
+        process_info = []
+        targets = []
+        try:
+            cdp_session = browser.new_browser_cdp_session()
+            process_info = cdp_session.send("SystemInfo.getProcessInfo").get("processInfo", [])
+            targets = cdp_session.send("Target.getTargets").get("targetInfos", [])
+            tracer.record("PLAYWRIGHT", "run_rollover_diagnostic_only", "CDP_PROCESS_INFO", "END", state, processInfo=process_info, connectionId=getattr(bridge, "_diagnostic_connection_id", None))
+            tracer.record("PLAYWRIGHT", "run_rollover_diagnostic_only", "CDP_TARGET_INVENTORY", "END", state, targets=[{key: item.get(key) for key in ("targetId", "type", "url", "title", "attached", "browserContextId")} for item in targets], connectionId=getattr(bridge, "_diagnostic_connection_id", None))
+        except Exception as error:
+            tracer.record("PLAYWRIGHT", "run_rollover_diagnostic_only", "CDP_READ_ERROR", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc(), connectionId=getattr(bridge, "_diagnostic_connection_id", None))
+        finally:
+            if cdp_session is not None:
+                try:
+                    cdp_session.detach()
+                except Exception:
+                    pass
+
+        browser_ids = {int(item["id"]) for item in process_info if item.get("type") == "browser" and str(item.get("id", "")).isdigit()}
+        renderer_ids = {int(item["id"]) for item in process_info if item.get("type") == "renderer" and str(item.get("id", "")).isdigit()}
+        process_rows = []
+        try:
+            process_rows = architect_windows_process_rows()
+            tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "OS_PROCESS_INVENTORY", "END", state, processes=process_rows, browserProcessIds=sorted(browser_ids), rendererProcessIds=sorted(renderer_ids))
+            if len(browser_ids) == 1:
+                browser_pid = next(iter(browser_ids))
+                try:
+                    _diagnostic_memory_candidate(tracer, state, "architect_tab_renderer_working_set", architect_renderer_working_set_bytes(browser_pid, renderer_ids, process_rows))
+                except Exception as error:
+                    tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "TAB_RENDERER_MEMORY", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error))
+                try:
+                    root_pid = resolve_architect_browser_root_pid(endpoint)
+                    aggregate = architect_process_tree_memory_bytes(root_pid, process_rows)
+                    _diagnostic_memory_candidate(tracer, state, "governed_browser_process_tree_working_set", aggregate)
+                    included = [row for row in process_rows if row.get("pid") == root_pid or row.get("parentPid") == root_pid]
+                    tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "OS_PROCESS_TREE", "END", state, rootPid=root_pid, includedProcesses=included, excludedProcesses=[row for row in process_rows if row not in included])
+                except Exception as error:
+                    tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "OS_PROCESS_TREE", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error), stackTrace=traceback.format_exc())
+        except Exception as error:
+            tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "OS_PROCESS_INVENTORY", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error), stackTrace=traceback.format_exc())
+
+        for source, value in (("persisted.architectMemoryBytes", state.get("architectMemoryBytes")),):
+            _diagnostic_memory_candidate(tracer, state, source, value)
+        due = bool(state.get("rolloverDue"))
+        paused = bool(state.get("discussionPauseActive"))
+        reason = "DISCUSSION_PAUSED" if paused else ("ROLLOVER_DUE_FALSE" if not due else "NOT_NEXT_PROMPT_READY")
+        active_pid = state.get("codexPid") or state.get("active_codex_pid")
+        active_pid_alive = None
+        if active_pid:
+            try:
+                active_pid_alive = LocalWatcher.process_alive(int(active_pid))
+            except (TypeError, ValueError):
+                active_pid_alive = False
+        tracer.record("ROLLOVER", "run_rollover_diagnostic_only", "ROLLOVER_GATE", "DECISION", state, workflowState=state.get("state"), safeBoundaryState="NEXT_PROMPT_READY", memorySource=state.get("architectMemoryOwnershipSource"), memoryBytes=state.get("architectMemoryBytes"), memoryMiB=state.get("architectMemoryMiB"), thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES, thresholdSatisfied=bool((state.get("architectMemoryBytes") or 0) >= ARCHITECT_MEMORY_THRESHOLD_BYTES), rolloverDueBefore=due, rolloverTriggerBefore=state.get("rolloverTrigger"), discussionPaused=paused, architectGenerating=False, executorRunning=state.get("executorProcessState") == "RUNNING", activePid=active_pid, activePidAlive=active_pid_alive, nextTaskId=state.get("nextTaskId"), nextPromptPathPresent=bool(state.get("nextPromptPath")), handoverRequested=state.get("handoverRequested"), rolloverAttemptedForTaskId=state.get("rolloverAttemptedForTaskId"), rolloverMaintenanceState=state.get("rolloverMaintenanceState"), decision="SKIP", reason=reason)
+        tracer.record("EXECUTOR", "run_rollover_diagnostic_only", "EXECUTOR_DISPATCH_GATE", "DECISION", state, stateValue=state.get("state"), nextTaskId=state.get("nextTaskId"), rolloverDue=state.get("rolloverDue"), rolloverTrigger=state.get("rolloverTrigger"), rolloverServiceCalled=False, rolloverServiceResult=None, discussionPaused=paused, decision="BLOCK", reason="DIAGNOSTIC_ONLY")
+        tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "SNAPSHOT_END", "END", state, diagnosticOnly=True, workflowActionCount=0)
+        return actual_id
+    except Exception as error:
+        tracer.record("ROLLOVER_DIAGNOSTIC", "run_rollover_diagnostic_only", "SNAPSHOT_ERROR", "ERROR", state, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc(), workflowActionCount=0)
+        return "ERROR"
+    finally:
+        if bridge is not None:
+            _disconnect_architect_bridge_read_only(bridge, tracer, state)
 
 
 def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
@@ -395,7 +591,7 @@ def architect_windows_process_rows() -> list[dict[str, int]]:
     script = ("Get-CimInstance Win32_Process | ForEach-Object { "
               "$p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; "
               "if ($p) { [pscustomobject][ordered]@{ pid=[int]$_.ProcessId; "
-              "parentPid=[int]$_.ParentProcessId; workingSet=[int64]$p.WorkingSet64 } } "
+              "parentPid=[int]$_.ParentProcessId; name=[string]$_.Name; workingSet=[int64]$p.WorkingSet64 } } "
               "} | ConvertTo-Json -Compress")
     try:
         raw = subprocess.check_output(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], text=True, encoding="utf-8", errors="strict")
@@ -1301,30 +1497,38 @@ class ArchitectSessionRollover:
         workflow_state = self.watcher.state.get("state", "IDLE")
         boundary_state = safe_boundary_state or workflow_state
         if boundary_state != "NEXT_PROMPT_READY":
+            _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "NOT_NEXT_PROMPT_READY", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
         if boundary_state == "NEXT_PROMPT_READY":
             prompt_path = self.watcher.state.get("nextPromptPath")
             next_task = self.watcher.state.get("nextTaskId")
             if not next_task or not isinstance(prompt_path, str) or not Path(prompt_path).is_file() or self.watcher.state.get("handoverRequested"):
+                _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "NO_VALID_NEXT_PROMPT", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
                 return False
         count = int(self.watcher.state.get("architectResponseCount", 0))
         trigger = self.rollover_trigger(self.watcher.state.get("architectMemoryBytes"), count)
         if not trigger:
+            _trace_rollover_gate(self.watcher, boundary_state, "NO_TRIGGER", "MEMORY_BELOW_THRESHOLD", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
         self._retire_stale_transaction_for_task(task_id)
         if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id:
+            _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "ALREADY_ATTEMPTED_FOR_TASK", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
         if architect_generating or not latest_prompt_dispatched or self.watcher.state.get("handoverRequested"):
+            _trace_rollover_gate(self.watcher, boundary_state, "DEFER", "ARCHITECT_GENERATING" if architect_generating else "HANDOVER_ALREADY_REQUESTED", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
         if executor_running:
+            _trace_rollover_gate(self.watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
         active_pid = self.watcher.state.get("codexPid") or self.watcher.state.get("active_codex_pid")
         if active_pid and self.watcher.state.get("executorProcessState") != "COMPLETED_WITH_RESULT":
             try:
                 if LocalWatcher.process_alive(int(active_pid)):
+                    _trace_rollover_gate(self.watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
                     return False
             except (TypeError, ValueError):
+                _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "ACTIVE_PID_INVALID", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
                 return False
         previous_transaction_id = str(self.watcher.state.get("rolloverTransactionId") or "").strip()
         transaction_id = rollover_transaction_id(self.watcher.state, task_id)
@@ -5352,13 +5556,63 @@ def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: 
     return str(decision.get("action") or "")
 
 
+def _trace_rollover_gate(watcher: Any, safe_boundary_state: str | None, decision: str, reason: str, **fields: Any) -> None:
+    tracer = diagnostic_trace_for(watcher)
+    if not tracer:
+        return
+    state = watcher.state
+    active_pid = state.get("codexPid") or state.get("active_codex_pid")
+    active_alive = None
+    if active_pid:
+        try:
+            active_alive = LocalWatcher.process_alive(int(active_pid))
+        except (TypeError, ValueError):
+            active_alive = False
+    tracer.record(
+        "ROLLOVER",
+        fields.pop("function", "rollover_gate"),
+        "ROLLOVER_GATE",
+        "DECISION",
+        state,
+        workflowState=state.get("state"),
+        safeBoundaryState=safe_boundary_state or state.get("state"),
+        memorySource=state.get("architectMemoryOwnershipSource"),
+        memoryBytes=state.get("architectMemoryBytes"),
+        memoryMiB=state.get("architectMemoryMiB"),
+        thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+        thresholdSatisfied=bool(isinstance(state.get("architectMemoryBytes"), int) and state.get("architectMemoryBytes") >= ARCHITECT_MEMORY_THRESHOLD_BYTES),
+        rolloverDueBefore=state.get("rolloverDue"),
+        rolloverTriggerBefore=state.get("rolloverTrigger"),
+        discussionPaused=bool(state.get("discussionPauseActive")),
+        architectGenerating=fields.pop("architectGenerating", None),
+        executorRunning=fields.pop("executorRunning", state.get("executorProcessState") == "RUNNING"),
+        activePid=active_pid,
+        activePidAlive=active_alive,
+        nextTaskId=state.get("nextTaskId"),
+        nextPromptPathPresent=bool(state.get("nextPromptPath")),
+        handoverRequested=state.get("handoverRequested"),
+        rolloverAttemptedForTaskId=state.get("rolloverAttemptedForTaskId"),
+        rolloverMaintenanceState=state.get("rolloverMaintenanceState"),
+        decision=decision,
+        reason=reason,
+        **fields,
+    )
+
+
 def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: str, paused: Callable[[], bool], safe_boundary_state: str | None = None) -> bool:
     """Attempt optional rollover maintenance at the pre-dispatch boundary."""
     tracer = diagnostic_trace_for(watcher)
     if tracer:
         tracer.record("ROLLOVER", "service_deferred_rollover_once", "FUNCTION", "BEGIN", watcher.state, safeBoundaryState=safe_boundary_state)
     boundary_state = safe_boundary_state or watcher.state.get("state")
-    if paused() or boundary_state != "NEXT_PROMPT_READY" or watcher.state.get("state") != boundary_state or not watcher.state.get("rolloverDue"):
+    if paused():
+        _trace_rollover_gate(watcher, boundary_state, "DEFER", "DISCUSSION_PAUSED", function="service_deferred_rollover_once")
+        return False
+    if boundary_state != "NEXT_PROMPT_READY" or watcher.state.get("state") != boundary_state:
+        _trace_rollover_gate(watcher, boundary_state, "SKIP", "NOT_NEXT_PROMPT_READY", function="service_deferred_rollover_once")
+        return False
+    if not watcher.state.get("rolloverDue"):
+        _trace_rollover_gate(watcher, boundary_state, "NO_TRIGGER", "ROLLOVER_DUE_FALSE", function="service_deferred_rollover_once")
         return False
     watcher.retire_completed_executor_ownership()
     next_task_id = str(watcher.state.get("nextTaskId") or "")
@@ -5366,14 +5620,18 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (active_pid and watcher.state.get("executorProcessState") == "RUNNING"
             and LocalWatcher.process_alive(int(active_pid))):
+        _trace_rollover_gate(watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="service_deferred_rollover_once", executorRunning=True)
         return False
     if watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
+        _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
         return False
     rollover = watcher.session_rollover
     if not rollover._begin_bounded_recovery():
         if tracer:
             tracer.record("ROLLOVER", "service_deferred_rollover_once", "GATE", "DECISION", watcher.state, gate="bounded_recovery", result="BLOCK", reason="backoff_or_terminal")
+        _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
         return False
+    _trace_rollover_gate(watcher, boundary_state, "ATTEMPT", "ROLLOVER_DUE_SAFE_BOUNDARY", function="service_deferred_rollover_once")
     def failed() -> bool:
         rollover._record_recovery_failure()
         return False
@@ -5428,16 +5686,25 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     """Dispatch project work; rollover is optional maintenance, never a gate."""
     tracer = diagnostic_trace_for(watcher)
     if tracer:
-        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "BEGIN", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"), promptPath=watcher.state.get("nextPromptPath"), rolloverDue=watcher.state.get("rolloverDue"), discussionPause=bool(watcher.state.get("discussionPauseActive")))
+        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "BEGIN", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"), promptPath=watcher.state.get("nextPromptPath"), rolloverDue=watcher.state.get("rolloverDue"), discussionPause=bool(watcher.state.get("discussionPauseActive")), rolloverServiceCalled=False)
     if watcher.state.get("state") != "NEXT_PROMPT_READY":
+        if tracer:
+            tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="NOT_NEXT_PROMPT_READY", rolloverServiceCalled=False)
         return None
     watcher.retire_completed_executor_ownership()
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (watcher.state.get("executorProcessState") == "RUNNING"
             and active_pid and LocalWatcher.process_alive(int(active_pid))):
+        if tracer:
+            tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="EXECUTOR_RUNNING", activePid=active_pid, rolloverServiceCalled=False)
         return None
+    rollover_called = False
+    rollover_result = None
     if watcher.state.get("rolloverDue"):
-        service_deferred_rollover_once(watcher, endpoint, paused, "NEXT_PROMPT_READY")
+        rollover_called = True
+        rollover_result = service_deferred_rollover_once(watcher, endpoint, paused, "NEXT_PROMPT_READY")
+    if tracer:
+        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="LAUNCH", reason="PROJECT_WORKFLOW_AUTHORITY", rolloverServiceCalled=rollover_called, rolloverServiceResult=rollover_result, discussionPaused=bool(paused()))
     runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
     runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
     process = watcher.launch_next(launch)
@@ -5495,7 +5762,8 @@ def main() -> None:
     watcher = LocalFirstOrchestrator(project, state_dir)
     watcher.runtime_logger = logger
     watcher.runtime_run_id = run_id
-    diagnostic_trace = DiagnosticTracer(state_dir, run_id) if DiagnosticTracer.enabled() else None
+    diagnostic_only = rollover_diagnostic_only_enabled()
+    diagnostic_trace = DiagnosticTracer(state_dir, run_id) if (DiagnosticTracer.enabled() or diagnostic_only) else None
     watcher.diagnostic_trace = diagnostic_trace
     _ACTIVE_DIAGNOSTIC_TRACE = diagnostic_trace
     if diagnostic_trace:
@@ -5516,6 +5784,14 @@ def main() -> None:
         watcher.state.get("architectSendState") or "NONE", watcher.state.get("architectConversationId") or "NONE", recovery_action))
     runtime_log(logger, run_id, "WATCHER_STARTED", watcher.state, source=log_path)
     runtime_log(logger, run_id, "STATE_RECOVERED", watcher.state, recoveryAction=recovery_action)
+    if diagnostic_only:
+        result = run_rollover_diagnostic_only(watcher, endpoint, diagnostic_trace)
+        if diagnostic_trace:
+            diagnostic_trace.record("MAIN", "main", "DIAGNOSTIC_ONLY_COMPLETE", "END", watcher.state, result=result, workflowActionCount=0)
+            diagnostic_trace.shutdown(watcher.state)
+            _ACTIVE_DIAGNOSTIC_TRACE = None
+        instance_lock.release()
+        return
     hotkeys = DiscussionHotkeyController(watcher)
     if not hotkeys.start(lambda event: runtime_log(logger, run_id, event, watcher.state)) and os.name == "nt":
         print("ORCHESTRATOR_HOTKEY_REGISTRATION_FAILED")

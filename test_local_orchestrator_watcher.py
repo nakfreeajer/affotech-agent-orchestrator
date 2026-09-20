@@ -827,6 +827,144 @@ def test_diagnostic_trace_cap_disables_only_trace_writes(tmp_path, monkeypatch):
     assert len(lines) <= 2
 
 
+def test_rollover_diagnostic_only_is_read_only_and_logs_memory_sources(tmp_path, monkeypatch):
+    from local_orchestrator_watcher import DiagnosticTracer, LocalWatcher, run_rollover_diagnostic_only
+
+    state_path = tmp_path / "state.json"
+    initial = {
+        "state": "RESULT_READY", "taskId": "000069", "lastCompletedTaskId": "000069",
+        "nextTaskId": "000070", "discussionPauseActive": True,
+        "architectConversationId": "current", "architectMemoryBytes": 247 * 1024 * 1024,
+        "architectMemoryOwnership": "SESSION_SCOPED", "architectMemoryOwnershipSource": "ARCHITECT_PAGE_RENDERER",
+        "rolloverDue": False, "rolloverPending": False, "rolloverInProgress": False,
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+    }
+    state_path.write_text(json.dumps(initial), encoding="utf-8")
+    watcher = LocalWatcher(str(tmp_path), state_path, runner=object())
+    tracer = DiagnosticTracer(tmp_path, "diagnostic-only")
+    watcher.diagnostic_trace = tracer
+    calls = {"evaluate": 0, "title": 0, "stop": 0, "send": []}
+
+    class Page:
+        url = "https://chatgpt.com/c/current"
+        def title(self):
+            calls["title"] += 1
+            return "Architect"
+        def evaluate(self, _script):
+            calls["evaluate"] += 1
+            return {
+                "measureUserAgentSpecificMemoryAvailable": True,
+                "measureUserAgentSpecificMemoryBytes": 260 * 1024 * 1024,
+                "measureUserAgentSpecificMemoryError": None,
+                "performanceMemoryAvailable": True,
+                "usedJSHeapSize": 247 * 1024 * 1024,
+                "totalJSHeapSize": 300 * 1024 * 1024,
+                "jsHeapSizeLimit": 2048 * 1024 * 1024,
+            }
+
+    page = Page()
+    class CdpSession:
+        def send(self, method):
+            calls["send"].append(method)
+            if method == "SystemInfo.getProcessInfo":
+                return {"processInfo": [{"type": "browser", "id": 10}, {"type": "renderer", "id": 11}]}
+            return {"targetInfos": [{"targetId": "target-1", "type": "page", "url": page.url, "title": "Architect", "attached": True}]}
+        def detach(self):
+            pass
+
+    class Browser:
+        contexts = [type("Context", (), {"pages": [page]})()]
+        def new_browser_cdp_session(self):
+            return CdpSession()
+
+    class Runtime:
+        def stop(self):
+            calls["stop"] += 1
+
+    class Bridge:
+        def __init__(self):
+            self.page = page
+            self._browser = Browser()
+            self._runtime = Runtime()
+            self._diagnostic_connection_id = "PW-CONN-0001"
+
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: Bridge()))
+    monkeypatch.setattr(watcher_module, "architect_windows_process_rows", lambda: [
+        {"pid": 10, "parentPid": 1, "workingSet": 100},
+        {"pid": 11, "parentPid": 10, "workingSet": 120 * 1024 * 1024},
+    ])
+    monkeypatch.setattr(watcher_module, "resolve_architect_browser_root_pid", lambda _endpoint: 10)
+    monkeypatch.setattr(watcher_module, "architect_process_tree_memory_bytes", lambda _root, _rows: 130 * 1024 * 1024)
+
+    before = state_path.read_bytes()
+    assert run_rollover_diagnostic_only(watcher, "http://127.0.0.1:9333", tracer) == "current"
+    tracer.shutdown(watcher.state)
+    assert state_path.read_bytes() == before
+    assert calls["evaluate"] == 1
+    assert calls["send"] == ["SystemInfo.getProcessInfo", "Target.getTargets"]
+    assert calls["stop"] == 1
+    assert watcher.state["state"] == "RESULT_READY"
+    assert watcher.state["discussionPauseActive"] is True
+    records = [json.loads(line) for line in (tmp_path / "logs" / "diagnostic" / "diagnostic-only" / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    candidates = [record for record in records if record.get("operation") == "MEMORY_CANDIDATE"]
+    sources = {record.get("source") for record in candidates}
+    assert "performance.measureUserAgentSpecificMemory" in sources
+    assert "performance.memory.usedJSHeapSize" in sources
+    assert "architect_tab_renderer_working_set" in sources
+    assert "governed_browser_process_tree_working_set" in sources
+    assert any(record.get("operation") == "MEMORY_APIS" for record in records)
+    assert any(record.get("operation") == "ROLLOVER_GATE" and record.get("reason") == "DISCUSSION_PAUSED" for record in records)
+    assert any(record.get("operation") == "EXECUTOR_DISPATCH_GATE" and record.get("reason") == "DIAGNOSTIC_ONLY" for record in records)
+    assert any(record.get("operation") == "DIAGNOSTIC_ONLY_COMPLETE" for record in records) is False
+
+
+def test_rollover_diagnostic_only_logs_memory_api_exception_without_mutation(tmp_path, monkeypatch):
+    from local_orchestrator_watcher import DiagnosticTracer, LocalWatcher, run_rollover_diagnostic_only
+    state_path = tmp_path / "state.json"
+    initial = {"state": "RESULT_READY", "taskId": "000069", "discussionPauseActive": True, "architectConversationId": "current"}
+    state_path.write_text(json.dumps(initial), encoding="utf-8")
+    watcher = LocalWatcher(str(tmp_path), state_path, runner=object())
+    tracer = DiagnosticTracer(tmp_path, "diagnostic-error")
+    class Page:
+        url = "https://chatgpt.com/c/current"
+        def title(self): return "Architect"
+        def evaluate(self, _script): raise RuntimeError("measure rejected")
+    page = Page()
+    class Session:
+        def send(self, method):
+            return {"processInfo": [{"type": "browser", "id": 10}, {"type": "renderer", "id": 11}]} if method == "SystemInfo.getProcessInfo" else {"targetInfos": []}
+        def detach(self): pass
+    class Browser:
+        contexts = [type("Context", (), {"pages": [page]})()]
+        def new_browser_cdp_session(self): return Session()
+    class Runtime:
+        def stop(self): pass
+    class Bridge:
+        _diagnostic_connection_id = "PW-CONN-0001"
+        _browser = Browser()
+        _runtime = Runtime()
+        def __init__(self): self.page = page
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: Bridge()))
+    monkeypatch.setattr(watcher_module, "architect_windows_process_rows", lambda: [])
+    before = state_path.read_bytes()
+    assert run_rollover_diagnostic_only(watcher, "endpoint", tracer) == "current"
+    tracer.shutdown(watcher.state)
+    assert state_path.read_bytes() == before
+    records = [json.loads(line) for line in (tmp_path / "logs" / "diagnostic" / "diagnostic-error" / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    error = next(record for record in records if record.get("operation") == "MEMORY_APIS")
+    assert error["phase"] == "ERROR"
+    assert error["errorClass"] == "RuntimeError"
+    assert "measure rejected" in error["errorMessage"]
+    assert "stackTrace" in error
+
+
+def test_rollover_diagnostic_only_flag_is_opt_in(monkeypatch):
+    monkeypatch.delenv("ORCHESTRATOR_ROLLOVER_DIAGNOSTIC_ONLY", raising=False)
+    assert not watcher_module.rollover_diagnostic_only_enabled()
+    monkeypatch.setenv("ORCHESTRATOR_ROLLOVER_DIAGNOSTIC_ONLY", "1")
+    assert watcher_module.rollover_diagnostic_only_enabled()
+
+
 def test_rollover_recovery_accounting_records_successful_completion(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover, LocalWatcher
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
