@@ -3783,6 +3783,7 @@ class LocalFirstOrchestrator:
         self.process_factory = process_factory
         self._live_bottom_recovery_attempted: set[str] = set()
         self.state = self._load_state()
+        self._operator_restart_rollover_recovery_available = self.state.get("rolloverMaintenanceState") == "DEFERRED"
         self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
         self.state.setdefault("executorSessionMode", "PERSISTENT")
         self.architect_memory_reader = None
@@ -5649,8 +5650,15 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="service_deferred_rollover_once", executorRunning=True)
         return False
     if watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
-        _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
-        return False
+        if not getattr(watcher, "_operator_restart_rollover_recovery_available", False):
+            _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
+            return False
+        watcher._operator_restart_rollover_recovery_available = False
+        watcher.state.update({"rolloverRecoveryState": "PENDING", "rolloverRecoveryAttemptCount": 0})
+        for key in ("rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt", "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason"):
+            watcher.state.pop(key, None)
+        watcher.save()
+        _trace_rollover_gate(watcher, boundary_state, "ATTEMPT", "OPERATOR_RESTART_RECOVERY", function="service_deferred_rollover_once")
     rollover = watcher.session_rollover
     if not rollover._begin_bounded_recovery():
         if tracer:
@@ -5709,7 +5717,7 @@ def sample_completed_architect_response_memory(watcher: Any, bridge: Any) -> str
 
 
 def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any], endpoint: str, paused: Callable[[], bool], logger: logging.Logger | None = None, run_id: str | None = None) -> Any:
-    """Dispatch project work; rollover is optional maintenance, never a gate."""
+    """Dispatch project work only after any required Architect rollover completes."""
     tracer = diagnostic_trace_for(watcher)
     if tracer:
         tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "BEGIN", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"), promptPath=watcher.state.get("nextPromptPath"), rolloverDue=watcher.state.get("rolloverDue"), discussionPause=bool(watcher.state.get("discussionPauseActive")), rolloverServiceCalled=False)
@@ -5726,11 +5734,27 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
         return None
     rollover_called = False
     rollover_result = None
+    rollover_complete = not bool(watcher.state.get("rolloverDue"))
     if watcher.state.get("rolloverDue"):
+        previous_authority = watcher.state.get("architectConversationId")
         rollover_called = True
         rollover_result = service_deferred_rollover_once(watcher, endpoint, paused, "NEXT_PROMPT_READY")
+        rollover_complete = bool(
+            rollover_result
+            and not watcher.state.get("rolloverDue")
+            and not watcher.state.get("rolloverPending")
+            and not watcher.state.get("rolloverInProgress")
+            and not watcher.state.get("handoverRequested")
+            and bool(watcher.state.get("architectConversationId"))
+            and (not previous_authority or watcher.state.get("architectConversationId") != previous_authority)
+        )
+        if not rollover_complete:
+            if tracer:
+                tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH", rolloverServiceCalled=True, rolloverServiceResult=rollover_result, rolloverComplete=False, authoritativeArchitectConversationId=watcher.state.get("architectConversationId"))
+            runtime_log(logger, run_id, "NEXT_PROMPT_READY_DISPATCH_BLOCKED", watcher.state, reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH", rolloverServiceResult=rollover_result)
+            return None
     if tracer:
-        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="LAUNCH", reason="PROJECT_WORKFLOW_AUTHORITY", rolloverServiceCalled=rollover_called, rolloverServiceResult=rollover_result, discussionPaused=bool(paused()))
+        tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="LAUNCH", reason="ROLLOVER_COMPLETE" if rollover_called else "ROLLOVER_NOT_DUE", rolloverServiceCalled=rollover_called, rolloverServiceResult=rollover_result, rolloverComplete=rollover_complete, authoritativeArchitectConversationId=watcher.state.get("architectConversationId"), discussionPaused=bool(paused()))
     runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
     runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
     process = watcher.launch_next(launch)

@@ -763,9 +763,9 @@ def test_due_rollover_recovery_is_bounded_and_enters_safety_cutout(tmp_path, mon
     assert prompt.read_bytes() == b"preserved staged prompt"
     class Process:
         pid = 9001
-    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: (launches.append(1) or Process()), "endpoint", lambda: False) is not None
+    assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: (launches.append(1) or Process()), "endpoint", lambda: False) is None
     assert attaches == [1]
-    assert launches == [1]
+    assert launches == []
 
 
 def test_diagnostic_trace_is_opt_in_and_records_existing_browser_evidence(tmp_path, monkeypatch):
