@@ -1846,6 +1846,86 @@ def test_operator_restart_failed_rollover_returns_to_passive_wait(tmp_path, monk
     assert sleeps == [2.0, 2.0]
 
 
+def test_operator_restart_unsent_recovery_reaches_real_request_once(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "taskId": "000070",
+        "lastCompletedTaskId": "000070",
+        "nextTaskId": "000071",
+        "nextPromptPath": str(prompt),
+        "rolloverPending": True,
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": "000071",
+        "rolloverAttemptedForTaskId": "000071",
+        "rolloverHandoverSendState": "UNSENT",
+        "handoverRequested": False,
+        "architectConversationId": "OLD",
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert restarted._operator_restart_rollover_recovery_available is True
+    restarted.state["architectMemoryBytes"] = watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    events = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def _assistant_entries(self):
+            events.append("reconcile")
+            return []
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def submit_result_bounded(self, _payload): events.append("send")
+        def wait_for_new_response(self, *_args, **_kwargs): return {"state": "TIMEOUT", "text": ""}
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert events == ["reconcile", "send"]
+    assert restarted.state["rolloverAttemptedForTaskId"] == "000071"
+    assert restarted.state["rolloverHandoverSendState"] in {"ACKNOWLEDGED", "AMBIGUOUS"}
+
+
+@pytest.mark.parametrize("send_state", ["AMBIGUOUS", "ACKNOWLEDGED"])
+def test_operator_restart_existing_delivery_reconciles_before_any_resend(tmp_path, monkeypatch, send_state):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "taskId": "000070",
+        "lastCompletedTaskId": "000070",
+        "nextTaskId": "000071",
+        "nextPromptPath": str(prompt),
+        "rolloverPending": True,
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": "000071",
+        "rolloverAttemptedForTaskId": "000071",
+        "rolloverHandoverSendState": send_state,
+        "handoverRequested": True,
+        "architectConversationId": "OLD",
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    events = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def _assistant_entries(self):
+            events.append("reconcile")
+            return []
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def submit_result_bounded(self, _payload): events.append("send")
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert events == ["reconcile"]
+
+
 def test_operator_restart_allows_one_bounded_recovery_after_deferred_rollover(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     prompt = tmp_path / "next.txt"

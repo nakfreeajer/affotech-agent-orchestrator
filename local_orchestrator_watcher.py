@@ -1513,7 +1513,7 @@ class ArchitectSessionRollover:
         self.watcher.save()
         return True
 
-    def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False, safe_boundary_state: str | None = None) -> bool:
+    def request_if_due(self, bridge: "ArchitectPlaywright", latest_prompt_dispatched: bool, executor_running: bool, emit: Callable[[str], None] = print, architect_generating: bool = False, safe_boundary_state: str | None = None, allow_same_task_unsent_recovery: bool = False) -> bool:
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.request_if_due", "FUNCTION", "BEGIN", self.watcher.state, latestPromptDispatched=latest_prompt_dispatched, executorRunning=executor_running, architectGenerating=architect_generating, safeBoundaryState=safe_boundary_state)
@@ -1535,7 +1535,7 @@ class ArchitectSessionRollover:
             return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
         self._retire_stale_transaction_for_task(task_id)
-        if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id:
+        if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id and not allow_same_task_unsent_recovery:
             _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "ALREADY_ATTEMPTED_FOR_TASK", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
         if architect_generating or not latest_prompt_dispatched or self.watcher.state.get("handoverRequested"):
@@ -5649,10 +5649,12 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             and LocalWatcher.process_alive(int(active_pid))):
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="service_deferred_rollover_once", executorRunning=True)
         return False
+    operator_restart_recovery = False
     if watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
         if not getattr(watcher, "_operator_restart_rollover_recovery_available", False):
             _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
             return False
+        operator_restart_recovery = True
         watcher._operator_restart_rollover_recovery_available = False
         watcher.state.update({"rolloverRecoveryState": "PENDING", "rolloverRecoveryAttemptCount": 0})
         for key in ("rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt", "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason"):
@@ -5685,7 +5687,30 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             if (watcher.state.get("handoverRequested")
                     or watcher.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}):
                 return failed()
-        if not rollover.request_if_due(bridge, latest_prompt_dispatched=True, executor_running=False, architect_generating=bridge.generation_visible(), safe_boundary_state=boundary_state):
+        send_state = watcher.state.get("rolloverHandoverSendState")
+        recovery_evidence = any(
+            watcher.state.get(key)
+            for key in (
+                "pending_handover", "rolloverFreshCandidateConversationId",
+                "rolloverFreshCandidateState", "rolloverFreshCandidateDiscoveryState",
+                "rolloverFreshCandidateAttemptCount", "rolloverFreshCandidateRetryAfter",
+                "rolloverFreshBootstrapPayloadHash", "rolloverFreshPageCreated",
+            )
+        )
+        allow_same_task_unsent_recovery = bool(
+            operator_restart_recovery
+            and send_state == "UNSENT"
+            and not watcher.state.get("handoverRequested")
+            and not recovery_evidence
+        )
+        if not rollover.request_if_due(
+            bridge,
+            latest_prompt_dispatched=True,
+            executor_running=False,
+            architect_generating=bridge.generation_visible(),
+            safe_boundary_state=boundary_state,
+            allow_same_task_unsent_recovery=allow_same_task_unsent_recovery,
+        ):
             return failed()
         observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
         if observed.get("state") != "COMPLETED" or not watcher.process_pending_handover_response(bridge, observed.get("text", "")):
