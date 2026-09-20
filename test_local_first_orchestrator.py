@@ -1159,6 +1159,34 @@ def test_memory_telemetry_cannot_block_next_prompt_dispatch(tmp_path, monkeypatc
     assert launches == [1]
 
 
+def test_completed_architect_response_samples_before_next_prompt_dispatch(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state["state"] = "ARCHITECT_RUNNING"
+    samples = iter([watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES - 1,
+                    watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES])
+    class Bridge:
+        def current_session_memory_bytes(self): return next(samples)
+    assert watcher_module.sample_completed_architect_response_memory(watcher, Bridge()) is None
+    assert watcher.state.get("rolloverDue") is not True
+    assert watcher_module.sample_completed_architect_response_memory(watcher, Bridge()) == "MEMORY_THRESHOLD"
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    prompt = tmp_path / "next.txt"
+    prompt.write_text("next", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000001", "lastCompletedTaskId": "000001",
+                          "nextTaskId": "000002", "nextPromptPath": str(prompt),
+                          "executorProcessState": "COMPLETED_WITH_RESULT"})
+    order = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: order.append("rollover") or False)
+    class Process:
+        pid = 7002
+    assert watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: order.append("launch") or Process(), "endpoint", lambda: False
+    ) is not None
+    assert order == ["rollover", "launch"]
+
+
 def test_legacy_rollover_cutout_recovers_only_with_valid_newer_staged_task(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     result = tmp_path / "000001-result.txt"

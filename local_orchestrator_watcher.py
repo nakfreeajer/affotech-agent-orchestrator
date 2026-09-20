@@ -2095,12 +2095,24 @@ class ArchitectPlaywright:
             """async () => {
                 const performance = globalThis.performance;
                 if (performance && typeof performance.measureUserAgentSpecificMemory === 'function') {
-                    const sample = await performance.measureUserAgentSpecificMemory();
-                    if (sample && Number.isFinite(sample.bytes)) return Math.floor(sample.bytes);
+                    try {
+                        const sample = await performance.measureUserAgentSpecificMemory();
+                        if (sample && Number.isFinite(sample.bytes) && sample.bytes >= 0) {
+                            return Math.floor(sample.bytes);
+                        }
+                    } catch (_error) {
+                        // Fall through to the renderer-local heap measurement.
+                    }
                 }
-                const memory = performance && performance.memory;
-                if (!memory || !Number.isFinite(memory.usedJSHeapSize)) return null;
-                return Math.floor(memory.usedJSHeapSize);
+                try {
+                    const memory = performance && performance.memory;
+                    if (memory && Number.isFinite(memory.usedJSHeapSize) && memory.usedJSHeapSize >= 0) {
+                        return Math.floor(memory.usedJSHeapSize);
+                    }
+                } catch (_error) {
+                    // The caller will fail closed when no valid measurement exists.
+                }
+                return null;
             }"""
         )
         if not isinstance(result, int) or result < 0:
@@ -5375,6 +5387,15 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 pass
 
 
+def sample_completed_architect_response_memory(watcher: Any, bridge: Any) -> str | None:
+    """Record current-session memory after Architect completion, before acceptance."""
+    rollover = getattr(watcher, "session_rollover", None)
+    reader = getattr(bridge, "current_session_memory_bytes", None)
+    if rollover is None or not callable(reader):
+        return None
+    return rollover.sample_memory(memory_reader=reader)
+
+
 def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any], endpoint: str, paused: Callable[[], bool], logger: logging.Logger | None = None, run_id: str | None = None) -> Any:
     """Dispatch project work; rollover is optional maintenance, never a gate."""
     tracer = diagnostic_trace_for(watcher)
@@ -5767,6 +5788,8 @@ def main() -> None:
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
                         time.sleep(1.0)
                         continue
+                    if observed.get("state") == "COMPLETED" and rollover is not None:
+                        sample_completed_architect_response_memory(watcher, bridge)
                     if watcher.state.get("handoverRequested") and watcher.state.get("rolloverInProgress") and rollover is not None:
                         if watcher.process_pending_handover_response(bridge, observed["text"]):
                             baseline = bridge.assistant_baseline()

@@ -896,6 +896,33 @@ def test_response_count_does_not_override_memory_threshold(tmp_path):
     assert rollover.rollover_trigger(ARCHITECT_MEMORY_THRESHOLD_BYTES, 0) == "MEMORY_THRESHOLD"
 
 
+def test_current_session_memory_prefers_measurement_api(tmp_path):
+    from local_orchestrator_watcher import ArchitectPlaywright, ARCHITECT_MEMORY_THRESHOLD_BYTES
+    class Page:
+        def evaluate(self, script):
+            assert "measureUserAgentSpecificMemory" in script
+            assert "usedJSHeapSize" in script
+            return ARCHITECT_MEMORY_THRESHOLD_BYTES
+    assert ArchitectPlaywright(Page()).current_session_memory_bytes() == ARCHITECT_MEMORY_THRESHOLD_BYTES
+
+
+def test_current_session_memory_reject_falls_back_to_renderer_heap(tmp_path):
+    from local_orchestrator_watcher import ArchitectPlaywright
+    class Page:
+        def evaluate(self, script):
+            assert "catch (_error)" in script
+            return 123456
+    assert ArchitectPlaywright(Page()).current_session_memory_bytes() == 123456
+
+
+def test_current_session_memory_unavailable_fails_closed(tmp_path):
+    from local_orchestrator_watcher import ArchitectPlaywright
+    class Page:
+        def evaluate(self, _script): return None
+    with pytest.raises(RuntimeError, match="ARCHITECT_SESSION_MEMORY_UNAVAILABLE"):
+        ArchitectPlaywright(Page()).current_session_memory_bytes()
+
+
 def test_pending_rollover_blocks_new_relay_execution(tmp_path):
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     watcher.state["rolloverPending"] = True
