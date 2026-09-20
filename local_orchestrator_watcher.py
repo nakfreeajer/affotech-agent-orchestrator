@@ -5764,6 +5764,75 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     return process
 
 
+def deferred_rollover_passive_wait_required(watcher: LocalFirstOrchestrator) -> bool:
+    """Return whether a failed rollover must remain passive for this task boundary."""
+    state = watcher.state
+    next_task_id = state.get("nextTaskId")
+    return bool(
+        state.get("state") == "NEXT_PROMPT_READY"
+        and state.get("rolloverDue")
+        and state.get("rolloverMaintenanceState") == "DEFERRED"
+        and next_task_id
+        and state.get("rolloverDeferredForTaskId") == next_task_id
+        and not getattr(watcher, "_operator_restart_rollover_recovery_available", False)
+    )
+
+
+def passive_deferred_rollover_wait(
+    watcher: LocalFirstOrchestrator,
+    logger: logging.Logger | None = None,
+    run_id: str | None = None,
+    poll_interval: float | None = None,
+) -> bool:
+    """Sleep/reload once after deferred rollover, without retrying maintenance."""
+    if not deferred_rollover_passive_wait_required(watcher):
+        return False
+    task_id = watcher.state.get("nextTaskId")
+    if getattr(watcher, "_rollover_passive_wait_logged_task", None) != task_id:
+        watcher._rollover_passive_wait_logged_task = task_id
+        runtime_log(
+            logger,
+            run_id,
+            "ROLLOVER_DEFERRED_PASSIVE_WAIT",
+            watcher.state,
+            reason="ROLLOVER_MAINTENANCE_DEFERRED",
+            nextTaskId=task_id,
+        )
+        tracer = diagnostic_trace_for(watcher)
+        if tracer:
+            tracer.record(
+                "ROLLOVER",
+                "passive_deferred_rollover_wait",
+                "ROLLOVER_DEFERRED_PASSIVE_WAIT",
+                "DECISION",
+                watcher.state,
+                decision="WAIT",
+                reason="ROLLOVER_MAINTENANCE_DEFERRED",
+                nextTaskId=task_id,
+            )
+    interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+    time.sleep(interval)
+    watcher.state = watcher._load_state()
+    return True
+
+
+def run_next_prompt_ready_once(
+    watcher: LocalFirstOrchestrator,
+    launch: Callable[[str, Path], Any],
+    endpoint: str,
+    paused: Callable[[], bool],
+    logger: logging.Logger | None = None,
+    run_id: str | None = None,
+) -> Any:
+    """Run one NEXT_PROMPT_READY iteration, including deferred passive waiting."""
+    if passive_deferred_rollover_wait(watcher, logger, run_id):
+        return None
+    process = dispatch_next_prompt_once(watcher, launch, endpoint, paused, logger, run_id)
+    if process is None:
+        passive_deferred_rollover_wait(watcher, logger, run_id)
+    return process
+
+
 def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -> bool:
     """Apply task-scoped format recovery from the resident main-loop path."""
     try:
@@ -5968,7 +6037,7 @@ def main() -> None:
             if state == "NEXT_PROMPT_READY":
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="NEXT_PROMPT_READY_DISPATCH_ATTEMPT")
-                process = dispatch_next_prompt_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
+                process = run_next_prompt_ready_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
                 continue
             if state == "HUMAN_REQUIRED":
                 if diagnostic_trace:

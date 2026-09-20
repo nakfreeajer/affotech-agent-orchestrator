@@ -1753,6 +1753,99 @@ def test_next_prompt_ready_failed_rollover_does_not_launch_or_duplicate(tmp_path
     assert prompt.read_text(encoding="utf-8") == "next bounded task"
 
 
+def test_next_prompt_ready_deferred_rollover_enters_resident_passive_wait(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    service_calls = []
+    launches = []
+    sleeps = []
+
+    def failed_rollover(*_args, **_kwargs):
+        service_calls.append(1)
+        watcher._operator_restart_rollover_recovery_available = False
+        watcher.state.update({
+            "rolloverMaintenanceState": "DEFERRED",
+            "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
+            "rolloverDue": True,
+        })
+        return False
+
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", failed_rollover)
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda interval: sleeps.append(interval))
+    monkeypatch.setattr(watcher, "_load_state", lambda: watcher.state)
+
+    for _ in range(3):
+        assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+
+    assert service_calls == [1]
+    assert launches == []
+    assert len(sleeps) == 3
+    assert all(interval == 2.0 for interval in sleeps)
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000041"
+    assert watcher.state["nextPromptPath"] == str(prompt)
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state.get("humanRequiredReason") not in {"ARCHITECT_ROLLOVER_SAFETY_CUTOUT", "ROLLOVER_MAINTENANCE_DEFERRED"}
+
+
+def test_operator_restart_deferred_rollover_gets_one_attempt_then_successful_dispatch(tmp_path, monkeypatch):
+    watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
+    })
+    watcher._operator_restart_rollover_recovery_available = True
+    events = []
+
+    def successful_rollover(*_args, **_kwargs):
+        events.append("rollover")
+        watcher.state.update({
+            "rolloverDue": False,
+            "rolloverPending": False,
+            "rolloverInProgress": False,
+            "handoverRequested": False,
+            "architectConversationId": "FRESH",
+        })
+        return True
+
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", successful_rollover)
+    monkeypatch.setattr(watcher, "launch_next", lambda _launch: events.append("launch") or type("Process", (), {"pid": 4101})())
+    process = watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False)
+
+    assert process is not None
+    assert events == ["rollover", "launch"]
+
+
+def test_operator_restart_failed_rollover_returns_to_passive_wait(tmp_path, monkeypatch):
+    watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
+    })
+    watcher._operator_restart_rollover_recovery_available = True
+    service_calls = []
+    sleeps = []
+
+    def failed_rollover(*_args, **_kwargs):
+        service_calls.append(1)
+        watcher._operator_restart_rollover_recovery_available = False
+        watcher.state.update({
+            "rolloverMaintenanceState": "DEFERRED",
+            "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
+            "rolloverDue": True,
+        })
+        return False
+
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", failed_rollover)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda interval: sleeps.append(interval))
+    monkeypatch.setattr(watcher, "_load_state", lambda: watcher.state)
+
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+    assert service_calls == [1]
+    assert sleeps == [2.0, 2.0]
+
+
 def test_operator_restart_allows_one_bounded_recovery_after_deferred_rollover(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     prompt = tmp_path / "next.txt"
