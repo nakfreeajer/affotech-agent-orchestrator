@@ -2507,6 +2507,107 @@ def test_operator_restart_retires_stale_prior_boundary_and_recovers_current_boun
     assert restarted.state["rolloverAttemptedForTaskId"] == "000071"
 
 
+def _terminal_same_task_rollover_fixture(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000080.txt"
+    prompt.write_text("task 000080", encoding="utf-8")
+    retired = "8084c3b80c13ebccb27d52c4"
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000079", "lastCompletedTaskId": "000079",
+        "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "rolloverDue": True, "rolloverTrigger": "MEMORY_THRESHOLD", "rolloverPending": True,
+        "rolloverInProgress": False, "handoverRequested": True,
+        "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "DEFERRED",
+        "rolloverRecoveryState": "DEFERRED",
+        "rolloverRecoveryTerminalReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "rolloverTransactionId": retired, "rolloverTransactionTaskId": "000080",
+        "rolloverAttemptedForTaskId": "000080", "architectConversationId": "OLD",
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+    })
+    watcher.save()
+    return watcher, prompt, retired
+
+
+def test_terminal_same_task_transaction_retires_once_and_prepares_fresh_id(tmp_path):
+    watcher, _prompt, retired = _terminal_same_task_rollover_fixture(tmp_path)
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert restarted._operator_restart_rollover_recovery_available is True
+    assert restarted.session_rollover._retire_terminal_same_task_transaction("000080", True) is True
+    assert restarted.session_rollover._retire_terminal_same_task_transaction("000080", True) is False
+    assert restarted.state["rolloverRetiredTransactionId"] == retired
+    assert restarted.state["rolloverHandoverSendState"] == "UNSENT"
+
+    submitted = []
+
+    class Bridge:
+        def submit_result_bounded(self, _payload):
+            persisted = json.loads(restarted.state_path.read_text(encoding="utf-8"))
+            submitted.append((persisted.get("rolloverTransactionId"), persisted.get("rolloverTransactionGeneration")))
+
+    assert restarted.session_rollover.request_if_due(
+        Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY",
+        allow_same_task_unsent_recovery=True,
+    ) is True
+    replacement = restarted.state["rolloverTransactionId"]
+    assert replacement != retired
+    assert restarted.state["rolloverTransactionGeneration"] == 1
+    assert submitted == [(replacement, 1)]
+    persisted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert persisted.state["rolloverTransactionId"] == replacement
+    assert persisted.state["rolloverTransactionGeneration"] == 1
+
+
+def test_live_transaction_identity_is_immutable_across_restart(tmp_path):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    transaction = "live-transaction-000080"
+    watcher.state.update({
+        "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "rolloverTransactionId": transaction, "rolloverTransactionTaskId": "000080",
+        "rolloverAttemptedForTaskId": "000080", "rolloverInProgress": True,
+        "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "RECONCILE_PENDING",
+    })
+    watcher.save()
+    assert watcher_module.rollover_transaction_id(watcher.state, "000080") == transaction
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert watcher_module.rollover_transaction_id(restarted.state, "000080") == transaction
+
+
+def test_terminal_replacement_requires_exact_cutout_and_operator_authority(tmp_path):
+    watcher, _prompt, _retired = _terminal_same_task_rollover_fixture(tmp_path)
+    for updates in (
+        {"rolloverRecoveryTerminalReason": "OTHER"},
+        {"rolloverRecoveryTerminalReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT", "nextTaskId": "000081"},
+    ):
+        candidate = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+        candidate.state.update(watcher.state)
+        candidate.state.update(updates)
+        assert candidate.session_rollover._retire_terminal_same_task_transaction("000080", True) is False
+    assert watcher.session_rollover._retire_terminal_same_task_transaction("000080", False) is False
+
+
+def test_retired_transaction_token_cannot_satisfy_replacement(tmp_path):
+    watcher, _prompt, retired = _terminal_same_task_rollover_fixture(tmp_path)
+    assert watcher.session_rollover._retire_terminal_same_task_transaction("000080", True) is True
+
+    class Bridge:
+        def submit_result_bounded(self, _payload):
+            return None
+
+    assert watcher.session_rollover.request_if_due(
+        Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY",
+        allow_same_task_unsent_recovery=True,
+    ) is True
+    replacement = watcher.state["rolloverTransactionId"]
+    assert replacement != retired
+    assert watcher_module.handover_transaction_matches(
+        f"ARCHITECT_HANDOVER_READY\nRollover transaction ID: {retired}", replacement
+    ) is False
+    assert watcher_module.handover_transaction_matches(
+        f"Rollover transaction ID: {replacement}\nARCHITECT_HANDOVER_READY", replacement
+    ) is True
+
+
 @pytest.mark.parametrize(
     ("rollover_due", "rollover_trigger", "deferred_task"),
     [
