@@ -1742,18 +1742,36 @@ class ArchitectSessionRollover:
                 _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "ACTIVE_PID_INVALID", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
                 return False
         previous_transaction_id = str(self.watcher.state.get("rolloverTransactionId") or "").strip()
-        try:
-            generation = int(self.watcher.state.get("rolloverTransactionGeneration", 0) or 0)
-        except (TypeError, ValueError):
-            generation = 0
-        generation += 1
-        self.watcher.state["rolloverTransactionGeneration"] = generation
-        transaction_id = rollover_transaction_id(self.watcher.state, task_id)
         retired_transaction_id = str(self.watcher.state.get("rolloverRetiredTransactionId") or "").strip()
-        while transaction_id in {previous_transaction_id, retired_transaction_id}:
-            generation += 1
+        raw_generation = self.watcher.state.get("rolloverTransactionGeneration")
+        try:
+            persisted_generation = int(raw_generation)
+        except (TypeError, ValueError):
+            persisted_generation = 0
+        prepared_unsent = (
+            allow_same_task_unsent_recovery
+            and self.watcher.state.get("state") == "NEXT_PROMPT_READY"
+            and str(self.watcher.state.get("nextTaskId") or "") == task_id
+            and self.watcher.state.get("rolloverDue") is True
+            and self.watcher.state.get("rolloverPending") is True
+            and bool(previous_transaction_id)
+            and not isinstance(raw_generation, bool)
+            and persisted_generation > 0
+            and self.watcher.state.get("rolloverHandoverSendState") == "UNSENT"
+            and self.watcher.state.get("handoverRequested") is False
+            and previous_transaction_id != retired_transaction_id
+        )
+        if prepared_unsent:
+            generation = persisted_generation
+            transaction_id = previous_transaction_id
+        else:
+            generation = max(0, persisted_generation) + 1
             self.watcher.state["rolloverTransactionGeneration"] = generation
             transaction_id = rollover_transaction_id(self.watcher.state, task_id)
+            while transaction_id in {previous_transaction_id, retired_transaction_id}:
+                generation += 1
+                self.watcher.state["rolloverTransactionGeneration"] = generation
+                transaction_id = rollover_transaction_id(self.watcher.state, task_id)
         if previous_transaction_id and transaction_id != previous_transaction_id:
             # A deferred transaction is terminal authority.  Do not let its
             # response, candidate, or bootstrap evidence participate in the

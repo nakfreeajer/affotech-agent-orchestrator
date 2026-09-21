@@ -2608,6 +2608,75 @@ def test_retired_transaction_token_cannot_satisfy_replacement(tmp_path):
     ) is True
 
 
+def test_prepared_unsent_transaction_reused_after_real_restart_path(tmp_path, monkeypatch):
+    watcher, _prompt, retired = _terminal_same_task_rollover_fixture(tmp_path)
+    first = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    sent = []
+
+    class FailedBridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def submit_result_bounded(self, _payload):
+            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE")
+        def close(self): pass
+
+    failed_bridge = FailedBridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: failed_bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(first, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    prepared_id = first.state["rolloverTransactionId"]
+    prepared_generation = first.state["rolloverTransactionGeneration"]
+    assert prepared_id != retired
+    assert prepared_generation == 1
+    assert first.state["rolloverHandoverSendState"] == "UNSENT"
+
+    second = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert second._operator_restart_rollover_recovery_available is True
+
+    class RetryBridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def submit_result_bounded(self, payload):
+            persisted = json.loads(second.state_path.read_text(encoding="utf-8"))
+            sent.append((payload, persisted.get("rolloverTransactionId"), persisted.get("rolloverTransactionGeneration")))
+        def wait_for_new_response(self, *_args, **_kwargs): return {"state": "TIMEOUT", "text": ""}
+        def close(self): pass
+
+    retry_bridge = RetryBridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: retry_bridge))
+    assert watcher_module.service_deferred_rollover_once(second, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert len(sent) == 1
+    payload, persisted_id, persisted_generation = sent[0]
+    assert persisted_id == prepared_id
+    assert persisted_generation == prepared_generation
+    assert f"Rollover transaction ID: {prepared_id}" in payload
+    assert second.state["rolloverTransactionId"] == prepared_id
+    assert second.state["rolloverTransactionGeneration"] == prepared_generation
+
+
+def test_prepared_unsent_without_valid_generation_gets_new_identity(tmp_path):
+    watcher, _prompt, retired = _terminal_same_task_rollover_fixture(tmp_path)
+    watcher.state.update({
+        "rolloverTransactionId": "prepared-without-generation",
+        "rolloverTransactionTaskId": "000080",
+        "rolloverHandoverSendState": "UNSENT",
+        "handoverRequested": False,
+    })
+
+    class Bridge:
+        def submit_result_bounded(self, _payload): return None
+
+    assert watcher.session_rollover.request_if_due(
+        Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY",
+        allow_same_task_unsent_recovery=True,
+    ) is True
+    assert watcher.state["rolloverTransactionId"] != "prepared-without-generation"
+    assert watcher.state["rolloverTransactionId"] != retired
+    assert watcher.state["rolloverTransactionGeneration"] == 1
+
+
 @pytest.mark.parametrize(
     ("rollover_due", "rollover_trigger", "deferred_task"),
     [
