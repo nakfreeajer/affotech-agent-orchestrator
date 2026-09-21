@@ -2250,6 +2250,115 @@ def test_next_prompt_ready_deferred_rollover_enters_resident_passive_wait(tmp_pa
     assert watcher.state.get("humanRequiredReason") not in {"ARCHITECT_ROLLOVER_SAFETY_CUTOUT", "ROLLOVER_MAINTENANCE_DEFERRED"}
 
 
+def _live_reconciliation_backoff_state(watcher, prompt, *, now=100.0):
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000079", "lastCompletedTaskId": "000079",
+        "nextTaskId": "000080", "nextPromptPath": str(prompt), "rolloverDue": True,
+        "rolloverTrigger": "MEMORY_THRESHOLD", "rolloverPending": True,
+        "rolloverInProgress": True, "handoverRequested": True,
+        "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "RECONCILE_PENDING",
+        "rolloverRecoveryState": "RECOVERING", "rolloverRecoveryAttemptCount": 1,
+        "rolloverRecoveryStartedAt": now - 3.0, "rolloverRecoveryRetryAfter": now + 5.0,
+        "rolloverHandoverRecoveryDisposition": "RETRYABLE",
+        "rolloverAttemptedForTaskId": "000080",
+        "rolloverTransactionId": "TEST-TX-000080", "rolloverTransactionTaskId": "000080",
+        "architectConversationId": "OLD",
+    })
+    watcher.save()
+
+
+def test_reconciliation_backoff_is_wait_not_exhaustion_or_busy_loop(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    _live_reconciliation_backoff_state(watcher, prompt)
+    now = [100.0]
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now[0])
+    events = []
+    monkeypatch.setattr(watcher_module, "runtime_log", lambda *args, **kwargs: events.append((args[2], kwargs)))
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: (_ for _ in ()).throw(AssertionError("backoff must not attach"))))
+
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    names = [name for name, _fields in events]
+    assert "HANDOVER_RECONCILIATION_WAIT" in names
+    assert "HANDOVER_RECONCILIATION_EXHAUSTED" not in names
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert "rolloverDeferredForTaskId" not in watcher.state
+
+    sleeps = []
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(watcher, "_load_state", lambda: watcher.state)
+    service_calls = []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: service_calls.append(1) or False)
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+    assert service_calls == []
+    assert len(sleeps) == 1
+    assert 0 < sleeps[0] <= 2.0
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverInProgress"] is True
+    assert watcher.state["nextTaskId"] == "000080"
+
+
+def test_reconciliation_retry_deadline_allows_next_attempt(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    _live_reconciliation_backoff_state(watcher, prompt)
+    now = [106.0]
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now[0])
+    calls = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def _assistant_entries(self):
+            calls.append("reconcile")
+            return []
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert calls == ["reconcile"]
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 2
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert watcher.state["rolloverHandoverSendState"] == "AMBIGUOUS"
+
+
+@pytest.mark.parametrize("exhaustion", ["attempts", "window"])
+def test_reconciliation_true_exhaustion_defers_once(tmp_path, monkeypatch, exhaustion):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    _live_reconciliation_backoff_state(watcher, prompt)
+    if exhaustion == "attempts":
+        watcher.state["rolloverRecoveryAttemptCount"] = watcher_module.ROLLOVER_RECOVERY_MAX_ATTEMPTS
+    else:
+        watcher.state["rolloverRecoveryStartedAt"] = 0.0
+        watcher.state["rolloverRecoveryRetryAfter"] = 0.0
+    watcher.save()
+    now = [100.0 if exhaustion == "attempts" else watcher_module.ROLLOVER_RECOVERY_WINDOW_SECONDS + 100.0]
+    if exhaustion == "window":
+        watcher.state["rolloverRecoveryStartedAt"] = now[0] - watcher_module.ROLLOVER_RECOVERY_WINDOW_SECONDS - 1.0
+        watcher.save()
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now[0])
+    events = []
+    monkeypatch.setattr(watcher_module, "runtime_log", lambda *args, **kwargs: events.append((args[2], kwargs)))
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: (_ for _ in ()).throw(AssertionError("exhaustion must not attach"))))
+
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert watcher.state["rolloverMaintenanceState"] == "DEFERRED"
+    assert watcher.state["rolloverDeferredForTaskId"] == "000080"
+    exhausted = [fields for name, fields in events if name == "HANDOVER_RECONCILIATION_EXHAUSTED"]
+    assert len(exhausted) == 1
+    assert exhausted[0]["recoveryDisposition"] == watcher_module.ROLLOVER_RECOVERY_EXHAUSTED
+
+    # The terminal state is handled by the existing passive wait and cannot
+    # re-enter bounded recovery or emit another exhaustion event.
+    monkeypatch.setattr(watcher, "_load_state", lambda: watcher.state)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
+    exhausted = [name for name, _fields in events if name == "HANDOVER_RECONCILIATION_EXHAUSTED"]
+    assert len(exhausted) == 1
+
+
 def test_operator_restart_deferred_rollover_gets_one_attempt_then_successful_dispatch(tmp_path, monkeypatch):
     watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
     watcher.state.update({

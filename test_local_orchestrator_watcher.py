@@ -970,7 +970,7 @@ def test_rollover_recovery_accounting_records_successful_completion(tmp_path):
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     watcher.state.update({"rolloverDue": True, "rolloverPending": True, "taskId": "task-1"})
     rollover = ArchitectSessionRollover(watcher)
-    assert rollover._begin_bounded_recovery() is True
+    assert rollover._begin_bounded_recovery() == watcher_module.ROLLOVER_RECOVERY_ATTEMPT_ALLOWED
     assert watcher.state["rolloverRecoveryAttemptCount"] == 1
     rollover._record_recovery_success()
     assert watcher.state["rolloverRecoveryState"] == "COMPLETE"

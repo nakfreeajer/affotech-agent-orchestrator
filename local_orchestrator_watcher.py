@@ -36,6 +36,9 @@ ARCHITECT_MEMORY_SAFETY_CEILING_BYTES = ARCHITECT_MEMORY_THRESHOLD_BYTES * 2
 ROLLOVER_RECOVERY_MAX_ATTEMPTS = 2
 ROLLOVER_RECOVERY_WINDOW_SECONDS = 300.0
 ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS = 5.0
+ROLLOVER_RECOVERY_ATTEMPT_ALLOWED = "ATTEMPT_ALLOWED"
+ROLLOVER_RECOVERY_WAIT_BACKOFF = "WAIT_BACKOFF"
+ROLLOVER_RECOVERY_EXHAUSTED = "EXHAUSTED"
 ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS = 5.0
 FRESH_BOOTSTRAP_OBSERVATION_TIMEOUT_SECONDS = 2.0
 FRESH_BOOTSTRAP_OBSERVATION_POLL_SECONDS = 0.1
@@ -1475,8 +1478,8 @@ class ArchitectSessionRollover:
         self._next_memory_sample_at = now + ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS
         return self.sample_memory(memory_reader=memory_reader)
 
-    def _begin_bounded_recovery(self) -> bool:
-        """Acquire one durable, backoff-protected rollover recovery attempt."""
+    def _begin_bounded_recovery(self) -> str:
+        """Return ATTEMPT_ALLOWED, WAIT_BACKOFF, or EXHAUSTED."""
         state = self.watcher.state
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
@@ -1484,7 +1487,7 @@ class ArchitectSessionRollover:
         if state.get("humanRequiredReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT":
             if tracer:
                 tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "GATE", "DECISION", state, gate="safety_cutout", result="BLOCK", reason="terminal_cutout")
-            return False
+            return ROLLOVER_RECOVERY_EXHAUSTED
         now = time.time()
         started = float(state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
         if state.get("rolloverRecoveryState") == "COMPLETE":
@@ -1503,20 +1506,20 @@ class ArchitectSessionRollover:
         attempts = int(state.get("rolloverRecoveryAttemptCount", 0) or 0)
         if attempts >= ROLLOVER_RECOVERY_MAX_ATTEMPTS or now - started >= ROLLOVER_RECOVERY_WINDOW_SECONDS:
             self._enter_safety_cutout("ARCHITECT_ROLLOVER_SAFETY_CUTOUT")
-            return False
+            return ROLLOVER_RECOVERY_EXHAUSTED
         retry_after = float(state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
         if now < retry_after:
             if tracer:
-                tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "GATE", "DECISION", state, gate="rollover_retry_after", result="BLOCK", now=now, retryAfter=retry_after)
-            return False
+                tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "GATE", "DECISION", state, gate="rollover_retry_after", result=ROLLOVER_RECOVERY_WAIT_BACKOFF, now=now, retryAfter=retry_after)
+            return ROLLOVER_RECOVERY_WAIT_BACKOFF
         state["rolloverRecoveryAttemptCount"] = attempts + 1
         state["rolloverRecoveryLastAttemptAt"] = now
         state["rolloverRecoveryRetryAfter"] = now + ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS
         state["rolloverRecoveryState"] = "RECOVERING"
         self.watcher.save()
         if tracer:
-            tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "FUNCTION", "END", state, result=True, attemptCount=state.get("rolloverRecoveryAttemptCount"))
-        return True
+            tracer.record("ROLLOVER", "ArchitectSessionRollover._begin_bounded_recovery", "FUNCTION", "END", state, result=ROLLOVER_RECOVERY_ATTEMPT_ALLOWED, attemptCount=state.get("rolloverRecoveryAttemptCount"))
+        return ROLLOVER_RECOVERY_ATTEMPT_ALLOWED
 
     def _record_recovery_failure(self) -> None:
         state = self.watcher.state
@@ -5921,7 +5924,24 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         consume_operator_restart_recovery()
     rollover = watcher.session_rollover
     reconciliation_live_before_recovery = rollover.handover_reconciliation_pending()
-    if not rollover._begin_bounded_recovery():
+    recovery_disposition = rollover._begin_bounded_recovery()
+    if recovery_disposition == ROLLOVER_RECOVERY_WAIT_BACKOFF:
+        retry_after = float(watcher.state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
+        remaining = max(0.0, retry_after - time.time())
+        runtime_log(
+            getattr(watcher, "runtime_logger", None),
+            getattr(watcher, "runtime_run_id", None),
+            "HANDOVER_RECONCILIATION_WAIT",
+            watcher.state,
+            recoveryDisposition=ROLLOVER_RECOVERY_WAIT_BACKOFF,
+            attempts=int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0),
+            retryAfter=retry_after,
+            remainingBackoffSeconds=remaining,
+            handoverResent=False,
+        )
+        _trace_rollover_gate(watcher, boundary_state, "DEFER", "ROLLOVER_RECONCILIATION_BACKOFF", function="service_deferred_rollover_once")
+        return False
+    if recovery_disposition == ROLLOVER_RECOVERY_EXHAUSTED:
         if reconciliation_live_before_recovery:
             started = float(watcher.state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
             runtime_log(
@@ -5929,6 +5949,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 getattr(watcher, "runtime_run_id", None),
                 "HANDOVER_RECONCILIATION_EXHAUSTED",
                 watcher.state,
+                recoveryDisposition=ROLLOVER_RECOVERY_EXHAUSTED,
                 attempts=int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0),
                 elapsedSeconds=max(0.0, time.time() - started) if started else None,
                 reason=watcher.state.get("rolloverRecoveryTerminalReason") or "BOUNDED_RECOVERY_EXHAUSTED",
@@ -6150,17 +6171,71 @@ def deferred_rollover_passive_wait_required(watcher: LocalFirstOrchestrator) -> 
     )
 
 
+def reconciliation_backoff_wait_required(watcher: LocalFirstOrchestrator) -> bool:
+    """Return whether a live reconciliation is waiting for its retry deadline."""
+    state = watcher.state
+    retry_after = float(state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
+    return bool(
+        state.get("state") == "NEXT_PROMPT_READY"
+        and state.get("rolloverDue")
+        and state.get("rolloverPending")
+        and state.get("rolloverInProgress")
+        and state.get("handoverRequested")
+        and state.get("rolloverHandoverSendState") == "AMBIGUOUS"
+        and state.get("rolloverMaintenanceState") == "RECONCILE_PENDING"
+        and state.get("rolloverHandoverRecoveryDisposition") == "RETRYABLE"
+        and retry_after > time.time()
+    )
+
+
 def passive_deferred_rollover_wait(
     watcher: LocalFirstOrchestrator,
     logger: logging.Logger | None = None,
     run_id: str | None = None,
     poll_interval: float | None = None,
 ) -> bool:
-    """Sleep/reload once after deferred rollover, without retrying maintenance."""
-    if not deferred_rollover_passive_wait_required(watcher):
+    """Sleep/reload once after deferred rollover or reconciliation backoff."""
+    deferred_wait = deferred_rollover_passive_wait_required(watcher)
+    backoff_wait = reconciliation_backoff_wait_required(watcher)
+    if not deferred_wait and not backoff_wait:
         return False
     task_id = watcher.state.get("nextTaskId")
-    if getattr(watcher, "_rollover_passive_wait_logged_task", None) != task_id:
+    if backoff_wait:
+        retry_after = float(watcher.state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
+        remaining = max(0.0, retry_after - time.time())
+        interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+        wait_seconds = min(interval, remaining)
+        wait_marker = (task_id, retry_after)
+        if getattr(watcher, "_rollover_backoff_wait_logged", None) != wait_marker:
+            watcher._rollover_backoff_wait_logged = wait_marker
+            runtime_log(
+                logger,
+                run_id,
+                "HANDOVER_RECONCILIATION_WAIT",
+                watcher.state,
+                recoveryDisposition=ROLLOVER_RECOVERY_WAIT_BACKOFF,
+                attempts=int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0),
+                retryAfter=retry_after,
+                remainingBackoffSeconds=remaining,
+                handoverResent=False,
+            )
+            tracer = diagnostic_trace_for(watcher)
+            if tracer:
+                tracer.record(
+                    "ROLLOVER",
+                    "passive_deferred_rollover_wait",
+                    "HANDOVER_RECONCILIATION_WAIT",
+                    "DECISION",
+                    watcher.state,
+                    recoveryDisposition=ROLLOVER_RECOVERY_WAIT_BACKOFF,
+                    attempts=int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0),
+                    retryAfter=retry_after,
+                    remainingBackoffSeconds=remaining,
+                    handoverResent=False,
+                )
+    else:
+        wait_seconds = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+    if deferred_wait and getattr(watcher, "_rollover_passive_wait_logged_task", None) != task_id:
         watcher._rollover_passive_wait_logged_task = task_id
         runtime_log(
             logger,
@@ -6182,8 +6257,7 @@ def passive_deferred_rollover_wait(
                 reason="ROLLOVER_MAINTENANCE_DEFERRED",
                 nextTaskId=task_id,
             )
-    interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
-    time.sleep(interval)
+    time.sleep(wait_seconds)
     watcher.state = watcher._load_state()
     return True
 
