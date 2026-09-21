@@ -635,6 +635,153 @@ def test_service_reconciles_orphan_before_requesting_new_handover(tmp_path, monk
     assert len(calls) == 1
 
 
+def _prebudget_reconciliation_fixture(tmp_path, response, *, recovery_started=997.0,
+                                      recovery_attempts=1, retry_after=1005.0):
+    from local_orchestrator_watcher import LocalFirstOrchestrator
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    prompt = tmp_path / "000080.txt"
+    prompt.write_text("next prompt", encoding="utf-8")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000079", "lastCompletedTaskId": "000079",
+        "nextTaskId": "000080", "nextPromptPath": str(prompt), "rolloverDue": True,
+        "rolloverPending": True, "rolloverInProgress": True, "handoverRequested": True,
+        "handoverReady": False, "rolloverHandoverSendState": "ACKNOWLEDGED",
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverRecoveryState": "RECOVERING",
+        "rolloverHandoverRecoveryDisposition": "RETRYABLE",
+        "rolloverHandoverRecoveryReason": "ARCHITECT_HANDOVER_NOT_FOUND",
+        "rolloverRecoveryStartedAt": recovery_started, "rolloverRecoveryAttemptCount": recovery_attempts,
+        "rolloverRecoveryRetryAfter": retry_after, "rolloverTransactionId": "2b324cd32cefc00ef1790c36",
+        "rolloverTransactionGeneration": 2, "rolloverTransactionTaskId": "000080",
+        "rolloverAttemptedForTaskId": "000080", "architectConversationId": "6ab08bd2-7140-83ec-813b-8501af0993f5",
+    })
+    watcher.save()
+    return watcher, prompt
+
+
+class _PrebudgetBridge:
+    class _Page:
+        url = "https://chatgpt.com/c/6ab08bd2-7140-83ec-813b-8501af0993f5"
+
+    def __init__(self, response):
+        self.page = self._Page()
+        self.response = response
+        self.assistant_entries_calls = 0
+        self.close_calls = 0
+        self.send_calls = 0
+
+    def _assistant_entries(self):
+        self.assistant_entries_calls += 1
+        return ([{"id": "existing", "text": self.response}] if self.response is not None else [])
+
+    def assistant_baseline(self):
+        return {"count": 0, "text_hash": "baseline", "entries": []}
+
+    def generation_visible(self):
+        return False
+
+    def close(self):
+        self.close_calls += 1
+
+
+def _run_prebudget_case(tmp_path, monkeypatch, response, *, now=1000.0,
+                        recovery_started=997.0, recovery_attempts=1, retry_after=1005.0):
+    watcher, prompt = _prebudget_reconciliation_fixture(
+        tmp_path, response, recovery_started=recovery_started,
+        recovery_attempts=recovery_attempts, retry_after=retry_after,
+    )
+    bridge = _PrebudgetBridge(response)
+    attaches, processed = [], []
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now)
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach",
+                        staticmethod(lambda *_args: attaches.append(bridge) or bridge))
+    monkeypatch.setattr(watcher, "process_pending_handover_response",
+                        lambda _bridge, text: processed.append(text) or bool(response))
+    monkeypatch.setattr(watcher.session_rollover, "request_if_due",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            AssertionError("pre-budget reconciliation must not send")))
+    result = watcher_module.service_deferred_rollover_once(
+        watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY")
+    return watcher, prompt, bridge, attaches, processed, result
+
+
+def test_prebudget_probe_consumes_exact_response_before_exhaustion(tmp_path, monkeypatch):
+    response = "document\nRollover transaction ID: 2b324cd32cefc00ef1790c36\nARCHITECT_HANDOVER_READY"
+    watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(
+        tmp_path, monkeypatch, response, recovery_started=0.0, recovery_attempts=2, retry_after=0.0)
+    assert result is True
+    assert processed == [response]
+    assert len(attaches) == 1 and bridge.close_calls == 1
+    assert watcher.state["rolloverTransactionId"] == "2b324cd32cefc00ef1790c36"
+    assert watcher.state["rolloverTransactionGeneration"] == 2
+    assert watcher.state["rolloverRecoveryState"] == "COMPLETE"
+
+
+def test_prebudget_probe_consumes_exact_response_during_backoff(tmp_path, monkeypatch):
+    response = "document\nRollover transaction ID: 2b324cd32cefc00ef1790c36\nARCHITECT_HANDOVER_READY"
+    watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(tmp_path, monkeypatch, response)
+    assert result is True
+    assert processed == [response]
+    assert len(attaches) == 1 and bridge.close_calls == 1
+    assert watcher.state["rolloverRecoveryState"] == "COMPLETE"
+
+
+def test_prebudget_probe_preserves_exhaustion_without_response(tmp_path, monkeypatch):
+    watcher, prompt, bridge, attaches, processed, result = _run_prebudget_case(
+        tmp_path, monkeypatch, None, recovery_started=699.0, recovery_attempts=2, retry_after=0.0)
+    assert result is False and processed == []
+    assert len(attaches) == 1 and bridge.close_calls == 1
+    assert watcher.state["rolloverMaintenanceState"] == "DEFERRED"
+    assert watcher.state["rolloverRecoveryState"] == "DEFERRED"
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["nextTaskId"] == "000080"
+    assert prompt.read_text(encoding="utf-8") == "next prompt"
+
+
+def test_prebudget_probe_preserves_backoff_without_response(tmp_path, monkeypatch):
+    watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(tmp_path, monkeypatch, None)
+    assert result is False and processed == []
+    assert len(attaches) == 1 and bridge.close_calls == 1
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 1
+    assert watcher.state["rolloverRecoveryRetryAfter"] == 1005.0
+
+
+@pytest.mark.parametrize("wrong_token", ["768df22312ef1a5c0f86a9ea", "8084c3b80c13ebccb27d52c4"])
+def test_prebudget_probe_rejects_wrong_or_missing_transaction_token(tmp_path, monkeypatch, wrong_token):
+    response = f"document\nRollover transaction ID: {wrong_token}\nARCHITECT_HANDOVER_READY"
+    watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(
+        tmp_path, monkeypatch, response, recovery_started=699.0, recovery_attempts=2, retry_after=0.0)
+    assert result is False and processed == []
+    assert len(attaches) == 1 and bridge.close_calls == 1
+    assert watcher.state["rolloverMaintenanceState"] == "DEFERRED"
+
+
+def test_prebudget_probe_rejects_ready_without_transaction_token(tmp_path, monkeypatch):
+    response = "document\nARCHITECT_HANDOVER_READY"
+    watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(
+        tmp_path, monkeypatch, response, recovery_started=699.0, recovery_attempts=2, retry_after=0.0)
+    assert result is False and processed == []
+    assert len(attaches) == 1 and bridge.close_calls == 1
+    assert watcher.state["rolloverMaintenanceState"] == "DEFERRED"
+
+
+def test_prebudget_probe_skipped_for_non_live_transaction(tmp_path, monkeypatch):
+    from local_orchestrator_watcher import LocalFirstOrchestrator
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    prompt = tmp_path / "000080.txt"
+    prompt.write_text("next prompt", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+                          "nextPromptPath": str(prompt), "rolloverDue": False, "rolloverPending": True,
+                          "handoverRequested": False, "architectConversationId": "old"})
+    watcher.save()
+    attaches = []
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach",
+                        staticmethod(lambda *_args: attaches.append(1)))
+    assert watcher_module.service_deferred_rollover_once(
+        watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert attaches == []
+
+
 def test_conclusive_unsent_handover_remains_retryable(tmp_path):
     from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())

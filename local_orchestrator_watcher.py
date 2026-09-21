@@ -39,6 +39,7 @@ ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS = 5.0
 ROLLOVER_RECOVERY_ATTEMPT_ALLOWED = "ATTEMPT_ALLOWED"
 ROLLOVER_RECOVERY_WAIT_BACKOFF = "WAIT_BACKOFF"
 ROLLOVER_RECOVERY_EXHAUSTED = "EXHAUSTED"
+_HANDOVER_RESPONSE_UNSET = object()
 ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS = 5.0
 FRESH_BOOTSTRAP_OBSERVATION_TIMEOUT_SECONDS = 2.0
 FRESH_BOOTSTRAP_OBSERVATION_POLL_SECONDS = 0.1
@@ -1966,7 +1967,22 @@ class ArchitectSessionRollover:
             emit("STATE=ROLLOVER_PENDING")
             return False
 
-    def reconcile_pending_handover(self, bridge: "ArchitectPlaywright") -> bool:
+    def _read_existing_handover_response(self, bridge: "ArchitectPlaywright", transaction_id: str | None = None) -> str | None:
+        """Read an existing semantic handover response without waiting or sending."""
+        entries = bridge._assistant_entries()
+        return next(
+            (
+                entry.get("text")
+                for entry in reversed(entries)
+                if isinstance(entry, dict)
+                and isinstance(entry.get("text"), str)
+                and architect_handover_ready(entry["text"])
+                and (transaction_id is None or handover_transaction_matches(entry["text"], transaction_id))
+            ),
+            None,
+        )
+
+    def reconcile_pending_handover(self, bridge: "ArchitectPlaywright", existing_handover: Any = _HANDOVER_RESPONSE_UNSET) -> bool:
         """Consume an already-visible handover for an outstanding rollover."""
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
@@ -1984,17 +2000,17 @@ class ArchitectSessionRollover:
             return False
         reconstructed_handover = False
         handover = self.watcher.state.get("pending_handover")
-        if not isinstance(handover, str) or not architect_handover_ready(handover):
+        if existing_handover is not _HANDOVER_RESPONSE_UNSET:
+            if not isinstance(handover, str) or not architect_handover_ready(handover):
+                handover = existing_handover
+        elif not isinstance(handover, str) or not architect_handover_ready(handover):
             try:
-                entries = bridge._assistant_entries()
+                handover = self._read_existing_handover_response(bridge)
             except Exception:
                 self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_HISTORY_UNAVAILABLE")
                 return False
-            handover = next((entry.get("text") for entry in reversed(entries)
-                             if isinstance(entry, dict) and isinstance(entry.get("text"), str)
-                             and architect_handover_ready(entry["text"])), None)
             if tracer:
-                tracer.record("HANDOVER", "reconcile_pending_handover", "HANDOVER_RESPONSE_CLASSIFICATION", "DECISION", self.watcher.state, found=bool(handover), entryCount=len(entries))
+                tracer.record("HANDOVER", "reconcile_pending_handover", "HANDOVER_RESPONSE_CLASSIFICATION", "DECISION", self.watcher.state, found=bool(handover))
         if not isinstance(handover, str) or not architect_handover_ready(handover):
             self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_NOT_FOUND")
             return False
@@ -6105,7 +6121,17 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     next_task_id = str(watcher.state.get("nextTaskId") or "")
     restart_recovery_available = bool(getattr(watcher, "_operator_restart_rollover_recovery_available", False))
     bridge = None
+    def close_bridge() -> None:
+        nonlocal bridge
+        if bridge is not None:
+            try:
+                bridge.close()
+            except Exception:
+                pass
+            bridge = None
     terminal_delivered_recovered = False
+    prebudget_probe_performed = False
+    prebudget_existing_response = None
     terminal_candidate = watcher.session_rollover._terminal_same_task_transaction_eligible(
         next_task_id, restart_recovery_available
     )
@@ -6157,6 +6183,60 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     elif (terminal_retired or stale_retired) and restart_recovery_available:
         consume_operator_restart_recovery()
     rollover = watcher.session_rollover
+    live_transaction = (
+        watcher.state.get("rolloverDue") is True
+        and watcher.state.get("rolloverPending") is True
+        and watcher.state.get("handoverRequested") is True
+        and watcher.state.get("rolloverTransactionId")
+        and str(watcher.state.get("rolloverTransactionTaskId") or "") == next_task_id
+        and watcher.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
+        and watcher.state.get("rolloverMaintenanceState") in {"IN_PROGRESS", "RECONCILE_PENDING"}
+        and (
+            watcher.state.get("rolloverInProgress") is True
+            or watcher.state.get("rolloverMaintenanceState") == "RECONCILE_PENDING"
+        )
+        and bool(watcher.state.get("architectConversationId"))
+    )
+    if live_transaction:
+        if bridge is None:
+            try:
+                conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+                bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            except Exception:
+                bridge = None
+        existing_response = None
+        if bridge is not None:
+            try:
+                prebudget_probe_performed = True
+                existing_response = rollover._read_existing_handover_response(
+                    bridge, watcher.state.get("rolloverTransactionId")
+                )
+            except Exception:
+                existing_response = None
+        prebudget_existing_response = existing_response
+        exact_existing_response = bool(
+            existing_response
+            and handover_transaction_matches(existing_response, watcher.state.get("rolloverTransactionId"))
+        )
+        runtime_log(
+            getattr(watcher, "runtime_logger", None),
+            getattr(watcher, "runtime_run_id", None),
+            "HANDOVER_RECONCILIATION_PRE_BUDGET_PROBE",
+            watcher.state,
+            transactionId=watcher.state.get("rolloverTransactionId"),
+            readOnly=True,
+            responseFound=bool(existing_response),
+            transactionMatched=exact_existing_response,
+            handoverResent=False,
+        )
+        if exact_existing_response:
+            try:
+                if watcher.process_pending_handover_response(bridge, existing_response):
+                    rollover._record_recovery_success()
+                    return True
+                return False
+            finally:
+                close_bridge()
     reconciliation_live_before_recovery = rollover.handover_reconciliation_pending()
     recovery_disposition = rollover._begin_bounded_recovery()
     if recovery_disposition == ROLLOVER_RECOVERY_WAIT_BACKOFF:
@@ -6174,6 +6254,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             handoverResent=False,
         )
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "ROLLOVER_RECONCILIATION_BACKOFF", function="service_deferred_rollover_once")
+        close_bridge()
         return False
     if recovery_disposition == ROLLOVER_RECOVERY_EXHAUSTED:
         if reconciliation_live_before_recovery:
@@ -6191,12 +6272,13 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         if tracer:
             tracer.record("ROLLOVER", "service_deferred_rollover_once", "GATE", "DECISION", watcher.state, gate="bounded_recovery", result="BLOCK", reason="backoff_or_terminal")
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
+        close_bridge()
         return False
     _trace_rollover_gate(watcher, boundary_state, "ATTEMPT", "ROLLOVER_DUE_SAFE_BOUNDARY", function="service_deferred_rollover_once")
     def failed() -> bool:
         rollover._record_recovery_failure()
         return False
-    def reconcile_pending(bridge: Any) -> bool:
+    def reconcile_pending(bridge: Any, use_prebudget_result: bool = False) -> bool:
         """Reconcile one existing transaction without ever resending it."""
         attempt = int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0)
         transaction_id = watcher.state.get("rolloverTransactionId")
@@ -6246,7 +6328,8 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             readOnly=True,
             handoverResent=False,
         )
-        result = rollover.reconcile_pending_handover(bridge)
+        observed_handover = prebudget_existing_response if use_prebudget_result else _HANDOVER_RESPONSE_UNSET
+        result = rollover.reconcile_pending_handover(bridge, observed_handover)
         disposition = "SUCCESS" if result else watcher.state.get("rolloverHandoverRecoveryDisposition")
         if disposition not in {"RETRYABLE", "HUMAN_REQUIRED"}:
             disposition = "RETRYABLE" if rollover.handover_reconciliation_pending() else "EXHAUSTED"
@@ -6273,7 +6356,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         legacy_task = str(watcher.state.get("taskId") or "")
         if (watcher.state.get("rolloverPending") and task_id
                 and watcher.state.get("rolloverAttemptedForTaskId") in {task_id, legacy_task}):
-            if reconcile_pending(bridge):
+            if reconcile_pending(bridge, prebudget_probe_performed):
                 rollover._record_recovery_success()
                 return True
             if (watcher.state.get("handoverRequested")
@@ -6316,7 +6399,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                     handoverResent=False,
                     maintenanceState=watcher.state.get("rolloverMaintenanceState"),
                 )
-                if reconcile_pending(bridge):
+                if reconcile_pending(bridge, prebudget_probe_performed):
                     rollover._record_recovery_success()
                     return True
                 # The send may have succeeded even though its acknowledgement
