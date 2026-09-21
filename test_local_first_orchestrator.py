@@ -339,6 +339,96 @@ def test_passive_probe_cleanup_failure_is_workflow_neutral(tmp_path, monkeypatch
     assert watcher.state.get("humanRequiredReason") is None
 
 
+def test_remote_control_canonicalization_does_not_publish_memory_reader(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    identity = "11111111-1111-1111-1111-111111111111"
+    main_reader = lambda: 700 * 1024 * 1024
+    watcher.architect_memory_reader = main_reader
+    watcher.architect_memory_reader_thread_id = threading.get_ident()
+    bridge = type("RemoteBridge", (), {
+        "page": _AckPage("https://chatgpt.com/c/" + identity),
+        "current_session_memory_bytes": lambda self: 1500 * 1024 * 1024,
+    })()
+    assert watcher_module.canonicalize_attached_architect_conversation(
+        watcher, bridge, identity, bind_memory=False
+    ) == identity
+    assert watcher.architect_memory_reader is main_reader
+    assert watcher.architect_memory_reader_thread_id == threading.get_ident()
+
+
+def test_main_thread_canonicalization_binds_reader_owner(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    identity = "22222222-2222-2222-2222-222222222222"
+    bridge = type("MainBridge", (), {
+        "page": _AckPage("https://chatgpt.com/c/" + identity),
+        "current_session_memory_bytes": lambda self: 700 * 1024 * 1024,
+    })()
+    assert watcher_module.canonicalize_attached_architect_conversation(watcher, bridge, identity) == identity
+    assert watcher.architect_memory_reader is not None
+    assert watcher.architect_memory_reader_thread_id == threading.get_ident()
+
+
+def test_cross_thread_memory_reader_is_rejected_and_logged(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    logger, records = runtime_event_capture()
+    watcher.runtime_logger = logger
+    owner_calls = {"count": 0}
+
+    def owner_reader():
+        owner_calls["count"] += 1
+        return 700 * 1024 * 1024
+
+    owner_thread_id = {}
+    def bind_on_owner_thread():
+        watcher.bind_architect_session_memory(type("OwnerBridge", (), {"current_session_memory_bytes": owner_reader})(), "ARCH-OLD")
+        owner_thread_id["id"] = threading.get_ident()
+
+    owner_thread = threading.Thread(target=bind_on_owner_thread, name="synthetic-playwright-owner")
+    owner_thread.start()
+    owner_thread.join()
+    assert owner_thread_id["id"] != threading.get_ident()
+    assert watcher.session_rollover.sample_memory() is None
+    assert owner_calls["count"] == 0
+    assert any(record.event == "ARCHITECT_MEMORY_SAMPLE_SKIPPED" and
+               "skipReason=MEMORY_READER_THREAD_MISMATCH" in record.getMessage()
+               for record in records)
+
+
+def test_cross_thread_reader_falls_back_to_main_thread_passive_probe(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+                          "discussionPauseActive": True, "rolloverDue": False,
+                          "architectConversationId": "ARCH-OLD"})
+    watcher.save()
+    owner_calls = {"count": 0}
+    main_calls = {"count": 0}
+
+    def owner_reader():
+        owner_calls["count"] += 1
+        return 700 * 1024 * 1024
+
+    def bind_on_owner_thread():
+        watcher.bind_architect_session_memory(type("OwnerBridge", (), {"current_session_memory_bytes": owner_reader})(), "ARCH-OLD")
+
+    owner_thread = threading.Thread(target=bind_on_owner_thread, name="synthetic-playwright-owner")
+    owner_thread.start()
+    owner_thread.join()
+
+    class MainBridge:
+        def current_session_memory_bytes(self):
+            main_calls["count"] += 1
+            return 1500 * 1024 * 1024
+        def close(self): pass
+
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: MainBridge()))
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
+    assert owner_calls["count"] == 0
+    assert main_calls["count"] == 1
+    assert watcher.state["architectMemoryBytes"] == 1500 * 1024 * 1024
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
+
+
 def recovery_fixture(tmp_path):
     base, config, head = configured_git_project(tmp_path)
     root = tmp_path / "orchestrator"

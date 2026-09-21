@@ -748,7 +748,12 @@ def architect_conversation_ids_equivalent(left: str, right: str) -> bool:
     return str(left or "") == str(right or "") or canonical_architect_conversation_id(left) == canonical_architect_conversation_id(right)
 
 
-def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requested_id: str | None) -> str:
+def canonicalize_attached_architect_conversation(
+    watcher: Any,
+    bridge: Any,
+    requested_id: str | None,
+    bind_memory: bool = True,
+) -> str:
     """Validate an attached page and persist its actual URL representation."""
     bridge.runtime_logger = getattr(watcher, "runtime_logger", None)
     bridge.runtime_run_id = getattr(watcher, "runtime_run_id", None)
@@ -768,9 +773,10 @@ def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requ
         watcher.state["architectConversationId"] = actual_id
         watcher.save()
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_CONVERSATION_ID_CANONICALIZED", watcher.state, **{"from": requested_id, "to": actual_id})
-    bind_memory = getattr(watcher, "bind_architect_session_memory", None)
-    if callable(bind_memory):
-        bind_memory(bridge, actual_id)
+    if bind_memory:
+        bind_memory_reader = getattr(watcher, "bind_architect_session_memory", None)
+        if callable(bind_memory_reader):
+            bind_memory_reader(bridge, actual_id)
     if tracer:
         tracer.record("ROLLOVER", "canonicalize_attached_architect_conversation", "FUNCTION", "END", getattr(watcher, "state", {}), durationMs=(time.monotonic() - started) * 1000, requestedConversationId=requested_id, actualConversationId=actual_id, result=True)
     return actual_id
@@ -1348,6 +1354,7 @@ class ArchitectSessionRollover:
 
     def initialize_current_session(self) -> None:
         self.watcher.architect_memory_reader = None
+        self.watcher.architect_memory_reader_thread_id = None
         self.watcher.architect_memory_session_id = None
         self.watcher.state["architectResponseCount"] = 0
         self.watcher.state["handoverRequested"] = False
@@ -1363,9 +1370,14 @@ class ArchitectSessionRollover:
         """Sample only the explicitly governed Architect process tree."""
         tracer = diagnostic_trace_for(self.watcher)
         started = time.monotonic()
+        bound_reader = getattr(self.watcher, "architect_memory_reader", None)
+        reader_owner_thread_id = getattr(self.watcher, "architect_memory_reader_thread_id", None)
+        current_thread_id = threading.get_ident()
+        reader_ownership_valid = not callable(bound_reader) or not reader_owner_thread_id or reader_owner_thread_id == current_thread_id
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_TICK", self.watcher.state,
                     taskId=self.watcher.state.get("taskId"), architectConversationId=self.watcher.state.get("architectConversationId"),
                     discussionPauseActive=bool(self.watcher.state.get("discussionPauseActive")), memoryReaderBound=bool(memory_reader or getattr(self.watcher, "architect_memory_reader", None)),
+                    readerOwnerThreadId=reader_owner_thread_id, currentThreadId=current_thread_id, readerOwnershipValid=reader_ownership_valid,
                     sampleAttempted=True, rendererPid=self.watcher.state.get("architectMemoryRendererPid", "UNAVAILABLE_AT_LAYER"), thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
                     thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB)
         if tracer:
@@ -1376,7 +1388,12 @@ class ArchitectSessionRollover:
             if tracer:
                 tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_SKIPPED", "SKIP", self.watcher.state, reason="SAFETY_CUTOUT", durationMs=(time.monotonic() - started) * 1000)
             return None
-        reader = memory_reader or getattr(self.watcher, "architect_memory_reader", None)
+        if memory_reader is None and callable(bound_reader) and not reader_ownership_valid:
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_SKIPPED", self.watcher.state,
+                        skipReason="MEMORY_READER_THREAD_MISMATCH", readerOwnerThreadId=reader_owner_thread_id,
+                        currentThreadId=current_thread_id, workflowMutation=False)
+            return None
+        reader = memory_reader or bound_reader
         if reader is None:
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_SKIPPED", self.watcher.state,
                         skipReason="MEMORY_READER_UNBOUND", memoryReaderBound=False, sampleAttempted=False, workflowMutation=False, rendererPid="UNAVAILABLE_AT_LAYER")
@@ -3317,6 +3334,7 @@ class LocalWatcher:
             self.state["architectResponseCount"] = 0
         self.loop_guard = LoopGuard(self.state)
         self.architect_memory_reader = None
+        self.architect_memory_reader_thread_id = None
         self.architect_memory_session_id = None
         self.state.pop("architectMemoryBytes", None)
         self.state.pop("architectMemoryMiB", None)
@@ -3338,12 +3356,16 @@ class LocalWatcher:
         if not callable(reader):
             return False
         self.architect_memory_reader = reader
+        self.architect_memory_reader_thread_id = threading.get_ident()
         self.architect_memory_session_id = conversation_id
         self.state["architectMemoryOwnership"] = "SESSION_SCOPED"
         self.state["architectMemoryOwnershipSource"] = "ARCHITECT_PAGE_RENDERER"
         if conversation_id:
             self.state["architectMemorySessionId"] = conversation_id
         self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_MEMORY_READER_BIND", self.state,
+                    conversationId=conversation_id, ownerThreadId=self.architect_memory_reader_thread_id,
+                    ownerThreadName=threading.current_thread().name, source="ARCHITECT_PAGE_RENDERER")
         return True
 
     def startup_candidate(self, bridge: ArchitectPlaywright, scan_history: bool = True, emit: Callable[[str], None] | None = None) -> str | None:
@@ -3935,6 +3957,7 @@ class LocalFirstOrchestrator:
         self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
         self.state.setdefault("executorSessionMode", "PERSISTENT")
         self.architect_memory_reader = None
+        self.architect_memory_reader_thread_id = None
         self.architect_memory_session_id = None
         self.memory_ownership_required = False
         if self.state.get("architectMemoryOwnership") != "SESSION_SCOPED":
@@ -3955,12 +3978,16 @@ class LocalFirstOrchestrator:
         if not actual_id:
             actual_id = architect_conversation_id_from_url(str(getattr(getattr(bridge, "page", None), "url", "")))
         self.architect_memory_reader = reader
+        self.architect_memory_reader_thread_id = threading.get_ident()
         self.architect_memory_session_id = actual_id
         self.state["architectMemoryOwnership"] = "SESSION_SCOPED"
         self.state["architectMemoryOwnershipSource"] = "ARCHITECT_PAGE_RENDERER"
         self.state["architectMemorySessionId"] = actual_id
         self.state.pop("architectMemoryError", None)
         self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_MEMORY_READER_BIND", self.state,
+                    conversationId=actual_id, ownerThreadId=self.architect_memory_reader_thread_id,
+                    ownerThreadName=threading.current_thread().name, source="ARCHITECT_PAGE_RENDERER")
         return True
 
     def bind_architect_memory_owner(self, endpoint: str, emit: Callable[[str], None] = print) -> int:
@@ -5542,7 +5569,9 @@ class RemoteDiscussionControlMonitor:
     def establish_startup_baseline(self, bridge: Any | None = None) -> None:
         self.bridge = bridge or self.bridge_factory()
         requested_id = self.watcher.state.get("architectConversationId")
-        self._conversation_id = canonicalize_attached_architect_conversation(self.watcher, self.bridge, requested_id)
+        self._conversation_id = canonicalize_attached_architect_conversation(
+            self.watcher, self.bridge, requested_id, bind_memory=False
+        )
         messages = self._messages(self.bridge)
         self._cursor = self._identity(messages[-1], len(messages) - 1) if messages else None
         count_reader = getattr(self.bridge, "control_user_message_count", None)
@@ -6134,6 +6163,20 @@ def passive_architect_memory_sample_for_pause(
     bridge = existing_bridge
     temporary_bridge = False
     reader = getattr(watcher, "architect_memory_reader", None)
+    reader_owner_thread_id = getattr(watcher, "architect_memory_reader_thread_id", None)
+    current_thread_id = threading.get_ident()
+    if callable(reader) and reader_owner_thread_id and reader_owner_thread_id != current_thread_id:
+        runtime_log(
+            getattr(watcher, "runtime_logger", None),
+            getattr(watcher, "runtime_run_id", None),
+            "ARCHITECT_MEMORY_SAMPLE_SKIPPED",
+            watcher.state,
+            skipReason="MEMORY_READER_THREAD_MISMATCH",
+            readerOwnerThreadId=reader_owner_thread_id,
+            currentThreadId=current_thread_id,
+            workflowMutation=False,
+        )
+        reader = None
     try:
         if not callable(reader) and bridge is None:
             conversation_id = (
