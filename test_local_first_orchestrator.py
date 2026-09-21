@@ -149,6 +149,109 @@ def test_result_and_handover_instrumentation_logs_decisions_without_bodies(tmp_p
     assert "synthetic staged task" not in rendered
 
 
+@pytest.mark.parametrize("workflow_state", ["NEXT_PROMPT_READY", "RESULT_READY", "IDLE"])
+def test_paused_workflow_still_samples_architect_memory_without_actions(tmp_path, monkeypatch, workflow_state):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "state": workflow_state,
+        "taskId": "000079",
+        "nextTaskId": "000080",
+        "discussionPauseActive": True,
+        "rolloverDue": False,
+        "architectConversationId": "ARCH-OLD",
+    })
+    watcher.save()
+    calls = {"attach": 0, "close": 0, "send": 0, "navigate": 0, "new_page": 0}
+
+    class ReadOnlyBridge:
+        def current_session_memory_bytes(self):
+            return 700 * 1024 * 1024
+        def close(self):
+            calls["close"] += 1
+        def submit_result_bounded(self, _payload):
+            calls["send"] += 1
+        def goto(self, _url):
+            calls["navigate"] += 1
+
+    def attach(_endpoint, _conversation_id):
+        calls["attach"] += 1
+        return ReadOnlyBridge()
+
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
+    assert watcher.state["architectMemoryBytes"] == 700 * 1024 * 1024
+    assert watcher.state["rolloverDue"] is False
+    assert calls == {"attach": 1, "close": 1, "send": 0, "navigate": 0, "new_page": 0}
+    assert watcher.state["state"] == workflow_state
+    assert watcher.state["discussionPauseActive"] is True
+
+
+def test_paused_memory_crossing_sets_due_without_workflow_action(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+        "discussionPauseActive": True, "rolloverDue": False, "architectConversationId": "ARCH-OLD",
+    })
+    watcher.save()
+    memory = {"bytes": 700 * 1024 * 1024}
+    calls = {"attach": 0, "close": 0, "send": 0, "navigate": 0, "new_page": 0}
+
+    class ReadOnlyBridge:
+        def current_session_memory_bytes(self):
+            return memory["bytes"]
+        def close(self):
+            calls["close"] += 1
+        def submit_result_bounded(self, _payload):
+            calls["send"] += 1
+        def goto(self, _url):
+            calls["navigate"] += 1
+
+    def attach(_endpoint, _conversation_id):
+        calls["attach"] += 1
+        return ReadOnlyBridge()
+
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
+    for value in (700, 1500, 1500):
+        watcher.session_rollover._next_memory_sample_at = 0
+        memory["bytes"] = value * 1024 * 1024
+        assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
+
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["taskId"] == "000079"
+    assert watcher.state["nextTaskId"] == "000080"
+    assert watcher.state["discussionPauseActive"] is True
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
+    assert calls == {"attach": 3, "close": 3, "send": 0, "navigate": 0, "new_page": 0}
+
+
+def test_paused_memory_cooldown_and_reader_failure_are_workflow_neutral(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+                          "discussionPauseActive": True, "rolloverDue": False})
+    watcher.save()
+    calls = {"attach": 0, "close": 0}
+
+    class FailingBridge:
+        def current_session_memory_bytes(self):
+            raise RuntimeError("SYNTHETIC_MEMORY_FAILURE")
+        def close(self):
+            calls["close"] += 1
+
+    def attach(_endpoint, _conversation_id):
+        calls["attach"] += 1
+        return FailingBridge()
+
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
+    before = {key: watcher.state.get(key) for key in ("state", "taskId", "nextTaskId", "discussionPauseActive", "rolloverDue")}
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is False
+    after = {key: watcher.state.get(key) for key in before}
+    assert after == before
+    assert watcher.state.get("humanRequiredReason") is None
+    assert calls == {"attach": 1, "close": 1}
+
+
 def recovery_fixture(tmp_path):
     base, config, head = configured_git_project(tmp_path)
     root = tmp_path / "orchestrator"

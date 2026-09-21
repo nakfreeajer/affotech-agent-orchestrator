@@ -1428,7 +1428,7 @@ class ArchitectSessionRollover:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_END", "END", self.watcher.state, durationMs=(time.monotonic() - started) * 1000, memoryBytes=memory_bytes, memoryMiB=round(memory_bytes / (1024 * 1024), 2), rolloverDueBefore=bool(previous_memory_bytes and previous_memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES), rolloverDueAfter=bool(self.watcher.state.get("rolloverDue")), rootPid=os.environ.get("ARCHITECT_BROWSER_ROOT_PID"))
         return trigger
 
-    def sample_memory_for_loop(self) -> str | None:
+    def sample_memory_for_loop(self, memory_reader: Callable[[], int] | None = None) -> str | None:
         """Throttle main-loop telemetry without changing direct sampling semantics."""
         now = time.monotonic()
         if now < self._next_memory_sample_at:
@@ -1439,7 +1439,7 @@ class ArchitectSessionRollover:
                 tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory_for_loop", "MEMORY_SAMPLE_SKIPPED", "SKIP", self.watcher.state, reason="COOLDOWN", retryAfter=self._next_memory_sample_at)
             return None
         self._next_memory_sample_at = now + ROLLOVER_MEMORY_SAMPLE_COOLDOWN_SECONDS
-        return self.sample_memory()
+        return self.sample_memory(memory_reader=memory_reader)
 
     def _begin_bounded_recovery(self) -> bool:
         """Acquire one durable, backoff-protected rollover recovery attempt."""
@@ -6095,6 +6095,89 @@ def passive_human_required_wait(watcher: LocalFirstOrchestrator, poll_interval: 
     return watcher.state.get("state", "HUMAN_REQUIRED")
 
 
+def passive_architect_memory_sample_for_pause(
+    watcher: LocalFirstOrchestrator,
+    endpoint: str,
+    existing_bridge: ArchitectPlaywright | None = None,
+) -> bool:
+    """Sample the current Architect renderer without allowing workflow actions.
+
+    A bound reader is reused.  When none is bound, this makes one temporary
+    read-only attachment to the persisted Architect conversation and closes
+    only that bridge after the sample.  It deliberately does not canonicalize,
+    navigate, send, create a page, or change Architect authority.
+    """
+    rollover = getattr(watcher, "session_rollover", None)
+    if rollover is None:
+        return False
+    if time.monotonic() < rollover._next_memory_sample_at:
+        rollover.sample_memory_for_loop()
+        return False
+
+    bridge = existing_bridge
+    temporary_bridge = False
+    reader = getattr(watcher, "architect_memory_reader", None)
+    try:
+        if not callable(reader) and bridge is None:
+            conversation_id = (
+                watcher.state.get("architectConversationId")
+                or os.environ.get("ARCHITECT_CONVERSATION_ID")
+                or VERIFIED_ARCHITECT_CONVERSATION_ID
+            )
+            runtime_log(
+                getattr(watcher, "runtime_logger", None),
+                getattr(watcher, "runtime_run_id", None),
+                "ARCHITECT_MEMORY_PASSIVE_ATTACH_BEGIN",
+                watcher.state,
+                conversationId=conversation_id,
+                readOnly=True,
+                workflowMutation=False,
+            )
+            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            temporary_bridge = True
+            runtime_log(
+                getattr(watcher, "runtime_logger", None),
+                getattr(watcher, "runtime_run_id", None),
+                "ARCHITECT_MEMORY_PASSIVE_ATTACH_END",
+                watcher.state,
+                conversationId=conversation_id,
+                readOnly=True,
+                workflowMutation=False,
+            )
+        if not callable(reader) and bridge is not None:
+            reader = getattr(bridge, "current_session_memory_bytes", None)
+        if not callable(reader):
+            rollover.sample_memory_for_loop()
+            return False
+        rollover.sample_memory_for_loop(reader)
+        return True
+    except Exception as error:
+        runtime_log(
+            getattr(watcher, "runtime_logger", None),
+            getattr(watcher, "runtime_run_id", None),
+            "ARCHITECT_MEMORY_SAMPLE_FAILED",
+            watcher.state,
+            error=f"PASSIVE_{type(error).__name__.upper()}",
+            readOnly=True,
+            workflowMutation=False,
+        )
+        return False
+    finally:
+        if temporary_bridge and bridge is not None:
+            try:
+                bridge.close()
+            except Exception as error:
+                runtime_log(
+                    getattr(watcher, "runtime_logger", None),
+                    getattr(watcher, "runtime_run_id", None),
+                    "ARCHITECT_MEMORY_SAMPLE_FAILED",
+                    watcher.state,
+                    error=f"PASSIVE_CLOSE_{type(error).__name__.upper()}",
+                    readOnly=True,
+                    workflowMutation=False,
+                )
+
+
 def main() -> None:
     global _ACTIVE_DIAGNOSTIC_TRACE
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
@@ -6194,8 +6277,11 @@ def main() -> None:
                 last_logged_state = state
             if discussion_paused() and state in {"IDLE", "RESULT_READY", "NEXT_PROMPT_READY"}:
                 log_main_loop_decision(watcher, "DISCUSSION_PAUSE_SKIP", "discussion_pause_active", False, True)
+                memory_monitoring_observed = passive_architect_memory_sample_for_pause(
+                    watcher, endpoint, existing_bridge=idle_bridge
+                )
                 runtime_log(logger, run_id, "DISCUSSION_PAUSE_DECISION", watcher.state, taskId=watcher.state.get("taskId"),
-                            discussionPauseActive=True, workflowActionsBlocked=True, memoryMonitoringObserved=False,
+                            discussionPauseActive=True, workflowActionsBlocked=True, memoryMonitoringObserved=memory_monitoring_observed,
                             rolloverDue=bool(watcher.state.get("rolloverDue")), decision="BLOCK", reason="DISCUSSION_PAUSED")
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="DISCUSSION_PAUSE_SKIP", reason="discussion_pause_active")
