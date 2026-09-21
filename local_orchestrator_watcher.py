@@ -1289,7 +1289,13 @@ Do not summarize obsolete history unless necessary to prevent regression.
 
 The output itself must be directly usable as the bootstrap prompt for the new Architect conversation.
 
-End with:
+When producing the handover response, reproduce the exact supplied rollover
+transaction ID on the line immediately before the final marker, using this
+exact line:
+
+Rollover transaction ID: <ROLLOVER_TRANSACTION_ID>
+
+The response must end with:
 
 ARCHITECT_HANDOVER_READY"""
 
@@ -1311,7 +1317,7 @@ def rollover_transaction_id(state: dict[str, Any], task_id: str | None = None) -
 
 
 def handover_request_for_transaction(transaction_id: str) -> str:
-    return f"{STANDARD_HANDOVER_REQUEST}\n\nRollover transaction ID: {transaction_id}"
+    return STANDARD_HANDOVER_REQUEST.replace("<ROLLOVER_TRANSACTION_ID>", str(transaction_id))
 
 
 def handover_transaction_matches(response: str, transaction_id: str | None) -> bool:

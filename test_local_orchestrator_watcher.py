@@ -528,7 +528,8 @@ def test_architect_rollover_counts_to_thirty_and_requests_once(tmp_path):
     watcher.state["architectMemoryBytes"] = 891289600
     assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
     assert not rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
-    assert bridge.requests[0].startswith(STANDARD_HANDOVER_REQUEST)
+    request_prefix = STANDARD_HANDOVER_REQUEST.split("<ROLLOVER_TRANSACTION_ID>", 1)[0]
+    assert bridge.requests[0].startswith(request_prefix)
     assert watcher.state["handoverRequested"] is True
 
 
@@ -1188,6 +1189,23 @@ ARCHITECT_HANDOVER_READY"""
             raise RuntimeError("fresh path reached")
     assert rollover.complete_from_response(Bridge(), production_format) is False
     assert reached == [True, "fresh"]
+
+
+def test_handover_request_explicitly_requires_exact_transaction_echo():
+    from local_orchestrator_watcher import handover_request_for_transaction, handover_transaction_matches
+
+    transaction_id = "4b7971a1ac59ac799bc02f58"
+    request = handover_request_for_transaction(transaction_id)
+    exact_line = f"Rollover transaction ID: {transaction_id}"
+    marker = "ARCHITECT_HANDOVER_READY"
+
+    assert "reproduce the exact supplied rollover" in request
+    assert exact_line in request
+    assert request.endswith(marker)
+    assert request.index(exact_line) < request.rfind(marker)
+    assert handover_transaction_matches(f"handover\n{exact_line}\n{marker}", transaction_id)
+    assert not handover_transaction_matches(f"handover\n{marker}", transaction_id)
+    assert not handover_transaction_matches(f"handover\nRollover transaction ID: wrong\n{marker}", transaction_id)
 
 
 def test_transaction_match_failure_is_diagnosed_without_handover_text(tmp_path):
