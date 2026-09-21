@@ -708,6 +708,116 @@ def test_atomic_write_and_github_free_evidence(tmp_path):
     assert "relay" not in json.dumps(watcher.state).lower()
 
 
+def test_atomic_state_write_flushes_and_preserves_complete_previous_state_on_replace_failure(tmp_path, monkeypatch):
+    path = tmp_path / "work" / "state.json"
+    atomic_write(path, b'{"state":"PREVIOUS","transaction":"tx-1"}\n')
+    fsync_calls = []
+    original_fsync = watcher_module.os.fsync
+    monkeypatch.setattr(watcher_module.os, "fsync", lambda descriptor: (fsync_calls.append(descriptor), original_fsync(descriptor))[1])
+    original_replace = watcher_module.os.replace
+    def fail_replace(*_args):
+        raise OSError("simulated power loss before replacement")
+    monkeypatch.setattr(watcher_module.os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        atomic_write(path, b'{"state":"NEW","transaction":"tx-2"}\n')
+    assert fsync_calls
+    assert json.loads(path.read_text(encoding="utf-8")) == {"state": "PREVIOUS", "transaction": "tx-1"}
+    monkeypatch.setattr(watcher_module.os, "replace", original_replace)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"state": "PREVIOUS", "transaction": "tx-1"}
+
+
+def test_stale_state_temp_does_not_override_canonical_state(tmp_path):
+    state_dir = tmp_path / "work"
+    state_dir.mkdir(parents=True)
+    canonical = state_dir / "state.json"
+    canonical.write_text(json.dumps({"state": "NEXT_PROMPT_READY", "nextTaskId": "000080", "rolloverTransactionId": "tx-canonical"}), encoding="utf-8")
+    (state_dir / f".state.json.{os.getpid()}.tmp").write_text(json.dumps({"state": "RESULT_READY", "nextTaskId": "000081", "rolloverTransactionId": "tx-stale"}), encoding="utf-8")
+    watcher = LocalFirstOrchestrator(str(tmp_path), state_dir)
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000080"
+    assert watcher.state["rolloverTransactionId"] == "tx-canonical"
+
+
+def test_restart_recovers_delivered_pending_transaction_without_resend(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    transaction = "crash-delivered-000080"
+    watcher.state.update({
+        "taskId": "000079", "lastCompletedTaskId": "000079", "nextTaskId": "000080",
+        "nextPromptPath": str(prompt), "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": True, "handoverRequested": True, "handoverReady": False,
+        "rolloverHandoverSendState": "PENDING", "rolloverMaintenanceState": "IN_PROGRESS",
+        "rolloverTransactionId": transaction, "rolloverTransactionGeneration": 2,
+        "rolloverTransactionTaskId": "000080", "rolloverAttemptedForTaskId": "000080",
+        "architectConversationId": "OLD", "executorProcessState": "COMPLETED_WITH_RESULT",
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    sends = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def exact_user_message_payload_observed(self, payload):
+            return f"Rollover transaction ID: {transaction}" in payload
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def generation_visible(self): return False
+        def _assistant_entries(self): return []
+        def submit_result_bounded(self, _payload): sends.append(1)
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    request_calls = []
+    monkeypatch.setattr(restarted.session_rollover, "request_if_due", lambda *_args, **_kwargs: request_calls.append(1) or (_ for _ in ()).throw(AssertionError("restart must not resend")))
+    assert watcher_module.service_deferred_rollover_once(restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert restarted.state["rolloverTransactionId"] == transaction
+    assert restarted.state["rolloverTransactionGeneration"] == 2
+    assert restarted.state["rolloverHandoverSendState"] == "ACKNOWLEDGED"
+    assert restarted.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert sends == [] and request_calls == []
+
+
+def test_restart_with_cdp_unavailable_preserves_transaction_and_fails_closed(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    transaction = "cdp-unavailable-000080"
+    watcher.state.update({
+        "taskId": "000079", "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": True,
+        "handoverRequested": True, "rolloverHandoverSendState": "ACKNOWLEDGED",
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverTransactionId": transaction,
+        "rolloverTransactionGeneration": 2, "rolloverTransactionTaskId": "000080",
+        "rolloverAttemptedForTaskId": "000080", "architectConversationId": "OLD",
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: (_ for _ in ()).throw(RuntimeError("CDP_UNAVAILABLE"))))
+    assert watcher_module.service_deferred_rollover_once(restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert restarted.state["rolloverTransactionId"] == transaction
+    assert restarted.state["rolloverTransactionGeneration"] == 2
+    assert restarted.state["nextTaskId"] == "000080"
+    assert restarted.state.get("rolloverRetiredTransactionId") is None
+
+
+def test_three_fresh_restarts_keep_unresolved_transaction_identity_stable(tmp_path):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    transaction = "stable-restart-000080"
+    watcher.state.update({
+        "taskId": "000079", "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": True,
+        "handoverRequested": True, "rolloverHandoverSendState": "ACKNOWLEDGED",
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverTransactionId": transaction,
+        "rolloverTransactionGeneration": 2, "rolloverTransactionTaskId": "000080",
+        "rolloverAttemptedForTaskId": "000080", "architectConversationId": "OLD",
+    })
+    watcher.save()
+    for _ in range(3):
+        fresh = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+        assert fresh.state["rolloverTransactionId"] == transaction
+        assert fresh.state["rolloverTransactionGeneration"] == 2
+        assert fresh.state["rolloverTransactionTaskId"] == "000080"
+        assert fresh.state["nextTaskId"] == "000080"
+
+
 class FakeComposer:
     def __init__(self, page):
         self.page = page

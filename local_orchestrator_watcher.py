@@ -2071,7 +2071,7 @@ class ArchitectSessionRollover:
             and state.get("rolloverPending")
             and state.get("rolloverInProgress")
             and state.get("handoverRequested")
-            and state.get("rolloverHandoverSendState") in {"ACKNOWLEDGED", "AMBIGUOUS"}
+            and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
             and state.get("rolloverMaintenanceState") in {"IN_PROGRESS", "RECONCILE_PENDING"}
             and state.get("rolloverHandoverRecoveryDisposition") not in {"HUMAN_REQUIRED", "EXHAUSTED"}
         )
@@ -4130,7 +4130,10 @@ def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(data)
+    with temporary.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, target)
 
 
@@ -6195,6 +6198,42 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         """Reconcile one existing transaction without ever resending it."""
         attempt = int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0)
         transaction_id = watcher.state.get("rolloverTransactionId")
+        if watcher.state.get("rolloverHandoverSendState") == "PENDING":
+            observer = getattr(bridge, "exact_user_message_payload_observed", None)
+            if callable(observer) and transaction_id:
+                try:
+                    payload = handover_request_for_transaction(transaction_id)
+                    delivery_observed = bool(observer(payload))
+                except Exception:
+                    delivery_observed = False
+                if delivery_observed:
+                    watcher.state.update({
+                        "rolloverHandoverSendState": "ACKNOWLEDGED",
+                        "rolloverMaintenanceState": "RECONCILE_PENDING",
+                        "rolloverInProgress": True,
+                        "rolloverDue": True,
+                        "rolloverPending": True,
+                        "handoverRequested": True,
+                        "handoverReady": False,
+                    })
+                    watcher.save()
+                    runtime_log(
+                        getattr(watcher, "runtime_logger", None),
+                        getattr(watcher, "runtime_run_id", None),
+                        "ARCHITECT_HANDOVER_DELIVERY_RECONCILED",
+                        watcher.state,
+                        transactionId=transaction_id,
+                        transactionTaskId=watcher.state.get("rolloverTransactionTaskId"),
+                        payloadSha256=hashlib.sha256(payload.encode()).hexdigest(),
+                        deliveryObserved=True,
+                        originalErrorCode="DURABLE_PENDING_AFTER_RESTART",
+                        originalErrorClass="PROCESS_RESTART",
+                        originalErrorMessage="delivery checked from durable PENDING state",
+                        underlyingExceptionClass=None,
+                        underlyingExceptionMessage=None,
+                        sendActionAttempted=False,
+                        sendActionAcknowledged=True,
+                    )
         runtime_log(
             getattr(watcher, "runtime_logger", None),
             getattr(watcher, "runtime_run_id", None),
