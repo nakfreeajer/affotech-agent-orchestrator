@@ -5650,17 +5650,16 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         return False
     watcher.retire_completed_executor_ownership()
     next_task_id = str(watcher.state.get("nextTaskId") or "")
-    watcher.session_rollover._retire_stale_transaction_for_task(next_task_id)
+    restart_recovery_available = bool(getattr(watcher, "_operator_restart_rollover_recovery_available", False))
+    stale_retired = watcher.session_rollover._retire_stale_transaction_for_task(next_task_id)
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (active_pid and watcher.state.get("executorProcessState") == "RUNNING"
             and LocalWatcher.process_alive(int(active_pid))):
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="service_deferred_rollover_once", executorRunning=True)
         return False
     operator_restart_recovery = False
-    if watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
-        if not getattr(watcher, "_operator_restart_rollover_recovery_available", False):
-            _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
-            return False
+    def consume_operator_restart_recovery() -> None:
+        nonlocal operator_restart_recovery
         operator_restart_recovery = True
         watcher._operator_restart_rollover_recovery_available = False
         watcher.state.update({"rolloverRecoveryState": "PENDING", "rolloverRecoveryAttemptCount": 0})
@@ -5668,6 +5667,14 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             watcher.state.pop(key, None)
         watcher.save()
         _trace_rollover_gate(watcher, boundary_state, "ATTEMPT", "OPERATOR_RESTART_RECOVERY", function="service_deferred_rollover_once")
+
+    if watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
+        if not restart_recovery_available:
+            _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
+            return False
+        consume_operator_restart_recovery()
+    elif stale_retired and restart_recovery_available:
+        consume_operator_restart_recovery()
     rollover = watcher.session_rollover
     if not rollover._begin_bounded_recovery():
         if tracer:

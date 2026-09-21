@@ -1892,6 +1892,50 @@ def test_operator_restart_unsent_recovery_reaches_real_request_once(tmp_path, mo
     assert restarted.state["rolloverHandoverSendState"] in {"ACKNOWLEDGED", "AMBIGUOUS"}
 
 
+def test_operator_restart_retires_stale_prior_boundary_and_recovers_current_boundary_once(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    old_transaction = "old-transaction-000070"
+    watcher.state.update({
+        "taskId": "000070",
+        "lastCompletedTaskId": "000070",
+        "nextTaskId": "000071",
+        "nextPromptPath": str(prompt),
+        "rolloverDue": True,
+        "rolloverTrigger": "MEMORY_THRESHOLD",
+        "rolloverPending": True,
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": "000070",
+        "rolloverTransactionTaskId": "000070",
+        "rolloverAttemptedForTaskId": "000070",
+        "rolloverTransactionId": old_transaction,
+        "rolloverHandoverSendState": "UNSENT",
+        "handoverRequested": False,
+        "architectConversationId": "OLD",
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert "architectMemoryBytes" not in restarted.state
+    assert "architectMemoryMiB" not in restarted.state
+    events = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def submit_result_bounded(self, _payload): events.append("send")
+        def wait_for_new_response(self, *_args, **_kwargs): return {"state": "TIMEOUT", "text": ""}
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert events == ["send"]
+    assert restarted.state["rolloverTransactionId"] != old_transaction
+    assert restarted.state["rolloverTransactionTaskId"] == "000071"
+    assert restarted.state["rolloverAttemptedForTaskId"] == "000071"
+
+
 @pytest.mark.parametrize(
     ("rollover_due", "rollover_trigger", "deferred_task"),
     [
