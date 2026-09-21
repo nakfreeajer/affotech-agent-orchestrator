@@ -1603,26 +1603,9 @@ class ArchitectSessionRollover:
     def _retire_terminal_same_task_transaction(self, task_id: str, operator_restart_available: bool) -> bool:
         """Retire one exhausted same-boundary transaction for explicit restart recovery."""
         state = self.watcher.state
-        transaction_id = str(state.get("rolloverTransactionId") or "").strip()
-        owner = str(state.get("rolloverTransactionTaskId") or "").strip()
-        terminal = (
-            state.get("state") == "NEXT_PROMPT_READY"
-            and str(state.get("nextTaskId") or "") == task_id
-            and state.get("rolloverDue") is True
-            and state.get("rolloverPending") is True
-            and state.get("rolloverInProgress") is False
-            and state.get("rolloverMaintenanceState") == "DEFERRED"
-            and state.get("rolloverRecoveryState") == "DEFERRED"
-            and state.get("rolloverRecoveryTerminalReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
-            and transaction_id
-            and owner == task_id
-            and state.get("rolloverAttemptedForTaskId") == task_id
-            and state.get("handoverRequested") is True
-            and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
-            and operator_restart_available
-        )
-        if not terminal:
+        if not self._terminal_same_task_transaction_eligible(task_id, operator_restart_available):
             return False
+        transaction_id = str(state.get("rolloverTransactionId") or "").strip()
         for key in (
             "rolloverTransactionId", "rolloverTransactionTaskId", "rolloverAttemptedForTaskId",
             "pending_handover", "rolloverHandoverResponseIdentity", "rolloverFreshCandidateConversationId",
@@ -1658,6 +1641,67 @@ class ArchitectSessionRollover:
             retiredTransactionId=transaction_id,
             transactionTaskId=task_id,
             reason="ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        )
+        return True
+
+    def _terminal_same_task_transaction_eligible(self, task_id: str, operator_restart_available: bool) -> bool:
+        state = self.watcher.state
+        transaction_id = str(state.get("rolloverTransactionId") or "").strip()
+        owner = str(state.get("rolloverTransactionTaskId") or "").strip()
+        return bool(
+            state.get("state") == "NEXT_PROMPT_READY"
+            and str(state.get("nextTaskId") or "") == task_id
+            and state.get("rolloverDue") is True
+            and state.get("rolloverPending") is True
+            and state.get("rolloverInProgress") is False
+            and state.get("rolloverMaintenanceState") == "DEFERRED"
+            and state.get("rolloverRecoveryState") == "DEFERRED"
+            and state.get("rolloverRecoveryTerminalReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
+            and transaction_id
+            and owner == task_id
+            and state.get("rolloverAttemptedForTaskId") == task_id
+            and state.get("handoverRequested") is True
+            and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
+            and operator_restart_available
+        )
+
+    def _revive_terminal_delivered_transaction(self, task_id: str) -> bool:
+        """Revive one terminal transaction whose exact request is already delivered."""
+        state = self.watcher.state
+        transaction_id = str(state.get("rolloverTransactionId") or "").strip()
+        if not transaction_id or str(state.get("rolloverTransactionTaskId") or "") != task_id:
+            return False
+        state.update({
+            "rolloverDue": True,
+            "rolloverPending": True,
+            "rolloverInProgress": True,
+            "handoverRequested": True,
+            "handoverReady": False,
+            "rolloverHandoverSendState": "ACKNOWLEDGED",
+            "rolloverMaintenanceState": "RECONCILE_PENDING",
+            "rolloverRecoveryState": "PENDING",
+            "rolloverHandoverRecoveryDisposition": "RECONCILE_PENDING",
+            "rolloverHandoverRecoveryReason": "DELIVERED_PAYLOAD_RECONCILIATION",
+        })
+        for key in (
+            "rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt",
+            "rolloverRecoveryAttemptCount", "rolloverRecoveryRetryAfter",
+            "rolloverRecoveryTerminalReason", "rolloverDeferredForTaskId",
+            "rolloverLastFailureReason", "rolloverAutoAttemptCount",
+            "rolloverHandoverRecoveryRetryAfter",
+        ):
+            state.pop(key, None)
+        self.watcher.save()
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None),
+            getattr(self.watcher, "runtime_run_id", None),
+            "ROLLOVER_TERMINAL_DELIVERED_TRANSACTION_RECOVERED",
+            state,
+            transactionId=transaction_id,
+            transactionTaskId=task_id,
+            transactionGeneration=state.get("rolloverTransactionGeneration"),
+            deliveryObserved=True,
+            handoverResent=False,
         )
         return True
 
@@ -1829,6 +1873,22 @@ class ArchitectSessionRollover:
                 tracer.record("HANDOVER", "request_if_due", "HANDOVER_REQUEST_SEND_ERROR", "ERROR", self.watcher.state, errorClass=type(error).__name__, errorMessage=str(error)[:500], stackTrace=traceback.format_exc())
             attempted = bool(getattr(bridge, "sendActionAttempted", False)) or bool(getattr(bridge, "last_send_method", None))
             ambiguous = attempted or (isinstance(error, ResultSubmissionError) and error.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+            exact_payload_observed = False
+            if ambiguous:
+                observer = getattr(bridge, "exact_user_message_payload_observed", None)
+                if callable(observer):
+                    try:
+                        exact_payload_observed = bool(observer(payload))
+                    except Exception:
+                        exact_payload_observed = False
+            error_code = getattr(error, "code", None) or type(error).__name__
+            cause = getattr(error, "__cause__", None)
+            error_message = str(error)[:500]
+            cause_class = type(cause).__name__ if cause is not None else None
+            cause_message = str(cause)[:500] if cause is not None else None
+            send_acknowledged = bool(getattr(bridge, "sendActionAcknowledged", False))
+            last_send_method = getattr(bridge, "last_send_method", None)
+            initial_send_returned = getattr(bridge, "initialSendActionReturned", None)
             if ambiguous:
                 self.watcher.state.update({
                     "rolloverInProgress": True,
@@ -1836,7 +1896,7 @@ class ArchitectSessionRollover:
                     "rolloverPending": True,
                     "handoverRequested": True,
                     "handoverReady": False,
-                    "rolloverHandoverSendState": "AMBIGUOUS",
+                    "rolloverHandoverSendState": "ACKNOWLEDGED" if exact_payload_observed else "AMBIGUOUS",
                     # An acknowledgement timeout means delivery is unknown,
                     # not failed.  Keep the transaction live so the caller
                     # can reconcile the existing Architect response without
@@ -1848,7 +1908,43 @@ class ArchitectSessionRollover:
                 })
                 self.watcher.state.pop("rolloverDeferredForTaskId", None)
                 self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
-                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_SEND_AMBIGUOUS", self.watcher.state, errorClass=type(error).__name__)
+                if exact_payload_observed:
+                    setattr(bridge, "sendActionAcknowledged", True)
+                    runtime_log(
+                        getattr(self.watcher, "runtime_logger", None),
+                        getattr(self.watcher, "runtime_run_id", None),
+                        "ARCHITECT_HANDOVER_DELIVERY_RECONCILED",
+                        self.watcher.state,
+                        transactionId=transaction_id,
+                        transactionTaskId=task_id,
+                        payloadSha256=hashlib.sha256(payload.encode()).hexdigest(),
+                        deliveryObserved=True,
+                        originalErrorCode=error_code,
+                        originalErrorClass=type(error).__name__,
+                        originalErrorMessage=error_message,
+                        underlyingExceptionClass=cause_class,
+                        underlyingExceptionMessage=cause_message,
+                        sendActionAttempted=attempted,
+                        sendActionAcknowledged=True,
+                    )
+                runtime_log(
+                    getattr(self.watcher, "runtime_logger", None),
+                    getattr(self.watcher, "runtime_run_id", None),
+                    "ARCHITECT_HANDOVER_SEND_AMBIGUOUS",
+                    self.watcher.state,
+                    errorCode=error_code,
+                    errorClass=type(error).__name__,
+                    errorMessage=error_message,
+                    causeClass=cause_class,
+                    causeMessage=cause_message,
+                    sendActionAttempted=attempted,
+                    sendActionAcknowledged=send_acknowledged or exact_payload_observed,
+                    lastSendMethod=last_send_method,
+                    initialSendActionReturned=initial_send_returned,
+                    exactPayloadObserved=exact_payload_observed,
+                    transactionId=transaction_id,
+                    transactionGeneration=self.watcher.state.get("rolloverTransactionGeneration"),
+                )
             else:
                 self.watcher.state.update({
                     "rolloverInProgress": False,
@@ -1864,7 +1960,7 @@ class ArchitectSessionRollover:
                 self.watcher.state.pop("rolloverAttemptedForTaskId", None)
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_SEND_DECISION", self.watcher.state,
                         transactionId=transaction_id, transactionTaskId=task_id, handoverSendState=self.watcher.state.get("rolloverHandoverSendState"),
-                        sendActionAttempted=ambiguous, ackObserved=False, classification="AMBIGUOUS" if ambiguous else "UNSENT",
+                        sendActionAttempted=attempted, ackObserved=send_acknowledged or exact_payload_observed, classification="DELIVERED_AFTER_ERROR" if exact_payload_observed else ("AMBIGUOUS" if ambiguous else "UNSENT"),
                         decision="RECONCILE" if ambiguous else "DEFER", reason=type(error).__name__)
             self.watcher.save()
             emit("STATE=ROLLOVER_PENDING")
@@ -1975,7 +2071,7 @@ class ArchitectSessionRollover:
             and state.get("rolloverPending")
             and state.get("rolloverInProgress")
             and state.get("handoverRequested")
-            and state.get("rolloverHandoverSendState") == "AMBIGUOUS"
+            and state.get("rolloverHandoverSendState") in {"ACKNOWLEDGED", "AMBIGUOUS"}
             and state.get("rolloverMaintenanceState") in {"IN_PROGRESS", "RECONCILE_PENDING"}
             and state.get("rolloverHandoverRecoveryDisposition") not in {"HUMAN_REQUIRED", "EXHAUSTED"}
         )
@@ -6003,7 +6099,30 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     watcher.retire_completed_executor_ownership()
     next_task_id = str(watcher.state.get("nextTaskId") or "")
     restart_recovery_available = bool(getattr(watcher, "_operator_restart_rollover_recovery_available", False))
-    terminal_retired = watcher.session_rollover._retire_terminal_same_task_transaction(
+    bridge = None
+    terminal_delivered_recovered = False
+    terminal_candidate = watcher.session_rollover._terminal_same_task_transaction_eligible(
+        next_task_id, restart_recovery_available
+    )
+    if terminal_candidate:
+        transaction_id = str(watcher.state.get("rolloverTransactionId") or "").strip()
+        try:
+            conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
+            expected_payload = handover_request_for_transaction(transaction_id)
+            observer = getattr(bridge, "exact_user_message_payload_observed", None)
+            delivered = bool(callable(observer) and observer(expected_payload))
+            if delivered:
+                terminal_delivered_recovered = watcher.session_rollover._revive_terminal_delivered_transaction(next_task_id)
+            else:
+                _disconnect_architect_bridge_read_only(bridge)
+                bridge = None
+        except Exception:
+            if bridge is not None:
+                _disconnect_architect_bridge_read_only(bridge)
+                bridge = None
+    terminal_retired = False if terminal_delivered_recovered else watcher.session_rollover._retire_terminal_same_task_transaction(
         next_task_id, restart_recovery_available
     )
     stale_retired = watcher.session_rollover._retire_stale_transaction_for_task(next_task_id)
@@ -6023,7 +6142,9 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         watcher.save()
         _trace_rollover_gate(watcher, boundary_state, "ATTEMPT", "OPERATOR_RESTART_RECOVERY", function="service_deferred_rollover_once")
 
-    if watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
+    if terminal_delivered_recovered and restart_recovery_available:
+        consume_operator_restart_recovery()
+    elif watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
         if not restart_recovery_available:
             _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
             return False
@@ -6099,11 +6220,13 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             handoverResent=False,
         )
         return result
-    bridge = None
     try:
-        conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
-        bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
-        conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
+        if bridge is None:
+            conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
+        else:
+            conversation_id = str(watcher.state.get("architectConversationId") or "")
         baseline = bridge.assistant_baseline()
         task_id = str(watcher.state.get("nextTaskId") or watcher.state.get("taskId") or "")
         legacy_task = str(watcher.state.get("taskId") or "")

@@ -2529,6 +2529,164 @@ def _terminal_same_task_rollover_fixture(tmp_path):
     return watcher, prompt, retired
 
 
+def test_action_error_after_payload_delivery_reconciles_without_resend(tmp_path):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "taskId": "000079", "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+        "architectConversationId": "OLD",
+    })
+    logger, records = runtime_event_capture()
+    watcher.runtime_logger = logger
+    watcher.runtime_run_id = "delivered-payload-test"
+    watcher.save()
+    calls = []
+
+    class DeliveredAfterActionError:
+        sendActionAttempted = True
+        sendActionAcknowledged = False
+        last_send_method = "playwright.click"
+        initialSendActionReturned = False
+
+        def submit_result_bounded(self, _payload):
+            calls.append("send")
+            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", "TimeoutError")
+
+        def exact_user_message_payload_observed(self, payload):
+            calls.append(("observe", payload))
+            return True
+
+    bridge = DeliveredAfterActionError()
+    assert watcher.session_rollover.request_if_due(
+        bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY"
+    ) is False
+    assert calls[0] == "send"
+    assert calls[1][0] == "observe"
+    assert calls.count("send") == 1
+    assert watcher.state["rolloverHandoverSendState"] == "ACKNOWLEDGED"
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert watcher.state["rolloverInProgress"] is True
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["rolloverTransactionId"]
+    assert watcher.state["rolloverTransactionGeneration"] == 1
+    assert any(record.event == "ARCHITECT_HANDOVER_DELIVERY_RECONCILED" for record in records)
+    rendered = "\n".join(record.getMessage() for record in records)
+    assert "errorCode=ARCHITECT_SEND_ACTION_FAILED" in rendered
+    assert "lastSendMethod=playwright.click" in rendered
+
+
+def test_action_error_without_payload_remains_ambiguous_without_resend(tmp_path):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "taskId": "000079", "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+    })
+    calls = []
+
+    class NotDelivered:
+        sendActionAttempted = True
+        last_send_method = "playwright.click"
+        def submit_result_bounded(self, _payload):
+            calls.append("send")
+            raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", "TimeoutError")
+        def exact_user_message_payload_observed(self, _payload):
+            calls.append("observe")
+            return False
+
+    assert watcher.session_rollover.request_if_due(
+        NotDelivered(), True, False, safe_boundary_state="NEXT_PROMPT_READY"
+    ) is False
+    assert calls == ["send", "observe"]
+    assert watcher.state["rolloverHandoverSendState"] == "AMBIGUOUS"
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert watcher.state["rolloverTransactionId"]
+
+
+def test_acknowledged_reconcile_pending_is_live_and_never_enters_new_send(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "taskId": "000079", "nextTaskId": "000080", "nextPromptPath": str(prompt),
+        "rolloverPending": True, "rolloverInProgress": True,
+        "handoverRequested": True, "rolloverHandoverSendState": "ACKNOWLEDGED",
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverAttemptedForTaskId": "000080",
+        "rolloverTransactionId": "ack-live-000080", "architectConversationId": "OLD",
+    })
+    assert watcher.session_rollover.handover_reconciliation_pending() is True
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def generation_visible(self): return False
+        def _assistant_entries(self): return []
+        def submit_result_bounded(self, _payload): raise AssertionError("must not resend")
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(
+        watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY"
+    ) is False
+    assert watcher.state["rolloverHandoverSendState"] == "ACKNOWLEDGED"
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+
+
+def test_terminal_delivered_transaction_is_revived_without_generation_three(tmp_path, monkeypatch):
+    watcher, prompt, _retired = _terminal_same_task_rollover_fixture(tmp_path)
+    transaction = "2b324cd32cefc00ef1790c36"
+    generation = 2
+    watcher.state.update({
+        "rolloverTransactionId": transaction,
+        "rolloverTransactionGeneration": generation,
+        "rolloverHandoverSendState": "AMBIGUOUS",
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    assert restarted._operator_restart_rollover_recovery_available is True
+    calls = {"attach": 0, "send": 0, "request": 0}
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def exact_user_message_payload_observed(self, payload):
+            assert f"Rollover transaction ID: {transaction}" in payload
+            return True
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def generation_visible(self): return False
+        def _assistant_entries(self): return []
+        def submit_result_bounded(self, _payload): calls["send"] += 1
+        def close(self): pass
+
+    bridge = Bridge()
+    def attach(*_args):
+        calls["attach"] += 1
+        return bridge
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    original_request = restarted.session_rollover.request_if_due
+    def forbidden_request(*args, **kwargs):
+        calls["request"] += 1
+        return original_request(*args, **kwargs)
+    monkeypatch.setattr(restarted.session_rollover, "request_if_due", forbidden_request)
+
+    assert watcher_module.service_deferred_rollover_once(
+        restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY"
+    ) is False
+    assert calls["attach"] == 1
+    assert calls["send"] == 0
+    assert calls["request"] == 0
+    assert restarted.state["rolloverTransactionId"] == transaction
+    assert restarted.state["rolloverTransactionGeneration"] == generation
+    assert restarted.state["rolloverTransactionTaskId"] == "000080"
+    assert restarted.state["rolloverAttemptedForTaskId"] == "000080"
+    assert restarted.state["rolloverHandoverSendState"] == "ACKNOWLEDGED"
+    assert restarted.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert restarted.state["rolloverInProgress"] is True
+    assert restarted.state["rolloverRecoveryState"] == "RECOVERING"
+    assert "rolloverRecoveryTerminalReason" not in restarted.state
+    assert restarted.state.get("rolloverRetiredTransactionId") is None
+
+
 def test_terminal_same_task_transaction_retires_once_and_prepares_fresh_id(tmp_path):
     watcher, _prompt, retired = _terminal_same_task_rollover_fixture(tmp_path)
     restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
