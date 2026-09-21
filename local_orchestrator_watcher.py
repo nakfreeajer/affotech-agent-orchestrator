@@ -419,6 +419,37 @@ def runtime_log(logger: logging.Logger | None, run_id: str | None, event: str, s
     logger.log(level, " ".join(f"{key}={value}" for key, value in fields.items() if value is not None), extra=safe)
 
 
+def log_main_loop_decision(watcher: Any, decision: str, reason: str, action_allowed: bool, action_blocked: bool) -> None:
+    """Emit bounded normal-runtime evidence for a main-loop branch."""
+    state = getattr(watcher, "state", {})
+    signature = (decision, reason, state.get("state"), state.get("taskId"), state.get("nextTaskId"),
+                 bool(state.get("discussionPauseActive")), bool(state.get("rolloverDue")),
+                 bool(state.get("rolloverPending")), bool(state.get("rolloverInProgress")),
+                 bool(state.get("handoverRequested")), state.get("architectConversationId"))
+    if getattr(watcher, "_last_runtime_main_loop_decision", None) == signature:
+        return
+    watcher._last_runtime_main_loop_decision = signature
+    runtime_log(
+        getattr(watcher, "runtime_logger", None),
+        getattr(watcher, "runtime_run_id", None),
+        "MAIN_LOOP_DECISION",
+        state,
+        taskId=state.get("taskId"),
+        nextTaskId=state.get("nextTaskId"),
+        discussionPauseActive=bool(state.get("discussionPauseActive")),
+        rolloverDue=bool(state.get("rolloverDue")),
+        rolloverPending=bool(state.get("rolloverPending")),
+        rolloverInProgress=bool(state.get("rolloverInProgress")),
+        handoverRequested=bool(state.get("handoverRequested")),
+        architectConversationId=state.get("architectConversationId"),
+        branch=decision,
+        decision=decision,
+        reason=reason,
+        actionAllowed=action_allowed,
+        actionBlocked=action_blocked,
+    )
+
+
 def run_owned_recovery_bridge(bridge: Any, operation: Callable[[Any], Any]) -> Any:
     """Run one recovery operation and always disconnect its owned bridge."""
     try:
@@ -702,6 +733,9 @@ def architect_conversation_ids_equivalent(left: str, right: str) -> bool:
 
 def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requested_id: str | None) -> str:
     """Validate an attached page and persist its actual URL representation."""
+    bridge.runtime_logger = getattr(watcher, "runtime_logger", None)
+    bridge.runtime_run_id = getattr(watcher, "runtime_run_id", None)
+    bridge.runtime_watcher = watcher
     tracer = diagnostic_trace_for(watcher)
     started = time.monotonic()
     if tracer:
@@ -710,6 +744,7 @@ def canonicalize_attached_architect_conversation(watcher: Any, bridge: Any, requ
     if page is None:
         return requested_id or ""
     actual_id = architect_conversation_id_from_url(page.url)
+    bridge.runtime_conversation_id = actual_id
     if requested_id and not architect_conversation_ids_equivalent(requested_id, actual_id):
         raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
     if requested_id and requested_id != actual_id:
@@ -1268,6 +1303,9 @@ def trace_transaction_match_failure(watcher: Any, response: str, transaction_id:
         return
     token = str(transaction_id or "").strip()
     token_present = bool(token and re.search(rf"(?<![0-9A-Fa-f]){re.escape(token)}(?![0-9A-Fa-f])", str(response or "")))
+    runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", watcher.state,
+                expectedTransactionId=token or None, transactionTokenPresent=token_present,
+                handoverReady=architect_handover_ready(response), decision="REJECT", reason=reason)
     tracer.record(
         "HANDOVER",
         "handover_transaction_matches",
@@ -1308,14 +1346,23 @@ class ArchitectSessionRollover:
         """Sample only the explicitly governed Architect process tree."""
         tracer = diagnostic_trace_for(self.watcher)
         started = time.monotonic()
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_TICK", self.watcher.state,
+                    taskId=self.watcher.state.get("taskId"), architectConversationId=self.watcher.state.get("architectConversationId"),
+                    discussionPauseActive=bool(self.watcher.state.get("discussionPauseActive")), memoryReaderBound=bool(memory_reader or getattr(self.watcher, "architect_memory_reader", None)),
+                    sampleAttempted=True, rendererPid=self.watcher.state.get("architectMemoryRendererPid", "UNAVAILABLE_AT_LAYER"), thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+                    thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_BEGIN", "BEGIN", self.watcher.state, threshold=ARCHITECT_MEMORY_THRESHOLD_BYTES, safetyCeiling=ARCHITECT_MEMORY_SAFETY_CEILING_BYTES)
         if self.watcher.state.get("humanRequiredReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT":
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_SKIPPED", self.watcher.state,
+                        skipReason="SAFETY_CUTOUT", workflowMutation=False, rendererPid="UNAVAILABLE_AT_LAYER")
             if tracer:
                 tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_SKIPPED", "SKIP", self.watcher.state, reason="SAFETY_CUTOUT", durationMs=(time.monotonic() - started) * 1000)
             return None
         reader = memory_reader or getattr(self.watcher, "architect_memory_reader", None)
         if reader is None:
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_SKIPPED", self.watcher.state,
+                        skipReason="MEMORY_READER_UNBOUND", memoryReaderBound=False, sampleAttempted=False, workflowMutation=False, rendererPid="UNAVAILABLE_AT_LAYER")
             if getattr(self.watcher, "memory_ownership_required", False) and self.watcher.state.get("architectMemoryOwnershipWarningEmitted") is not True:
                 self.watcher.state["architectMemoryOwnership"] = "UNCONFIGURED"
                 self.watcher.state["architectMemoryError"] = "ARCHITECT_BROWSER_ROOT_PID_REQUIRED"
@@ -1336,6 +1383,10 @@ class ArchitectSessionRollover:
             if reason != self._last_memory_error:
                 runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_FAILED", self.watcher.state, error=reason)
                 self._last_memory_error = reason
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_RESULT", self.watcher.state,
+                        sampleAttempted=True, memoryBytes=None, memoryMiB=None, thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+                        thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB, decision="UNAVAILABLE", workflowMutation=False,
+                        rendererPid="UNAVAILABLE_AT_LAYER", error=reason)
             return None
         recovering_from_error = self._last_memory_error is not None
         self._last_memory_error = None
@@ -1353,11 +1404,26 @@ class ArchitectSessionRollover:
         trigger = self.rollover_trigger(memory_bytes, response_count)
         if memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES and (previous_memory_bytes is None or previous_memory_bytes < ARCHITECT_MEMORY_THRESHOLD_BYTES):
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_THRESHOLD_TELEMETRY", self.watcher.state, memoryMiB=memory_mib, thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB)
+        rollover_due_before = bool(self.watcher.state.get("rolloverDue"))
+        trigger_before = self.watcher.state.get("rolloverTrigger")
+        workflow_mutation = False
         if trigger and not self.watcher.state.get("rolloverDue"):
             self.watcher.state["rolloverDue"] = True
             self.watcher.state["rolloverTrigger"] = trigger
             self.watcher.save()
+            workflow_mutation = True
             emit(f"ROLLOVER_DUE trigger={trigger}")
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_RESULT", self.watcher.state,
+                    taskId=self.watcher.state.get("taskId"), architectConversationId=self.watcher.state.get("architectConversationId"),
+                    memoryBytes=memory_bytes, memoryMiB=memory_mib, thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+                    thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB, rolloverDueBefore=rollover_due_before,
+                    rolloverDueAfter=bool(self.watcher.state.get("rolloverDue")), rolloverTriggerBefore=trigger_before,
+                    rolloverTriggerAfter=self.watcher.state.get("rolloverTrigger"), decision="TRIGGER_DUE" if trigger else "NO_TRIGGER",
+                    workflowMutation=workflow_mutation, rendererPid=self.watcher.state.get("architectMemoryRendererPid", "UNAVAILABLE_AT_LAYER"))
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_THRESHOLD_DECISION", self.watcher.state,
+                    memoryBytes=memory_bytes, memoryMiB=memory_mib, thresholdBytes=ARCHITECT_MEMORY_THRESHOLD_BYTES,
+                    thresholdMiB=ARCHITECT_MEMORY_THRESHOLD_MIB, decision="TRIGGER_DUE" if trigger else "BELOW_THRESHOLD",
+                    rolloverDueAfter=bool(self.watcher.state.get("rolloverDue")), workflowMutation=workflow_mutation)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory", "MEMORY_SAMPLE_END", "END", self.watcher.state, durationMs=(time.monotonic() - started) * 1000, memoryBytes=memory_bytes, memoryMiB=round(memory_bytes / (1024 * 1024), 2), rolloverDueBefore=bool(previous_memory_bytes and previous_memory_bytes >= ARCHITECT_MEMORY_THRESHOLD_BYTES), rolloverDueAfter=bool(self.watcher.state.get("rolloverDue")), rootPid=os.environ.get("ARCHITECT_BROWSER_ROOT_PID"))
         return trigger
@@ -1366,6 +1432,8 @@ class ArchitectSessionRollover:
         """Throttle main-loop telemetry without changing direct sampling semantics."""
         now = time.monotonic()
         if now < self._next_memory_sample_at:
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_MEMORY_SAMPLE_SKIPPED", self.watcher.state,
+                        skipReason="COOLDOWN", sampleAttempted=False, workflowMutation=False, rendererPid="UNAVAILABLE_AT_LAYER")
             tracer = diagnostic_trace_for(self.watcher)
             if tracer:
                 tracer.record("ROLLOVER", "ArchitectSessionRollover.sample_memory_for_loop", "MEMORY_SAMPLE_SKIPPED", "SKIP", self.watcher.state, reason="COOLDOWN", retryAfter=self._next_memory_sample_at)
@@ -1590,6 +1658,10 @@ class ArchitectSessionRollover:
         self.watcher.state["rolloverMaintenanceState"] = "IN_PROGRESS"
         self.watcher.state.pop("rolloverLastFailureReason", None)
         self.watcher.state.pop("rolloverDeferredForTaskId", None)
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_SEND_DECISION", self.watcher.state,
+                    transactionId=transaction_id, transactionTaskId=task_id, handoverSendState="PENDING",
+                    sendActionAttempted=False, ackObserved=False, generationVisible=architect_generating,
+                    classification="NEW_TRANSACTION", decision="SEND", reason="ROLLOVER_TRIGGER_AUTHORIZED")
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_PENDING", self.watcher.state, trigger=trigger)
         try:
@@ -1598,9 +1670,15 @@ class ArchitectSessionRollover:
                 tracer.record("HANDOVER", "request_if_due", "HANDOVER_REQUEST_SEND_BEGIN", "BEGIN", self.watcher.state, payloadLength=len(payload), payloadSha256=hashlib.sha256(payload.encode()).hexdigest(), transactionId=transaction_id)
             else:
                 payload = handover_request_for_transaction(transaction_id)
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_SEND_STAGE", self.watcher.state,
+                        transactionId=transaction_id, transactionTaskId=task_id, stage="SEND_BEGIN", payloadLength=len(payload),
+                        payloadSha256=hashlib.sha256(payload.encode()).hexdigest(), handoverSendState="PENDING")
             bridge.submit_result_bounded(payload)
             self.watcher.state["rolloverHandoverSendState"] = "ACKNOWLEDGED"
             self.watcher.save()
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_SEND_STAGE", self.watcher.state,
+                        transactionId=transaction_id, transactionTaskId=task_id, stage="SEND_END", sendActionAttempted=True,
+                        ackObserved=True, handoverSendState="ACKNOWLEDGED")
             emit("ARCHITECT_HANDOVER_REQUESTED")
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_REQUESTED", self.watcher.state)
             return True
@@ -1635,6 +1713,10 @@ class ArchitectSessionRollover:
                     "rolloverDeferredForTaskId": task_id,
                 })
                 self.watcher.state.pop("rolloverAttemptedForTaskId", None)
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_SEND_DECISION", self.watcher.state,
+                        transactionId=transaction_id, transactionTaskId=task_id, handoverSendState=self.watcher.state.get("rolloverHandoverSendState"),
+                        sendActionAttempted=ambiguous, ackObserved=False, classification="AMBIGUOUS" if ambiguous else "UNSENT",
+                        decision="RECONCILE" if ambiguous else "DEFER", reason=type(error).__name__)
             self.watcher.save()
             emit("STATE=ROLLOVER_PENDING")
             return False
@@ -1762,6 +1844,8 @@ class ArchitectSessionRollover:
             "rolloverFreshCandidateState": status,
         })
         self.watcher.save()
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
+                    candidateConversationId=conversation_id, candidateState=status, decision="RECORD", reason="CANDIDATE_PAGE_PROVEN")
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover._record_fresh_candidate", "FUNCTION", "END", self.watcher.state, conversationId=conversation_id, candidateState=status)
@@ -1787,6 +1871,8 @@ class ArchitectSessionRollover:
                 old_id = architect_conversation_id_from_url(getattr(bridge.page, "url", ""))
             except (RuntimeError, StopIteration):
                 pass
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_SCAN", self.watcher.state,
+                    oldConversationId=old_id, candidateConversationId=candidate_id, candidateCount=len(pages), decision="SCAN")
         if candidate_id:
             for page in pages:
                 try:
@@ -1794,6 +1880,8 @@ class ArchitectSessionRollover:
                 except (RuntimeError, StopIteration, TypeError):
                     continue
                 if architect_conversation_ids_equivalent(str(candidate_id), actual_id):
+                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
+                                oldConversationId=old_id, candidateConversationId=actual_id, candidateCount=1, decision="USE_PERSISTED", reason="PERSISTED_ID_MATCH")
                     return page
             stale_candidate_id = str(candidate_id)
         if (not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending")
@@ -1837,12 +1925,16 @@ class ArchitectSessionRollover:
             self.watcher.save()
             print(f"ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS count={len(proven)}")
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_AMBIGUOUS", self.watcher.state, count=len(proven))
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
+                        oldConversationId=old_id, candidateCount=len(proven), bootstrapHash=bootstrap_hash, decision="BLOCK", reason="MULTIPLE_PROVEN_CANDIDATES")
             return None
         if not proven:
             if self.watcher.state.get("rolloverFreshCandidateDiscoveryState") != "NOT_FOUND":
                 self.watcher.state["rolloverFreshCandidateDiscoveryState"] = "NOT_FOUND"
                 self.watcher.save()
                 runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_NOT_FOUND", self.watcher.state)
+                runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
+                            oldConversationId=old_id, candidateCount=0, bootstrapHash=bootstrap_hash, decision="BLOCK", reason="NO_PROVEN_CANDIDATE")
             return None
         if stale_candidate_id:
             actual_id = architect_conversation_id_from_url(getattr(proven[0], "url", ""))
@@ -1853,6 +1945,8 @@ class ArchitectSessionRollover:
             })
             self.watcher.save()
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_FRESH_CANDIDATE_IDENTITY_CORRECTED", self.watcher.state, oldCandidateId=stale_candidate_id, newCandidateId=actual_id)
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
+                        oldConversationId=old_id, candidateConversationId=actual_id, candidateCount=1, bootstrapHash=bootstrap_hash, decision="USE", reason="CONTENT_PROOF_IDENTITY_CORRECTED")
             return proven[0]
         self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
         self.watcher.save()
@@ -1863,11 +1957,18 @@ class ArchitectSessionRollover:
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.complete_from_response", "HANDOVER_WAIT_COMPLETE", "BEGIN", self.watcher.state, responseLength=len(response), responseSha256=hashlib.sha256(response.encode()).hexdigest(), handoverReady=architect_handover_ready(response))
         if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", self.watcher.state,
+                        transactionId=self.watcher.state.get("rolloverTransactionId"), handoverSendState=self.watcher.state.get("rolloverHandoverSendState"),
+                        existingResponseFound=True, transactionMatched=False, decision="BLOCK", reason="HANDOVER_NOT_REQUESTED_OR_NOT_READY")
             return False
         transaction_id = self.watcher.state.get("rolloverTransactionId")
         if not handover_transaction_matches(response, transaction_id):
             trace_transaction_match_failure(self.watcher, response, transaction_id, "TRANSACTION_TOKEN_MISSING_OR_INVALID")
             return False
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", self.watcher.state,
+                    transactionId=transaction_id, transactionTaskId=self.watcher.state.get("rolloverTransactionTaskId"),
+                    handoverSendState=self.watcher.state.get("rolloverHandoverSendState"), existingResponseFound=True,
+                    transactionMatched=True, decision="ACCEPT", reason="VALID_HANDOVER_RESPONSE")
         self.watcher.state["handoverReady"] = True
         self.watcher.state["pending_handover"] = response
         self.watcher.state["rolloverHandoverResponseIdentity"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
@@ -1921,6 +2022,10 @@ class ArchitectSessionRollover:
                 tracer.record("ROLLOVER", "complete_from_response", "FRESH_READY_WAIT_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id)
             ack_deadline = time.monotonic() + 30.0
             new_bridge = ArchitectPlaywright(new_page)
+            new_bridge.runtime_logger = getattr(self.watcher, "runtime_logger", None)
+            new_bridge.runtime_run_id = getattr(self.watcher, "runtime_run_id", None)
+            new_bridge.runtime_watcher = self.watcher
+            new_bridge.runtime_conversation_id = conversation_id
             while time.monotonic() < ack_deadline:
                 if new_bridge.generation_visible():
                     if tracer:
@@ -1933,6 +2038,9 @@ class ArchitectSessionRollover:
                 if entries:
                     latest = entries[-1].get("text", "") if isinstance(entries[-1], dict) else ""
                     if architect_session_ready(latest):
+                        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_ACK_DECISION", self.watcher.state,
+                                    oldConversationId=self.watcher.state.get("architectConversationId"), candidateConversationId=conversation_id,
+                                    sessionReadyObserved=True, candidateState="ACK_PENDING", decision="ACCEPT", reason="ARCHITECT_SESSION_READY")
                         if tracer:
                             tracer.record("ROLLOVER", "complete_from_response", "FRESH_READY_WAIT_COMPLETE", "END", self.watcher.state, conversationId=conversation_id, assistantSha256=hashlib.sha256(latest.encode()).hexdigest())
                         break
@@ -1945,6 +2053,10 @@ class ArchitectSessionRollover:
             final_url = final_url() if callable(final_url) else final_url
             conversation_id = architect_conversation_id_from_url(final_url)
             phase = "COMMIT_NEW_CONVERSATION_AUTHORITY"
+            old_conversation_id = self.watcher.state.get("architectConversationId")
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_AUTHORITY_COMMIT_DECISION", self.watcher.state,
+                        oldConversationId=old_conversation_id, newConversationId=conversation_id,
+                        sessionReadyProven=True, commitAllowed=True, commitCompleted=False, oldPageCloseAllowed=False, reason="FRESH_SESSION_READY")
             if tracer:
                 tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id)
             self.watcher.state["architectConversationId"] = conversation_id
@@ -1977,6 +2089,9 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("pending_handover", None)
             self.watcher.save()
             committed = True
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_AUTHORITY_COMMIT_DECISION", self.watcher.state,
+                        oldConversationId=old_conversation_id, newConversationId=conversation_id, sessionReadyProven=True,
+                        commitAllowed=True, commitCompleted=True, oldPageCloseAllowed=True, reason="DURABLE_AUTHORITY_COMMITTED")
             if tracer:
                 tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_END", "END", self.watcher.state, conversationId=conversation_id)
             bridge.page = new_page
@@ -2719,7 +2834,16 @@ class ArchitectPlaywright:
         self._trace_operation("wait_for_new_response", "BEGIN", baselineCount=baseline.get("count"), pollInterval=poll_interval)
         stable_hash = None
         stable_polls = 0
+        poll_count = 0
         while True:
+            poll_count += 1
+            wait_conversation_id = getattr(self, "runtime_conversation_id", "UNAVAILABLE_AT_LAYER")
+            wait_watcher = getattr(self, "runtime_watcher", None)
+            wait_state = getattr(wait_watcher, "state", {})
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_WAIT_POLL", wait_state,
+                        conversationId=wait_conversation_id,
+                        pollCount=poll_count, pollIntervalSeconds=poll_interval, generationVisible="NOT_SAMPLED_AT_LOG_POINT",
+                        waitReason="NEW_RESPONSE", completionState=getattr(self, "last_state", "NOT_SAMPLED_AT_LOG_POINT"))
             entries = self._assistant_entries()
             snapshot = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
             current = {"count": len(entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": entries}
@@ -4144,8 +4268,12 @@ class LocalFirstOrchestrator:
         if tracer:
             tracer.record("ROLLOVER", "process_pending_handover_response", "FUNCTION", "BEGIN", self.state, responseLength=len(response), responseSha256=hashlib.sha256(response.encode()).hexdigest())
         if not self.state.get("handoverRequested"):
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", self.state,
+                        existingResponseFound=True, transactionMatched=False, decision="BLOCK", reason="HANDOVER_NOT_REQUESTED")
             return False
         if self.session_rollover.complete_from_response(bridge, response):
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", self.state,
+                        existingResponseFound=True, transactionMatched=True, decision="ACCEPT", reason="HANDOVER_COMMITTED")
             return True
         if self.state.get("rolloverInProgress") or (self.state.get("rolloverDue") and self.state.get("rolloverPending")):
             self.defer_failed_rollover()
@@ -4985,20 +5113,31 @@ class LocalFirstOrchestrator:
     def deliver_result(self, bridge: Any) -> str | None:
         if self.state.get("state") != "RESULT_READY":
             raise RuntimeError("RESULT_NOT_READY")
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_DECISION", self.state,
+                    taskId=self.state.get("taskId"), deliveryStateBefore=self.state.get("architectSendState"),
+                    generationVisible="NOT_SAMPLED_AT_LOG_POINT", discussionPauseActive=bool(self.state.get("discussionPauseActive")),
+                    decision="EVALUATE", reason="RESULT_READY")
         if self.discussion_pause_active():
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_DECISION", self.state,
+                        taskId=self.state.get("taskId"), decision="BLOCK", reason="DISCUSSION_PAUSED", retryAllowed=False)
             return
         if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
             if not getattr(self, "_result_delivery_deferred_logged", False):
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_DEFERRED", self.state, reason="ARCHITECT_GENERATING")
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECOVERY_DECISION", self.state,
+                            recoveryBranch="WAIT_GENERATION", retryAllowed=False, retryBlockedReason="ARCHITECT_GENERATING")
                 self._result_delivery_deferred_logged = True
             return RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING
         self._result_delivery_deferred_logged = False
         path = Path(self.state["executorResultPath"])
         payload, payload_hash = self._result_delivery_payload()
         task_id = str(self.state["taskId"])
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ATTEMPT", self.state, hash=payload_hash)
         prior_hash = self.state.get("architectDeliveryPayloadHash")
         delivery_state = self.state.get("architectSendState")
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ATTEMPT", self.state, hash=payload_hash)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_SEND_STAGE", self.state,
+                    taskId=task_id, payloadHash=payload_hash, deliveryStateBefore=delivery_state,
+                    sendActionAttempted=False, sendMethod="PENDING", stage="PREPARE")
         if prior_hash == payload_hash and delivery_state == "CONFIRMED":
             if not self._exact_result_payload_observed(bridge, payload):
                 self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
@@ -5049,6 +5188,8 @@ class LocalFirstOrchestrator:
             self.save()
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
         try:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_SEND_STAGE", self.state,
+                        taskId=task_id, payloadHash=payload_hash, stage="SEND_BEGIN", sendMethod=getattr(bridge, "last_send_method", None) or "UNKNOWN")
             sender(wire_payload)
         except Exception as error:
             code = getattr(error, "code", None) or type(error).__name__
@@ -5056,20 +5197,34 @@ class LocalFirstOrchestrator:
             acknowledged = bool(getattr(bridge, "sendActionAcknowledged", False))
             ambiguous = (attempted and not acknowledged) or code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT"
             failure_class = "ARCHITECT_DELIVERY_AMBIGUOUS" if ambiguous else "ARCHITECT_DELIVERY_PRE_SEND_FAILURE"
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ACK_DECISION", self.state,
+                        taskId=task_id, payloadHash=payload_hash, sendActionAttempted=attempted,
+                        sendMethod=getattr(bridge, "last_send_method", None), ackObserved=acknowledged,
+                        classification=failure_class, failureClass=failure_class, failureError=code,
+                        decision="AMBIGUOUS" if ambiguous else "FAILED", retryAllowed=ambiguous)
             self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS" if ambiguous else "FAILED", "architectSendError": code, "architectDeliveryFailureClass": failure_class})
             self.save()
             if ambiguous:
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode=code, failureClass=failure_class, attempt=self.state.get("architectTransportRecoveryCount"))
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_FAILED", self.state, errorClass=code, failureClass=failure_class)
             raise
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_SEND_STAGE", self.state,
+                    taskId=task_id, payloadHash=payload_hash, stage="SEND_END", sendActionAttempted=True,
+                    sendMethod=getattr(bridge, "last_send_method", None), ackObserved=True)
         if not self._wait_for_exact_result_payload(bridge, payload):
             self.state.update({"state": "RESULT_READY", "architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
             self.save()
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode="ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED")
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ACK_DECISION", self.state,
+                        taskId=task_id, payloadHash=payload_hash, messageEvidenceObserved=False, ackObserved=False,
+                        classification="AMBIGUOUS", timeoutStage="PAYLOAD_OBSERVATION", decision="BLOCK", retryAllowed=True)
             raise ResultSubmissionError("ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED")
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
         self.save()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_CONFIRMED", self.state, hash=payload_hash)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_ACK_DECISION", self.state,
+                    taskId=task_id, payloadHash=payload_hash, messageEvidenceObserved=True, ackObserved=True,
+                    deliveryStateAfter="CONFIRMED", classification="CONFIRMED", decision="ALLOW", retryAllowed=False)
         self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
 
     def deliver_result_with_recovery(self, bridge_factory: Callable[[], Any], max_attempts: int = 3, initial_bridge: Any | None = None) -> Any | None:
@@ -5104,6 +5259,11 @@ class LocalFirstOrchestrator:
                 self.save()
                 return bridge
             except Exception as error:
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_RECOVERY_DECISION", self.state,
+                            taskId=self.state.get("taskId"), payloadHash=self.state.get("architectDeliveryPayloadHash"),
+                            recoveryBranch="EXCEPTION", failureClass=type(error).__name__, attempt=attempt + 1,
+                            retryAllowed=not confirmed_current_payload() and attempt + 1 < max_attempts,
+                            reason="CONFIRMED_TERMINAL" if confirmed_current_payload() else "RECOVERY_ATTEMPT")
                 if confirmed_current_payload():
                     self.state["architectTransportRecoveryCount"] = 0
                     self.save()
@@ -5591,10 +5751,20 @@ def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: 
 
 
 def _trace_rollover_gate(watcher: Any, safe_boundary_state: str | None, decision: str, reason: str, **fields: Any) -> None:
+    state = watcher.state
+    runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_TRIGGER_DECISION", state,
+                taskId=state.get("taskId"), nextTaskId=state.get("nextTaskId"), rolloverDue=bool(state.get("rolloverDue")),
+                rolloverTrigger=state.get("rolloverTrigger"), decision=decision, reason=reason,
+                discussionPauseActive=bool(state.get("discussionPauseActive")), workflowMutation=False)
+    runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_EXECUTION_GATE", state,
+                taskId=state.get("taskId"), nextTaskId=state.get("nextTaskId"), rolloverDue=bool(state.get("rolloverDue")),
+                rolloverTrigger=state.get("rolloverTrigger"), rolloverPending=bool(state.get("rolloverPending")),
+                rolloverInProgress=bool(state.get("rolloverInProgress")), handoverRequested=bool(state.get("handoverRequested")),
+                discussionPauseActive=bool(state.get("discussionPauseActive")), safeBoundary=safe_boundary_state == "NEXT_PROMPT_READY",
+                gateResult="ALLOW" if decision in {"ATTEMPT", "ALLOW"} else "BLOCK", reason=reason)
     tracer = diagnostic_trace_for(watcher)
     if not tracer:
         return
-    state = watcher.state
     active_pid = state.get("codexPid") or state.get("active_codex_pid")
     active_alive = None
     if active_pid:
@@ -5726,7 +5896,16 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             allow_same_task_unsent_recovery=allow_same_task_unsent_recovery,
         ):
             return failed()
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_WAIT_BEGIN", watcher.state,
+                    conversationId=conversation_id, generationVisible="NOT_SAMPLED_AT_LOG_POINT", pollIntervalSeconds=0.5,
+                    memorySampleAgeMs=None, memorySampleAvailable=bool(watcher.state.get("architectMemoryBytes") is not None),
+                    rolloverDue=bool(watcher.state.get("rolloverDue")), discussionPauseActive=bool(watcher.state.get("discussionPauseActive")),
+                    waitReason="ROLLOVER_HANDOVER_RESPONSE")
         observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_WAIT_END", watcher.state,
+                    conversationId=conversation_id, completionState=observed.get("state"), generationVisible="NOT_SAMPLED_AT_LOG_POINT",
+                    rolloverDue=bool(watcher.state.get("rolloverDue")), discussionPauseActive=bool(watcher.state.get("discussionPauseActive")),
+                    waitReason="ROLLOVER_HANDOVER_RESPONSE")
         if observed.get("state") != "COMPLETED" or not watcher.process_pending_handover_response(bridge, observed.get("text", "")):
             if watcher.state.get("rolloverInProgress"):
                 watcher.defer_failed_rollover("ARCHITECT_HANDOVER_RESPONSE_INVALID")
@@ -5761,6 +5940,10 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     if tracer:
         tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "BEGIN", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"), promptPath=watcher.state.get("nextPromptPath"), rolloverDue=watcher.state.get("rolloverDue"), discussionPause=bool(watcher.state.get("discussionPauseActive")), rolloverServiceCalled=False)
     if watcher.state.get("state") != "NEXT_PROMPT_READY":
+        runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"),
+                    rolloverDue=bool(watcher.state.get("rolloverDue")), rolloverPending=bool(watcher.state.get("rolloverPending")),
+                    rolloverInProgress=bool(watcher.state.get("rolloverInProgress")), handoverRequested=bool(watcher.state.get("handoverRequested")),
+                    discussionPauseActive=bool(paused()), promptPresent=bool(watcher.state.get("nextPromptPath")), gateResult="BLOCK", reason="NOT_NEXT_PROMPT_READY")
         if tracer:
             tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="NOT_NEXT_PROMPT_READY", rolloverServiceCalled=False)
         return None
@@ -5768,6 +5951,10 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (watcher.state.get("executorProcessState") == "RUNNING"
             and active_pid and LocalWatcher.process_alive(int(active_pid))):
+        runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"),
+                    rolloverDue=bool(watcher.state.get("rolloverDue")), rolloverPending=bool(watcher.state.get("rolloverPending")),
+                    rolloverInProgress=bool(watcher.state.get("rolloverInProgress")), handoverRequested=bool(watcher.state.get("handoverRequested")),
+                    discussionPauseActive=bool(paused()), promptPresent=bool(watcher.state.get("nextPromptPath")), gateResult="BLOCK", reason="EXECUTOR_RUNNING")
         if tracer:
             tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="EXECUTOR_RUNNING", activePid=active_pid, rolloverServiceCalled=False)
         return None
@@ -5788,6 +5975,11 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
             and (not previous_authority or watcher.state.get("architectConversationId") != previous_authority)
         )
         if not rollover_complete:
+            runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"),
+                        rolloverDue=True, rolloverPending=bool(watcher.state.get("rolloverPending")), rolloverInProgress=bool(watcher.state.get("rolloverInProgress")),
+                        handoverRequested=bool(watcher.state.get("handoverRequested")), discussionPauseActive=bool(paused()),
+                        promptPresent=bool(watcher.state.get("nextPromptPath")), gateResult="BLOCK", reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH",
+                        rolloverServiceResult=rollover_result)
             if tracer:
                 tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH", rolloverServiceCalled=True, rolloverServiceResult=rollover_result, rolloverComplete=False, authoritativeArchitectConversationId=watcher.state.get("architectConversationId"))
             runtime_log(logger, run_id, "NEXT_PROMPT_READY_DISPATCH_BLOCKED", watcher.state, reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH", rolloverServiceResult=rollover_result)
@@ -5795,6 +5987,10 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
     if tracer:
         tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="LAUNCH", reason="ROLLOVER_COMPLETE" if rollover_called else "ROLLOVER_NOT_DUE", rolloverServiceCalled=rollover_called, rolloverServiceResult=rollover_result, rolloverComplete=rollover_complete, authoritativeArchitectConversationId=watcher.state.get("architectConversationId"), discussionPaused=bool(paused()))
     runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
+    runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state, taskId=watcher.state.get("taskId"), nextTaskId=watcher.state.get("nextTaskId"),
+                rolloverDue=bool(watcher.state.get("rolloverDue")), rolloverPending=bool(watcher.state.get("rolloverPending")),
+                rolloverInProgress=bool(watcher.state.get("rolloverInProgress")), handoverRequested=bool(watcher.state.get("handoverRequested")),
+                discussionPauseActive=bool(paused()), promptPresent=bool(watcher.state.get("nextPromptPath")), gateResult="ALLOW", reason="ROLLOVER_COMPLETE" if rollover_called else "ROLLOVER_NOT_DUE")
     runtime_log(logger, run_id, "CODEX_STARTING", watcher.state, attempt=int(watcher.state.get("executorAttemptNumber", 0)) + 1)
     process = watcher.launch_next(launch)
     if tracer:
@@ -5997,6 +6193,10 @@ def main() -> None:
                     print(f"STATE=HUMAN_REQUIRED reason={watcher.state.get('humanRequiredReason') or 'UNSPECIFIED'}")
                 last_logged_state = state
             if discussion_paused() and state in {"IDLE", "RESULT_READY", "NEXT_PROMPT_READY"}:
+                log_main_loop_decision(watcher, "DISCUSSION_PAUSE_SKIP", "discussion_pause_active", False, True)
+                runtime_log(logger, run_id, "DISCUSSION_PAUSE_DECISION", watcher.state, taskId=watcher.state.get("taskId"),
+                            discussionPauseActive=True, workflowActionsBlocked=True, memoryMonitoringObserved=False,
+                            rolloverDue=bool(watcher.state.get("rolloverDue")), decision="BLOCK", reason="DISCUSSION_PAUSED")
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="DISCUSSION_PAUSE_SKIP", reason="discussion_pause_active")
                 notice = (state, watcher.state.get("taskId") or watcher.state.get("nextTaskId"))
@@ -6011,6 +6211,7 @@ def main() -> None:
                 idle_bridge.close()
                 idle_bridge = None
             if state == "IDLE":
+                log_main_loop_decision(watcher, "IDLE_WAIT", "idle_poll", False, False)
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="IDLE_WAIT")
                 if watcher.intake_inbox(launch):
@@ -6063,6 +6264,7 @@ def main() -> None:
                     watcher.state = watcher._load_state()
                 continue
             if state == "EXECUTOR_RUNNING":
+                log_main_loop_decision(watcher, "EXECUTOR_RUNNING_WAIT", "executor_active", False, True)
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="EXECUTOR_RUNNING_WAIT")
                 state = run_executor_state_once(watcher, launch)
@@ -6074,11 +6276,13 @@ def main() -> None:
                     return
                 continue
             if state == "NEXT_PROMPT_READY":
+                log_main_loop_decision(watcher, "NEXT_PROMPT_READY_DISPATCH", "safe_boundary_evaluation", True, False)
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="NEXT_PROMPT_READY_DISPATCH_ATTEMPT")
                 process = run_next_prompt_ready_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
                 continue
             if state == "HUMAN_REQUIRED":
+                log_main_loop_decision(watcher, "HUMAN_REQUIRED_WAIT", str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED"), False, True)
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="HUMAN_REQUIRED_PASSIVE_WAIT")
                 if watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
@@ -6107,7 +6311,14 @@ def main() -> None:
                     if not isinstance(baseline, dict):
                         baseline = human_wait_bridge.assistant_baseline()
                     try:
+                        runtime_log(logger, run_id, "ARCHITECT_WAIT_BEGIN", watcher.state, conversationId=conversation_id,
+                                    generationVisible="NOT_SAMPLED_AT_LOG_POINT", pollIntervalSeconds=1.0,
+                                    memorySampleAgeMs=None, memorySampleAvailable=bool(watcher.state.get("architectMemoryBytes") is not None),
+                                    rolloverDue=bool(watcher.state.get("rolloverDue")), discussionPauseActive=True, waitReason="HUMAN_DECISION")
                         observed = human_wait_bridge.wait_for_new_response(baseline, poll_interval=1.0)
+                        runtime_log(logger, run_id, "ARCHITECT_WAIT_END", watcher.state, conversationId=conversation_id,
+                                    completionState=observed.get("state"), generationVisible="NOT_SAMPLED_AT_LOG_POINT",
+                                    rolloverDue=bool(watcher.state.get("rolloverDue")), discussionPauseActive=True, waitReason="HUMAN_DECISION")
                     except Exception as error:
                         try:
                             human_wait_bridge.close()
@@ -6180,6 +6391,7 @@ def main() -> None:
                 return
 
             conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+            log_main_loop_decision(watcher, "RESULT_DELIVERY" if state == "RESULT_READY" else "ARCHITECT_WAIT", "architect_response_or_delivery", False, False)
             if diagnostic_trace:
                 diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="RESULT_DELIVERY" if state == "RESULT_READY" else "ARCHITECT_WAIT")
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
@@ -6232,7 +6444,14 @@ def main() -> None:
                     baseline = {"count": len(prior), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": prior}
                 while True:
                     try:
+                        runtime_log(logger, run_id, "ARCHITECT_WAIT_BEGIN", watcher.state, conversationId=conversation_id,
+                                    generationVisible="NOT_SAMPLED_AT_LOG_POINT", pollIntervalSeconds=5.0,
+                                    memorySampleAgeMs=None, memorySampleAvailable=bool(watcher.state.get("architectMemoryBytes") is not None),
+                                    rolloverDue=bool(watcher.state.get("rolloverDue")), discussionPauseActive=bool(discussion_paused()), waitReason="RESULT_OR_ARCHITECT_RESPONSE")
                         observed = bridge.wait_for_new_response(baseline, poll_interval=5.0)
+                        runtime_log(logger, run_id, "ARCHITECT_WAIT_END", watcher.state, conversationId=conversation_id,
+                                    completionState=observed.get("state"), generationVisible="NOT_SAMPLED_AT_LOG_POINT",
+                                    rolloverDue=bool(watcher.state.get("rolloverDue")), discussionPauseActive=bool(discussion_paused()), waitReason="RESULT_OR_ARCHITECT_RESPONSE")
                         runtime_log(logger, run_id, "ARCHITECT_GENERATION_FINISHED", watcher.state, conversationId=conversation_id)
                     except Exception as error:
                         watcher.state["state"] = "ARCHITECT_RUNNING"

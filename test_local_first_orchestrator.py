@@ -1,6 +1,7 @@
 import json
 import hashlib
 import inspect
+import logging
 import os
 import subprocess
 import threading
@@ -66,6 +67,86 @@ def configured_project_prompt(base, head, task_id="owned-task"):
 def write_project_config(watcher, config):
     watcher.state_dir.mkdir(parents=True, exist_ok=True)
     (watcher.state_dir / "project-config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def runtime_event_capture():
+    records = []
+    logger = logging.getLogger(f"orchestrator-test-{id(records)}")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger.addHandler(Capture())
+    return logger, records
+
+
+def test_normal_runtime_decision_instrumentation_is_structured_and_non_sensitive(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=False)
+    logger, records = runtime_event_capture()
+    watcher.runtime_logger = logger
+    watcher.runtime_run_id = "synthetic-run"
+    watcher.state.update({"taskId": "000079", "nextTaskId": "000080", "nextPromptPath": str(prompt), "architectConversationId": "ARCH-OLD"})
+
+    before = dict(watcher.state)
+    watcher.session_rollover.sample_memory(lambda: watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES - 1)
+    watcher_module.log_main_loop_decision(watcher, "NEXT_PROMPT_READY_DISPATCH", "synthetic_observation", True, False)
+    watcher.session_rollover.request_if_due(
+        type("Bridge", (), {})(), True, False, safe_boundary_state="NEXT_PROMPT_READY"
+    )
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: False)
+    watcher.state["rolloverDue"] = True
+    watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False, logger, "synthetic-run")
+
+    events = {record.event for record in records}
+    assert {"MAIN_LOOP_DECISION", "ARCHITECT_MEMORY_SAMPLE_TICK", "ARCHITECT_MEMORY_SAMPLE_RESULT",
+            "ARCHITECT_MEMORY_THRESHOLD_DECISION", "ROLLOVER_TRIGGER_DECISION",
+            "ROLLOVER_EXECUTION_GATE", "CODEX_DISPATCH_GATE"}.issubset(events)
+    assert watcher.state["taskId"] == before["taskId"]
+    assert watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES == 891289600
+    rendered = "\n".join(record.getMessage() for record in records)
+    assert "synthetic prompt body" not in rendered
+    assert "synthetic result body" not in rendered
+    assert "ARCHITECT_HANDOVER_READY" not in rendered
+    assert "token=" not in rendered.lower()
+
+
+def test_result_and_handover_instrumentation_logs_decisions_without_bodies(tmp_path):
+    watcher = ready(tmp_path)
+    logger, records = runtime_event_capture()
+    watcher.runtime_logger = logger
+    watcher.runtime_run_id = "synthetic-run"
+
+    class ResultBridge:
+        def generation_visible(self): return False
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def user_baseline(self): return {"count": 0, "text_hash": "baseline"}
+        def submit_result_bounded(self, _payload): raise ResultSubmissionError("SYNTHETIC_SEND_FAILURE")
+
+    with pytest.raises(ResultSubmissionError):
+        watcher.deliver_result(ResultBridge())
+
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+        "nextPromptPath": str(tmp_path / "next.txt"), "rolloverDue": True,
+        "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+        "architectConversationId": "ARCH-OLD",
+    })
+    Path(watcher.state["nextPromptPath"]).write_text("synthetic staged task", encoding="utf-8")
+
+    class HandoverBridge:
+        def submit_result_bounded(self, _payload): pass
+
+    assert watcher.session_rollover.request_if_due(HandoverBridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY") is True
+    events = {record.event for record in records}
+    assert {"RESULT_DELIVERY_DECISION", "RESULT_DELIVERY_SEND_STAGE", "RESULT_DELIVERY_ACK_DECISION",
+            "HANDOVER_SEND_DECISION", "HANDOVER_SEND_STAGE"}.issubset(events)
+    rendered = "\n".join(record.getMessage() for record in records)
+    assert "executor report" not in rendered
+    assert "synthetic staged task" not in rendered
 
 
 def recovery_fixture(tmp_path):
