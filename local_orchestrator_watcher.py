@@ -1531,8 +1531,15 @@ class ArchitectSessionRollover:
         count = int(self.watcher.state.get("architectResponseCount", 0))
         trigger = self.rollover_trigger(self.watcher.state.get("architectMemoryBytes"), count)
         if not trigger:
-            _trace_rollover_gate(self.watcher, boundary_state, "NO_TRIGGER", "MEMORY_BELOW_THRESHOLD", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
-            return False
+            if (
+                allow_same_task_unsent_recovery
+                and self.watcher.state.get("rolloverDue") is True
+                and self.watcher.state.get("rolloverTrigger") == "MEMORY_THRESHOLD"
+            ):
+                trigger = "MEMORY_THRESHOLD"
+            else:
+                _trace_rollover_gate(self.watcher, boundary_state, "NO_TRIGGER", "MEMORY_BELOW_THRESHOLD", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
+                return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
         self._retire_stale_transaction_for_task(task_id)
         if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id and not allow_same_task_unsent_recovery:

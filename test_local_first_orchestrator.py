@@ -1854,6 +1854,7 @@ def test_operator_restart_unsent_recovery_reaches_real_request_once(tmp_path, mo
         "nextTaskId": "000071",
         "nextPromptPath": str(prompt),
         "rolloverPending": True,
+        "rolloverTrigger": "MEMORY_THRESHOLD",
         "rolloverMaintenanceState": "DEFERRED",
         "rolloverDeferredForTaskId": "000071",
         "rolloverAttemptedForTaskId": "000071",
@@ -1865,7 +1866,10 @@ def test_operator_restart_unsent_recovery_reaches_real_request_once(tmp_path, mo
     watcher.save()
     restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     assert restarted._operator_restart_rollover_recovery_available is True
-    restarted.state["architectMemoryBytes"] = watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES
+    assert "architectMemoryBytes" not in restarted.state
+    assert "architectMemoryMiB" not in restarted.state
+    assert restarted.state["rolloverDue"] is True
+    assert restarted.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
     events = []
 
     class Bridge:
@@ -1886,6 +1890,54 @@ def test_operator_restart_unsent_recovery_reaches_real_request_once(tmp_path, mo
     assert events == ["reconcile", "send"]
     assert restarted.state["rolloverAttemptedForTaskId"] == "000071"
     assert restarted.state["rolloverHandoverSendState"] in {"ACKNOWLEDGED", "AMBIGUOUS"}
+
+
+@pytest.mark.parametrize(
+    ("rollover_due", "rollover_trigger", "deferred_task"),
+    [
+        (False, "MEMORY_THRESHOLD", "000071"),
+        (True, None, "000071"),
+        (True, "RESPONSE_COUNT_FALLBACK", "000071"),
+        (True, "MEMORY_THRESHOLD", "000070"),
+    ],
+)
+def test_operator_restart_requires_current_durable_memory_trigger_and_boundary(
+    tmp_path, monkeypatch, rollover_due, rollover_trigger, deferred_task
+):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=rollover_due)
+    watcher.state.update({
+        "taskId": "000070",
+        "lastCompletedTaskId": "000070",
+        "nextTaskId": "000071",
+        "nextPromptPath": str(prompt),
+        "rolloverPending": True,
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverDeferredForTaskId": deferred_task,
+        "rolloverAttemptedForTaskId": "000071",
+        "rolloverHandoverSendState": "UNSENT",
+        "handoverRequested": False,
+        "rolloverTrigger": rollover_trigger,
+        "architectConversationId": "OLD",
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    events = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def _assistant_entries(self):
+            events.append("reconcile")
+            return []
+        def assistant_baseline(self): return {"count": 0, "text_hash": "baseline", "entries": []}
+        def generation_visible(self): return False
+        def submit_result_bounded(self, _payload): events.append("send")
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    assert watcher_module.service_deferred_rollover_once(restarted, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert "send" not in events
 
 
 @pytest.mark.parametrize("send_state", ["AMBIGUOUS", "ACKNOWLEDGED"])
