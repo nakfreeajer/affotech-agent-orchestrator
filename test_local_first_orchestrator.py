@@ -1921,6 +1921,107 @@ def test_main_maintenance_service_requires_live_executor_boundary(tmp_path, monk
     assert closed == []
 
 
+def test_ambiguous_handover_reconciles_same_invocation_without_terminal_defer(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000080.txt"
+    prompt.write_text("next bounded task", encoding="utf-8")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000079", "lastCompletedTaskId": "000079",
+        "nextTaskId": "000080", "nextPromptPath": str(prompt), "rolloverDue": True,
+        "rolloverTrigger": "MEMORY_THRESHOLD", "rolloverPending": True,
+        "architectConversationId": "OLD", "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES,
+    })
+    watcher.save()
+    clock = [100.0]
+    monkeypatch.setattr(watcher_module.time, "time", lambda: clock[0])
+    sends = []
+    ready = [False]
+
+    handover_prefix = "AFFOTECH ARCHITECT SESSION HANDOVER"
+
+    class Page:
+        def __init__(self, url, users=None, assistants=None):
+            self.url = url
+            self.users = users or []
+            self.assistants = assistants or []
+            self.context = None
+            self.closed = False
+
+        def evaluate(self, script):
+            if "stop-button" in script:
+                return False
+            if 'data-message-author-role="user"' in script:
+                return self.users
+            if 'data-message-author-role="assistant"' in script:
+                return self.assistants
+            return []
+
+        def close(self):
+            self.closed = True
+
+    old_page = Page("https://chatgpt.com/c/OLD")
+    fresh_page = Page("https://chatgpt.com/c/FRESH")
+    context = type("Context", (), {"pages": [old_page, fresh_page]})()
+    old_page.context = fresh_page.context = context
+
+    class Bridge:
+        page = old_page
+
+        def assistant_baseline(self):
+            return {"count": 0, "text_hash": "baseline", "entries": []}
+
+        def generation_visible(self):
+            return False
+
+        def submit_result_bounded(self, payload):
+            sends.append(payload)
+            raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT")
+
+        def _assistant_entries(self):
+            if not ready[0]:
+                return []
+            transaction_id = watcher.state["rolloverTransactionId"]
+            return [{"id": "handover", "text": f"{handover_prefix}\nRollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"}]
+
+        def close(self):
+            pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+
+    # The first send action is attempted once, then its acknowledgement times
+    # out.  The same service invocation must reconcile read-only rather than
+    # recording terminal DEFERRED state.
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
+    assert len(sends) == 1
+    assert watcher.state["rolloverHandoverSendState"] == "AMBIGUOUS"
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverInProgress"] is True
+    assert watcher.state["handoverRequested"] is True
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    assert "rolloverDeferredForTaskId" not in watcher.state
+    assert watcher.state["rolloverHandoverRecoveryDisposition"] == "RETRYABLE"
+
+    # A later bounded read on the same watcher finds the matching response;
+    # no second submit is permitted and no operator restart is involved.
+    ready[0] = True
+    transaction_id = watcher.state["rolloverTransactionId"]
+    handover = f"{handover_prefix}\nRollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"
+    fresh_page.users = [watcher_module.fresh_architect_bootstrap_payload(handover)]
+    fresh_page.assistants = [{"id": "ready", "text": "ARCHITECT_SESSION_READY"}]
+    clock[0] = 106.0
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is True
+    assert len(sends) == 1
+    assert watcher.state["architectConversationId"] == "FRESH"
+    assert watcher.state["rolloverDue"] is False
+    assert watcher.state["rolloverPending"] is False
+    assert watcher.state["rolloverInProgress"] is False
+    assert watcher.state["handoverRequested"] is False
+    assert watcher.state.get("humanRequiredReason") is None
+    assert getattr(watcher, "_operator_restart_rollover_recovery_available", False) is False
+
+
 def test_deferred_rollover_gets_fresh_transaction_and_rejects_stale_handover(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     prompt_a = tmp_path / "000041.txt"

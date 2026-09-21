@@ -1729,10 +1729,17 @@ class ArchitectSessionRollover:
                     "handoverRequested": True,
                     "handoverReady": False,
                     "rolloverHandoverSendState": "AMBIGUOUS",
-                    "rolloverMaintenanceState": "DEFERRED",
+                    # An acknowledgement timeout means delivery is unknown,
+                    # not failed.  Keep the transaction live so the caller
+                    # can reconcile the existing Architect response without
+                    # requiring a process restart or sending again.
+                    "rolloverMaintenanceState": "RECONCILE_PENDING",
+                    "rolloverHandoverRecoveryDisposition": "RECONCILE_PENDING",
+                    "rolloverHandoverRecoveryReason": type(error).__name__,
                     "rolloverLastFailureReason": type(error).__name__,
-                    "rolloverDeferredForTaskId": task_id,
                 })
+                self.watcher.state.pop("rolloverDeferredForTaskId", None)
+                self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
                 runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_SEND_AMBIGUOUS", self.watcher.state, errorClass=type(error).__name__)
             else:
                 self.watcher.state.update({
@@ -1852,12 +1859,33 @@ class ArchitectSessionRollover:
             self.watcher.save()
         return self.watcher.process_pending_handover_response(bridge, handover)
 
+    def handover_reconciliation_pending(self) -> bool:
+        """Whether the current transaction is live and awaits read-only reconciliation."""
+        state = self.watcher.state
+        return bool(
+            state.get("rolloverDue")
+            and state.get("rolloverPending")
+            and state.get("rolloverInProgress")
+            and state.get("handoverRequested")
+            and state.get("rolloverHandoverSendState") == "AMBIGUOUS"
+            and state.get("rolloverMaintenanceState") in {"IN_PROGRESS", "RECONCILE_PENDING"}
+            and state.get("rolloverHandoverRecoveryDisposition") not in {"HUMAN_REQUIRED", "EXHAUSTED"}
+        )
+
     def _mark_handover_recovery_disposition(self, disposition: str, reason: str) -> None:
         previous = (self.watcher.state.get("rolloverHandoverRecoveryDisposition"),
                     self.watcher.state.get("rolloverHandoverRecoveryReason"))
         self.watcher.state["rolloverHandoverRecoveryDisposition"] = disposition
         self.watcher.state["rolloverHandoverRecoveryReason"] = reason
         if disposition == "RETRYABLE":
+            # RETRYABLE is still a live transaction disposition.  It must not
+            # be converted into terminal DEFERRED merely because one
+            # read-only reconciliation did not yet find the response.
+            if (self.watcher.state.get("rolloverPending")
+                    and (self.watcher.state.get("rolloverInProgress")
+                         or self.watcher.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"})):
+                self.watcher.state["rolloverMaintenanceState"] = "RECONCILE_PENDING"
+                self.watcher.state.pop("rolloverDeferredForTaskId", None)
             self.watcher.state["rolloverHandoverRecoveryRetryAfter"] = time.time() + 5.0
         else:
             self.watcher.state.pop("rolloverHandoverRecoveryRetryAfter", None)
@@ -5892,7 +5920,19 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     elif stale_retired and restart_recovery_available:
         consume_operator_restart_recovery()
     rollover = watcher.session_rollover
+    reconciliation_live_before_recovery = rollover.handover_reconciliation_pending()
     if not rollover._begin_bounded_recovery():
+        if reconciliation_live_before_recovery:
+            started = float(watcher.state.get("rolloverRecoveryStartedAt", 0.0) or 0.0)
+            runtime_log(
+                getattr(watcher, "runtime_logger", None),
+                getattr(watcher, "runtime_run_id", None),
+                "HANDOVER_RECONCILIATION_EXHAUSTED",
+                watcher.state,
+                attempts=int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0),
+                elapsedSeconds=max(0.0, time.time() - started) if started else None,
+                reason=watcher.state.get("rolloverRecoveryTerminalReason") or "BOUNDED_RECOVERY_EXHAUSTED",
+            )
         if tracer:
             tracer.record("ROLLOVER", "service_deferred_rollover_once", "GATE", "DECISION", watcher.state, gate="bounded_recovery", result="BLOCK", reason="backoff_or_terminal")
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
@@ -5901,6 +5941,35 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     def failed() -> bool:
         rollover._record_recovery_failure()
         return False
+    def reconcile_pending(bridge: Any) -> bool:
+        """Reconcile one existing transaction without ever resending it."""
+        attempt = int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0)
+        transaction_id = watcher.state.get("rolloverTransactionId")
+        runtime_log(
+            getattr(watcher, "runtime_logger", None),
+            getattr(watcher, "runtime_run_id", None),
+            "HANDOVER_RECONCILIATION_ATTEMPT",
+            watcher.state,
+            attempt=attempt,
+            transactionId=transaction_id,
+            readOnly=True,
+            handoverResent=False,
+        )
+        result = rollover.reconcile_pending_handover(bridge)
+        disposition = "SUCCESS" if result else watcher.state.get("rolloverHandoverRecoveryDisposition")
+        if disposition not in {"RETRYABLE", "HUMAN_REQUIRED"}:
+            disposition = "RETRYABLE" if rollover.handover_reconciliation_pending() else "EXHAUSTED"
+        runtime_log(
+            getattr(watcher, "runtime_logger", None),
+            getattr(watcher, "runtime_run_id", None),
+            "HANDOVER_RECONCILIATION_RESULT",
+            watcher.state,
+            found=bool(watcher.state.get("pending_handover") or watcher.state.get("handoverReady")),
+            transactionMatched=bool(result or watcher.state.get("handoverReady")),
+            disposition=disposition,
+            handoverResent=False,
+        )
+        return result
     bridge = None
     try:
         conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
@@ -5911,11 +5980,13 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         legacy_task = str(watcher.state.get("taskId") or "")
         if (watcher.state.get("rolloverPending") and task_id
                 and watcher.state.get("rolloverAttemptedForTaskId") in {task_id, legacy_task}):
-            if rollover.reconcile_pending_handover(bridge):
+            if reconcile_pending(bridge):
                 rollover._record_recovery_success()
                 return True
             if (watcher.state.get("handoverRequested")
                     or watcher.state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}):
+                if rollover.handover_reconciliation_pending():
+                    return False
                 return failed()
         send_state = watcher.state.get("rolloverHandoverSendState")
         recovery_evidence = any(
@@ -5941,6 +6012,26 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             safe_boundary_state=boundary_state,
             allow_same_task_unsent_recovery=allow_same_task_unsent_recovery,
         ):
+            if rollover.handover_reconciliation_pending():
+                runtime_log(
+                    getattr(watcher, "runtime_logger", None),
+                    getattr(watcher, "runtime_run_id", None),
+                    "AMBIGUOUS_HANDOVER_RECONCILIATION_PENDING",
+                    watcher.state,
+                    transactionId=watcher.state.get("rolloverTransactionId"),
+                    taskId=watcher.state.get("rolloverTransactionTaskId"),
+                    handoverResent=False,
+                    maintenanceState=watcher.state.get("rolloverMaintenanceState"),
+                )
+                if reconcile_pending(bridge):
+                    rollover._record_recovery_success()
+                    return True
+                # The send may have succeeded even though its acknowledgement
+                # timed out.  A not-yet-visible response is retryable; it is
+                # not a terminal maintenance failure and must not enter the
+                # passive DEFERRED state here.
+                if rollover.handover_reconciliation_pending():
+                    return False
             return failed()
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ARCHITECT_WAIT_BEGIN", watcher.state,
                     conversationId=conversation_id, generationVisible="NOT_SAMPLED_AT_LOG_POINT", pollIntervalSeconds=0.5,
