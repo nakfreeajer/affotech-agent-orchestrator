@@ -227,17 +227,34 @@ def _diagnostic_memory_candidate(tracer: DiagnosticTracer, state: dict[str, Any]
     )
 
 
-def _disconnect_architect_bridge_read_only(bridge: Any, tracer: DiagnosticTracer, state: dict[str, Any]) -> None:
+def _disconnect_architect_bridge_read_only(
+    bridge: Any,
+    tracer: DiagnosticTracer | None = None,
+    state: dict[str, Any] | None = None,
+) -> Exception | None:
     """Disconnect an attached browser without Browser.close() or page mutation."""
     started = time.monotonic()
     connection_id = getattr(bridge, "_diagnostic_connection_id", None)
+    error = None
     try:
         runtime = getattr(bridge, "_runtime", None)
         if runtime is not None:
             runtime.stop()
-        tracer.close_connection(connection_id, "diagnostic_only_disconnect", state=state, started=started)
-    except Exception as error:
-        tracer.close_connection(connection_id, "diagnostic_only_disconnect", state=state, started=started, error=error)
+    except Exception as caught:
+        error = caught
+    finally:
+        if tracer is not None:
+            tracer.close_connection(
+                connection_id,
+                "diagnostic_only_disconnect",
+                state=state,
+                started=started,
+                error=error,
+            )
+        bridge._diagnostic_connection_id = None
+        bridge._runtime = None
+        bridge._browser = None
+    return error
 
 
 def run_rollover_diagnostic_only(watcher: Any, endpoint: str, tracer: DiagnosticTracer) -> str:
@@ -6164,15 +6181,18 @@ def passive_architect_memory_sample_for_pause(
         return False
     finally:
         if temporary_bridge and bridge is not None:
-            try:
-                bridge.close()
-            except Exception as error:
+            cleanup_error = _disconnect_architect_bridge_read_only(
+                bridge,
+                diagnostic_trace_for(watcher),
+                watcher.state,
+            )
+            if cleanup_error is not None:
                 runtime_log(
                     getattr(watcher, "runtime_logger", None),
                     getattr(watcher, "runtime_run_id", None),
                     "ARCHITECT_MEMORY_SAMPLE_FAILED",
                     watcher.state,
-                    error=f"PASSIVE_CLOSE_{type(error).__name__.upper()}",
+                    error=f"PASSIVE_CLOSE_{type(cleanup_error).__name__.upper()}",
                     readOnly=True,
                     workflowMutation=False,
                 )

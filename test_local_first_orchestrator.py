@@ -181,7 +181,7 @@ def test_paused_workflow_still_samples_architect_memory_without_actions(tmp_path
     assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
     assert watcher.state["architectMemoryBytes"] == 700 * 1024 * 1024
     assert watcher.state["rolloverDue"] is False
-    assert calls == {"attach": 1, "close": 1, "send": 0, "navigate": 0, "new_page": 0}
+    assert calls == {"attach": 1, "close": 0, "send": 0, "navigate": 0, "new_page": 0}
     assert watcher.state["state"] == workflow_state
     assert watcher.state["discussionPauseActive"] is True
 
@@ -222,7 +222,7 @@ def test_paused_memory_crossing_sets_due_without_workflow_action(tmp_path, monke
     assert watcher.state["discussionPauseActive"] is True
     assert watcher.state["rolloverDue"] is True
     assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
-    assert calls == {"attach": 3, "close": 3, "send": 0, "navigate": 0, "new_page": 0}
+    assert calls == {"attach": 3, "close": 0, "send": 0, "navigate": 0, "new_page": 0}
 
 
 def test_paused_memory_cooldown_and_reader_failure_are_workflow_neutral(tmp_path, monkeypatch):
@@ -249,7 +249,94 @@ def test_paused_memory_cooldown_and_reader_failure_are_workflow_neutral(tmp_path
     after = {key: watcher.state.get(key) for key in before}
     assert after == before
     assert watcher.state.get("humanRequiredReason") is None
-    assert calls == {"attach": 1, "close": 1}
+    assert calls == {"attach": 1, "close": 0}
+
+
+def test_passive_probe_uses_real_read_only_disconnect_lifecycle(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+                          "discussionPauseActive": True, "rolloverDue": False,
+                          "architectConversationId": "ARCH-OLD"})
+    watcher.save()
+    counts = {"browser_close": 0, "page_close": 0, "context_close": 0, "runtime_stop": 0}
+
+    class Browser:
+        def close(self):
+            counts["browser_close"] += 1
+            raise AssertionError("passive probe must not close Browser")
+
+    class Context:
+        def close(self):
+            counts["context_close"] += 1
+            raise AssertionError("passive probe must not close context")
+
+    class Page:
+        context = Context()
+        url = "https://chatgpt.com/c/ARCH-OLD"
+        def close(self):
+            counts["page_close"] += 1
+            raise AssertionError("passive probe must not close page")
+
+    class Runtime:
+        def stop(self):
+            counts["runtime_stop"] += 1
+
+    bridge = ArchitectPlaywright(Page())
+    bridge._browser = Browser()
+    bridge._runtime = Runtime()
+    bridge.current_session_memory_bytes = lambda: 700 * 1024 * 1024
+
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
+    assert counts == {"browser_close": 0, "page_close": 0, "context_close": 0, "runtime_stop": 1}
+    assert bridge._browser is None and bridge._runtime is None
+
+
+def test_passive_probe_keeps_existing_bridge_and_normal_close_semantics(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "RESULT_READY", "taskId": "000079", "discussionPauseActive": True})
+    watcher.save()
+    counts = {"browser_close": 0, "runtime_stop": 0}
+
+    class Browser:
+        def close(self): counts["browser_close"] += 1
+
+    class Runtime:
+        def stop(self): counts["runtime_stop"] += 1
+
+    existing = ArchitectPlaywright(object())
+    existing._browser = Browser()
+    existing._runtime = Runtime()
+    existing.current_session_memory_bytes = lambda: 700 * 1024 * 1024
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint", existing_bridge=existing) is True
+    assert counts == {"browser_close": 0, "runtime_stop": 0}
+    assert existing._browser is not None and existing._runtime is not None
+
+    normal = ArchitectPlaywright(object())
+    normal._browser = Browser()
+    normal._runtime = Runtime()
+    normal.close()
+    assert counts == {"browser_close": 1, "runtime_stop": 1}
+
+
+def test_passive_probe_cleanup_failure_is_workflow_neutral(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000079", "nextTaskId": "000080",
+                          "discussionPauseActive": True, "rolloverDue": False})
+    watcher.save()
+
+    class Runtime:
+        def stop(self): raise RuntimeError("SYNTHETIC_DISCONNECT_FAILURE")
+
+    bridge = ArchitectPlaywright(object())
+    bridge._browser = type("Browser", (), {"close": lambda _self: (_ for _ in ()).throw(AssertionError("browser close"))})()
+    bridge._runtime = Runtime()
+    bridge.current_session_memory_bytes = lambda: 700 * 1024 * 1024
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    assert watcher_module.passive_architect_memory_sample_for_pause(watcher, "synthetic-endpoint") is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["taskId"] == "000079"
+    assert watcher.state.get("humanRequiredReason") is None
 
 
 def recovery_fixture(tmp_path):
