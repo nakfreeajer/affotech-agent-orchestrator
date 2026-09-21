@@ -2229,7 +2229,8 @@ def test_assistant_entries_runtime_script_parses_and_old_python_escaping_is_reje
     from local_orchestrator_watcher import assistant_entries_script
 
     emitted = assistant_entries_script()
-    assert r"writingBlocks.map(clean).join('\n')" in emitted
+    assert "const text = clean(node);" in emitted
+    assert r"writingBlocks.map(clean).join('\n')" not in emitted
     node_program = 'const source = process.argv[1]; new Function("return (" + source + ")");'
     valid = subprocess.run(["node", "-e", node_program, emitted], capture_output=True, text=True)
     assert valid.returncode == 0, valid.stderr
@@ -2238,6 +2239,146 @@ def test_assistant_entries_runtime_script_parses_and_old_python_escaping_is_reje
     assert r"join('\n')" not in broken
     invalid = subprocess.run(["node", "-e", node_program, broken], capture_output=True, text=True)
     assert invalid.returncode != 0
+
+
+def _run_assistant_entries_dom_fixture(tree):
+    from local_orchestrator_watcher import assistant_entries_script
+
+    program = r'''
+const source = process.argv[1];
+const fixture = JSON.parse(process.argv[2]);
+class Element {
+  constructor(spec, parent = null) {
+    this.attrs = Object.assign({}, spec.attrs || {});
+    this.ownText = spec.text || '';
+    this.parent = parent;
+    this.children = (spec.children || []).map(child => new Element(child, this));
+    this.connected = true;
+  }
+  getAttribute(name) { return this.attrs[name] ?? null; }
+  get isConnected() { return this.connected; }
+  get innerText() { return this.ownText + this.children.filter(c => c.connected).map(c => c.innerText).join(''); }
+  get textContent() { return this.innerText; }
+  cloneNode(deep) {
+    const clone = new Element({attrs: this.attrs, text: this.ownText});
+    if (deep) clone.children = this.children.filter(c => c.connected).map(child => child.cloneNode(true));
+    clone.children.forEach(child => child.parent = clone);
+    return clone;
+  }
+  remove() {
+    this.connected = false;
+    if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this);
+  }
+  matches(selector) {
+    if (selector === 'button') return this.attrs.tag === 'button';
+    if (selector === '[role="button"]') return this.attrs.role === 'button';
+    if (selector === '[aria-hidden="true"]') return this.attrs['aria-hidden'] === 'true';
+    if (selector === '[data-testid="writing-block-suggested-followups"]') return this.attrs['data-testid'] === 'writing-block-suggested-followups';
+    if (selector === '[data-testid="writing-block-suggested-followups-surface"]') return this.attrs['data-testid'] === 'writing-block-suggested-followups-surface';
+    const m = selector.match(/^\[([^=]+)="([^"]*)"\]$/);
+    return !!m && this.attrs[m[1]] === m[2];
+  }
+  querySelectorAll(selector) {
+    const selectors = selector.split(',').map(x => x.trim());
+    const result = [];
+    const walk = node => {
+      for (const child of node.children) {
+        if (!child.connected) continue;
+        if (selectors.some(s => child.matches(s))) result.push(child);
+        walk(child);
+      }
+    };
+    walk(this);
+    return result;
+  }
+}
+const root = new Element(fixture);
+global.document = {
+  querySelectorAll: selector => {
+    const selectors = selector.split(',').map(x => x.trim());
+    const rootMatch = selectors.some(s => root.matches(s)) ? [root] : [];
+    return rootMatch.concat(root.querySelectorAll(selector));
+  }
+};
+const extractor = eval('(' + source + ')');
+process.stdout.write(JSON.stringify(extractor()));
+'''
+    completed = subprocess.run(
+        ["node", "-e", program, assistant_entries_script(), json.dumps(tree)],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(completed.stdout)[0]
+
+
+def test_assistant_semantic_extraction_preserves_mixed_response_and_filters_controls():
+    from local_orchestrator_watcher import architect_handover_ready, handover_transaction_matches
+
+    marker = "2b324cd32cefc00ef1790c36"
+    standard = _run_assistant_entries_dom_fixture({
+        "attrs": {"data-message-author-role": "assistant", "data-message-id": "standard"},
+        "text": "standard prose",
+        "children": [{"attrs": {"tag": "button"}, "text": "button chrome"},
+                      {"attrs": {"aria-hidden": "true"}, "text": "hidden chrome"}],
+    })
+    assert standard["semanticSource"] == "STANDARD_RESPONSE"
+    assert standard["text"] == "standard prose"
+
+    writing_only = _run_assistant_entries_dom_fixture({
+        "attrs": {"data-message-author-role": "assistant", "data-message-id": "writing"},
+        "children": [{"attrs": {"data-testid": "writing-block-container"}, "text": "block prose", "children": [
+            {"attrs": {"data-testid": "writing-block-suggested-followups"}, "text": "follow-up chrome"},
+        ]}],
+    })
+    assert writing_only["text"] == "block prose"
+    assert writing_only["text"].count("block prose") == 1
+    assert "follow-up chrome" not in writing_only["text"]
+
+    mixed = _run_assistant_entries_dom_fixture({
+        "attrs": {"data-message-author-role": "assistant", "data-message-id": "mixed"},
+        "text": "prefix ",
+        "children": [
+            {"attrs": {"data-testid": "writing-block-container"}, "text": "writing block "},
+            {"text": "suffix"},
+        ],
+    })
+    assert mixed["semanticSource"] == "WRITING_BLOCK"
+    assert mixed["text"] == "prefix writing block suffix"
+    assert mixed["text"].count("writing block") == 1
+
+    production = _run_assistant_entries_dom_fixture({
+        "attrs": {"data-message-author-role": "assistant", "data-message-id": "generation-2"},
+        "children": [
+            {"attrs": {"data-testid": "writing-block-container"}, "text": "handover body\n"},
+            {"text": f"Rollover transaction ID: {marker}\nARCHITECT_HANDOVER_READY"},
+        ],
+    })
+    assert marker in production["text"]
+    assert "ARCHITECT_HANDOVER_READY" in production["text"]
+    assert architect_handover_ready(production["text"])
+    assert handover_transaction_matches(production["text"], marker)
+    assert not handover_transaction_matches(production["text"].replace(marker, "768df22312ef1a5c0f86a9ea"), marker)
+    assert not handover_transaction_matches(production["text"].replace(marker, "8084c3b80c13ebccb27d52c4"), marker)
+
+    inside = _run_assistant_entries_dom_fixture({
+        "attrs": {"data-message-author-role": "assistant", "data-message-id": "inside"},
+        "children": [{"attrs": {"data-testid": "writing-block-container"},
+                      "text": f"Rollover transaction ID: {marker}\nARCHITECT_HANDOVER_READY"}],
+    })
+    assert handover_transaction_matches(inside["text"], marker)
+
+    controls = _run_assistant_entries_dom_fixture({
+        "attrs": {"data-message-author-role": "assistant", "data-message-id": "controls"},
+        "children": [
+            {"attrs": {"data-testid": "writing-block-container"}, "text": "legitimate prose"},
+            {"attrs": {"tag": "button"}, "text": f"Rollover transaction ID: {marker}\nARCHITECT_HANDOVER_READY"},
+            {"attrs": {"role": "button"}, "text": "ARCHITECT_HANDOVER_READY"},
+            {"attrs": {"aria-hidden": "true"}, "text": f"Rollover transaction ID: {marker}"},
+            {"attrs": {"data-testid": "writing-block-suggested-followups-surface"}, "text": "ARCHITECT_HANDOVER_READY"},
+        ],
+    })
+    assert marker not in controls["text"]
+    assert "ARCHITECT_HANDOVER_READY" not in controls["text"]
+    assert not architect_handover_ready(controls["text"])
 
 
 def test_assistant_entries_diagnostic_trace_records_each_evaluate_error_and_exhaustion(tmp_path):

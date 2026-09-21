@@ -2701,9 +2701,11 @@ def assistant_entries_script() -> str:
                   const writingBlocks = [...node.querySelectorAll('[data-testid="writing-block-container"]')]
                     .filter((block) => block.isConnected);
                   const semanticSource = writingBlocks.length ? 'WRITING_BLOCK' : 'STANDARD_RESPONSE';
-                  const text = writingBlocks.length
-                    ? writingBlocks.map(clean).join('\n')
-                    : clean(node);
+                  // Writing blocks are part of the assistant response, not a
+                  // replacement for the surrounding response text. Clean the
+                  // complete node once so legitimate prefixes/suffixes remain
+                  // available to response and handover matching.
+                  const text = clean(node);
                   return {
                     id: node.getAttribute('data-message-id'),
                     rawText: node.innerText || node.textContent || '',
