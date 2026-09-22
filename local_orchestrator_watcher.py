@@ -4860,7 +4860,10 @@ class LocalFirstOrchestrator:
             self.state["humanRecoveryAuthorizationError"] = "HUMAN_RECOVERY_TASK_MISMATCH"
             self.save()
             return None
-        if self.state.get("humanRecoveryAuthorizationConsumed"):
+        if (
+            self.state.get("humanRecoveryAuthorizationConsumed")
+            and self.state.get("humanRecoveryAuthorizedTaskId") == task_id
+        ):
             self.state["humanRecoveryAuthorizationError"] = "HUMAN_RECOVERY_AUTHORIZATION_CONSUMED"
             self.save()
             return None
@@ -4876,6 +4879,7 @@ class LocalFirstOrchestrator:
                 raise RuntimeError("PRELAUNCH_WORKTREE_NOT_OWNED")
             verify_executor_session(str(self.state.get("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)))
             self.state.update({"humanRecoveryAuthorizationConsumed": True, "humanRecoveryAuthorizedTaskId": task_id, "automaticRetryAuthorized": False, "state": "NEXT_PROMPT_READY", "nextTaskId": task_id, "targetProject": str(owned), "targetRepo": str(owned), "targetWorktree": str(owned)})
+            self.state.pop("humanRecoveryAuthorizationError", None)
             self.save()
             return True
         except (OSError, UnicodeError, RuntimeError) as error:

@@ -4698,6 +4698,98 @@ def test_exact_human_postlaunch_retry_is_consumed_and_launches_once(tmp_path, mo
     assert watcher.state["automaticRetryAuthorized"] is False
 
 
+def test_old_task_consumed_authorization_allows_current_task_once(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({
+        "humanRecoveryAuthorizationConsumed": True,
+        "humanRecoveryAuthorizedTaskId": "OLD-TASK",
+        "humanRecoveryAuthorizationError": "HUMAN_RECOVERY_AUTHORIZATION_CONSUMED",
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: True)
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is True
+    assert launches == []
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == task_id
+    assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == task_id
+    assert "humanRecoveryAuthorizationError" not in watcher.state
+
+
+def test_same_task_consumed_authorization_remains_one_shot(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({
+        "humanRecoveryAuthorizationConsumed": True,
+        "humanRecoveryAuthorizedTaskId": task_id,
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is None
+    assert launches == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRecoveryAuthorizationError"] == "HUMAN_RECOVERY_AUTHORIZATION_CONSUMED"
+
+
+def test_old_task_consumed_authorization_current_validation_failure_preserves_evidence(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state.update({
+        "humanRecoveryAuthorizationConsumed": True,
+        "humanRecoveryAuthorizedTaskId": "OLD-TASK",
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: (_ for _ in ()).throw(RuntimeError("EXECUTOR_SESSION_NOT_FOUND")))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is None
+    assert launches == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == "OLD-TASK"
+    assert watcher.state["humanRecoveryAuthorizationError"] == "EXECUTOR_SESSION_NOT_FOUND"
+
+
+def test_task_scoped_authorization_allows_sequential_tasks_once_each(tmp_path, monkeypatch):
+    watcher, base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: True)
+    launches = []
+    task_a = watcher.state["taskId"]
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_a)
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append("a")) is True
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == task_a
+
+    task_b = "TASK-B"
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "HEAD"], text=True).strip()
+    prompt_b = configured_project_prompt(base, head, task_b)
+    prompt_b_path = watcher.prompts_dir / f"{task_b}.txt"
+    prompt_b_path.write_text(prompt_b, encoding="utf-8")
+    worktree_b = watcher._owned_task_worktree(task_b, prompt_b)
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "taskId": task_b,
+        "nextTaskId": task_b,
+        "executorLaunchState": "POSTLAUNCH_NO_RESULT",
+        "nextPromptPath": str(prompt_b_path),
+    })
+    watcher.save()
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_b)
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append("b")) is True
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == "TASK-B"
+    assert launches == []
+
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append("b-again")) is None
+    assert launches == []
+
+
 def test_failed_human_postlaunch_retry_cannot_reuse_authorization(tmp_path, monkeypatch):
     watcher, base, worktree = postlaunch_recovery_fixture(tmp_path)
     task_id = watcher.state["taskId"]
