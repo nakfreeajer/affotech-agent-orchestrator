@@ -4720,6 +4720,48 @@ def test_old_task_consumed_authorization_allows_current_task_once(tmp_path, monk
     assert "humanRecoveryAuthorizationError" not in watcher.state
 
 
+def test_postlaunch_retry_inherits_persisted_project_context_without_prompt_metadata(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.prompts_dir.joinpath(f"{task_id}.txt").write_text("MILESTONE\npostlaunch retry without project metadata\n", encoding="utf-8")
+    watcher.state.update({
+        "nextPromptPath": str(watcher.prompts_dir / f"{task_id}.txt"),
+        "humanRecoveryAuthorizationConsumed": True,
+        "humanRecoveryAuthorizedTaskId": "OLD-TASK",
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: True)
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is True
+    assert launches == []
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == task_id
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == task_id
+
+
+def test_postlaunch_retry_without_project_context_fails_closed_before_git(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    watcher.state["taskWorktrees"] = {}
+    watcher.state.update({
+        "humanRecoveryAuthorizationConsumed": True,
+        "humanRecoveryAuthorizedTaskId": "OLD-TASK",
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(watcher_module, "verify_executor_session", lambda _sid: True)
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    launches = []
+    assert watcher.authorize_postlaunch_retry(lambda *_: launches.append(1)) is None
+    assert launches == []
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRecoveryAuthorizationConsumed"] is True
+    assert watcher.state["humanRecoveryAuthorizedTaskId"] == "OLD-TASK"
+    assert watcher.state["humanRecoveryAuthorizationError"] == "PRELAUNCH_WORKTREE_NOT_OWNED"
+
+
 def test_same_task_consumed_authorization_remains_one_shot(tmp_path, monkeypatch):
     watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
     task_id = watcher.state["taskId"]

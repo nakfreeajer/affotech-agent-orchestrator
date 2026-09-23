@@ -4802,11 +4802,13 @@ class LocalFirstOrchestrator:
         if self._git(persisted_path, "status", "--porcelain"):
             raise RuntimeError("RECOVERY_WORKTREE_DIRTY")
         try:
-            owned = self._owned_task_worktree(task_id, prompt)
+            owned = self._owned_task_worktree(task_id, prompt, context_task_id=task_id)
         except RuntimeError as error:
             if "AUTHORITY_ADVANCED" in str(error) or "SOURCE_MISMATCH" in str(error):
                 raise RuntimeError("RECOVERY_SOURCE_ADVANCED") from error
             raise
+        if owned is None:
+            raise RuntimeError("PRELAUNCH_WORKTREE_NOT_OWNED")
         if self._git(owned, "rev-parse", "HEAD").lower() != expected_head.lower():
             raise RuntimeError("RECOVERY_WORKTREE_HEAD_CHANGED")
         if self._git(owned, "status", "--porcelain"):
