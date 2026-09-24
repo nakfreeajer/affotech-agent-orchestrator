@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -23,10 +24,41 @@ KNOWN_STATES = {
     "IDLE", "NEXT_PROMPT_READY", "RESULT_READY", "ARCHITECT_RUNNING",
     "EXECUTOR_RUNNING", "EXECUTOR_CRASHED", "HUMAN_REQUIRED",
 }
+EXPECTED_REPOSITORY_IDENTITY = "nakfreeajer/affotech-agent-orchestrator"
+EXPECTED_BRANCH = "main"
 
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True, encoding="utf-8").strip()
+
+
+def repository_identity(remote: str) -> str:
+    value = str(remote or "").strip().replace("\\", "/")
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    elif value.startswith("git@") and ":" in value:
+        value = value.split(":", 1)[1]
+    value = value.split("/", 1)[1] if "/" in value and value.split("/", 1)[0].lower() in {"github.com", "www.github.com"} else value
+    return value.removesuffix(".git").strip("/").lower()
+
+
+def valid_architect_baseline(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("count"), int)
+        and not isinstance(value.get("count"), bool)
+        and value["count"] >= 0
+        and isinstance(value.get("text_hash"), str)
+        and bool(re.fullmatch(r"[0-9a-fA-F]{64}", value["text_hash"]))
+    )
+
+
+def architect_baseline_advanced(persisted: Any, current: Any) -> bool:
+    if not valid_architect_baseline(persisted) or not valid_architect_baseline(current):
+        return False
+    if current["count"] < persisted["count"]:
+        return False
+    return current["count"] > persisted["count"] or current["text_hash"].lower() != persisted["text_hash"].lower()
 
 
 def _result_exists(state: dict[str, Any]) -> bool:
@@ -103,10 +135,12 @@ def discover(
     try:
         head = _git(repo, "rev-parse", "HEAD")
         branch = _git(repo, "branch", "--show-current")
+        remote = _git(repo, "config", "--get", "remote.origin.url")
         cleanliness = not bool(_git(repo, "status", "--porcelain"))
     except (OSError, subprocess.CalledProcessError) as error:
         raise RuntimeError("REPOSITORY_IDENTITY_UNAVAILABLE") from error
-    if not branch or not head:
+    identity = repository_identity(remote)
+    if not branch or not head or branch != EXPECTED_BRANCH or identity != EXPECTED_REPOSITORY_IDENTITY:
         raise RuntimeError("REPOSITORY_IDENTITY_INCONSISTENT")
     records = process_records if process_records is not None else _default_process_records()
     session_id = str(state.get("executorSessionId") or "")
@@ -116,6 +150,15 @@ def discover(
         if "local_orchestrator_watcher.py" in str(row.get("CommandLine") or "")
     ]
     writers = _session_writer_records(session_id, records)
+    executor_process = next(
+        (row for row in records if str(row.get("ProcessId")) == str(pid)), None
+    )
+    executor_pid_owned = bool(
+        executor_process
+        and session_id
+        and session_id in str(executor_process.get("CommandLine") or "")
+        and "local_orchestrator_watcher.py" not in str(executor_process.get("CommandLine") or "")
+    )
     prompt_path = state.get("nextPromptPath")
     prompt = Path(prompt_path) if isinstance(prompt_path, str) and prompt_path else None
     result_path = state.get("executorResultPath")
@@ -126,11 +169,16 @@ def discover(
         "statePath": str(state_path),
         "head": head,
         "branch": branch,
+        "remoteOrigin": remote,
+        "repositoryIdentity": identity,
+        "repositoryIdentityValid": identity == EXPECTED_REPOSITORY_IDENTITY,
         "workingTreeClean": cleanliness,
         "state": state,
         "watcherRunning": bool(watcher_records),
         "watcherProcesses": watcher_records,
         "executorPidAlive": _pid_alive(pid, records),
+        "executorPidOwned": executor_pid_owned,
+        "executorProcess": executor_process,
         "executorPid": pid,
         "activeWriterPresent": bool(writers),
         "activeWriters": writers,
@@ -150,7 +198,11 @@ def classify_architect_observation(state: dict[str, Any], observation: dict[str,
         return "ARCHITECT_RECOVERY_INCONCLUSIVE"
     if observation.get("generationVisible"):
         return "WAIT_EXISTING_ARCHITECT"
-    if observation.get("newCompletedResponse"):
+    if (
+        observation.get("newCompletedResponse")
+        and observation.get("durableBaselineValid")
+        and observation.get("durableBaselineAdvanced")
+    ):
         return "CONSUME_EXISTING_ARCHITECT_RESPONSE"
     return "ARCHITECT_RECOVERY_INCONCLUSIVE"
 
@@ -165,19 +217,24 @@ def classify_workflow(discovery: dict[str, Any], architect_observation: dict[str
     if workflow == "NEXT_PROMPT_READY":
         return "SAFE_NORMAL_START"
     if workflow == "RESULT_READY":
-        return "SAFE_RESULT_RECOVERY"
+        return "SAFE_RESULT_RECOVERY" if discovery["resultNonEmpty"] else "BLOCK_RESULT_EVIDENCE_MISSING"
     if workflow == "ARCHITECT_RUNNING":
         return classify_architect_observation(state, architect_observation)
     if workflow == "EXECUTOR_RUNNING":
         executor_pid = discovery.get("executorPid")
-        owned_writer = any(
-            str(row.get("ProcessId")) == str(executor_pid)
-            for row in discovery.get("activeWriters", [])
-        )
-        if discovery["activeWriterPresent"] and not (discovery["executorPidAlive"] and owned_writer):
+        executor_owned = bool(discovery.get("executorPidOwned"))
+        other_writers = [
+            row for row in discovery.get("activeWriters", [])
+            if str(row.get("ProcessId")) != str(executor_pid)
+        ]
+        if other_writers:
             return "EXECUTOR_SESSION_ACTIVE_WRITER"
-        if discovery["executorPidAlive"]:
+        if discovery["executorPidAlive"] and executor_owned:
             return "WAIT_EXISTING_EXECUTOR"
+        if discovery["executorPidAlive"] and not executor_owned:
+            return "EXECUTOR_PID_OWNERSHIP_INCONCLUSIVE"
+        if discovery["activeWriterPresent"]:
+            return "EXECUTOR_SESSION_ACTIVE_WRITER"
         if discovery["resultNonEmpty"]:
             return "RECOVER_EXISTING_EXECUTOR_RESULT"
         return "EXECUTOR_INTERRUPTED_NO_RESULT"
@@ -231,14 +288,13 @@ def probe_architect(endpoint: str, conversation_id: str, state: dict[str, Any]) 
     try:
         bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
         baseline = bridge.assistant_baseline()
-        persisted = state.get("architectBaseline") or {}
-        newer = bool(
-            isinstance(persisted, dict)
-            and (baseline.get("count") != persisted.get("count") or baseline.get("text_hash") != persisted.get("text_hash"))
-        )
+        persisted = state.get("architectBaseline")
+        newer = architect_baseline_advanced(persisted, baseline)
         observation = {
             "generationVisible": bool(bridge.generation_visible()),
             "newCompletedResponse": newer,
+            "durableBaselineValid": valid_architect_baseline(persisted),
+            "durableBaselineAdvanced": newer,
             "assistantCount": baseline.get("count"),
         }
         observation["classification"] = classify_architect_observation(state, observation)

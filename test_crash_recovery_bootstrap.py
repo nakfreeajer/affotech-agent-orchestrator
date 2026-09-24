@@ -43,13 +43,35 @@ def test_result_ready_is_safe_result_recovery(tmp_path):
     result.write_text("valid result", encoding="utf-8")
     d, _ = discovery(tmp_path, "RESULT_READY")
     assert bootstrap.classify_workflow(d) == "SAFE_RESULT_RECOVERY"
+    d, _ = discovery(tmp_path / "missing", "RESULT_READY")
+    assert bootstrap.classify_workflow(d) == "BLOCK_RESULT_EVIDENCE_MISSING"
+    d, state = discovery(tmp_path / "empty", "RESULT_READY")
+    result = Path(state["executorResultPath"]); result.parent.mkdir(); result.write_text("", encoding="utf-8")
+    d, _ = discovery(tmp_path / "empty", "RESULT_READY")
+    assert bootstrap.classify_workflow(d) == "BLOCK_RESULT_EVIDENCE_MISSING"
 
 
 def test_architect_running_cases_are_conservative(tmp_path):
     d, _ = discovery(tmp_path / "generating", "ARCHITECT_RUNNING")
     assert bootstrap.classify_workflow(d, {"generationVisible": True}) == "WAIT_EXISTING_ARCHITECT"
-    assert bootstrap.classify_workflow(d, {"generationVisible": False, "newCompletedResponse": True}) == "CONSUME_EXISTING_ARCHITECT_RESPONSE"
+    assert bootstrap.classify_workflow(d, {"generationVisible": False, "newCompletedResponse": True, "durableBaselineAdvanced": True}) == "ARCHITECT_RECOVERY_INCONCLUSIVE"
     assert bootstrap.classify_workflow(d, {"generationVisible": False, "newCompletedResponse": False}) == "ARCHITECT_RECOVERY_INCONCLUSIVE"
+
+
+def _baseline(count, marker):
+    return {"count": count, "text_hash": marker * 64}
+
+
+def test_architect_baseline_proof_requires_valid_durable_advancement():
+    state = {"state": "ARCHITECT_RUNNING"}
+    current = _baseline(2, "b")
+    assert bootstrap.classify_architect_observation(state, {"generationVisible": False, "newCompletedResponse": True, "durableBaselineAdvanced": True}) == "ARCHITECT_RECOVERY_INCONCLUSIVE"
+    for persisted in ({}, {"count": "1", "text_hash": "bad"}, _baseline(2, "b")):
+        observation = {"generationVisible": False, "newCompletedResponse": bootstrap.architect_baseline_advanced(persisted, current), "durableBaselineAdvanced": bootstrap.architect_baseline_advanced(persisted, current)}
+        assert bootstrap.classify_architect_observation(state, observation) == "ARCHITECT_RECOVERY_INCONCLUSIVE"
+    advanced = {"generationVisible": False, "newCompletedResponse": True, "durableBaselineValid": True, "durableBaselineAdvanced": bootstrap.architect_baseline_advanced(_baseline(1, "a"), current)}
+    assert bootstrap.classify_architect_observation(state, advanced) == "CONSUME_EXISTING_ARCHITECT_RESPONSE"
+    assert bootstrap.classify_architect_observation(state, {"generationVisible": True}) == "WAIT_EXISTING_ARCHITECT"
 
 
 def test_executor_live_dead_with_result_and_dead_without_result(tmp_path):
@@ -92,6 +114,21 @@ def test_active_writer_only_blocks_matching_session(tmp_path):
     assert bootstrap.classify_workflow(d) == "EXECUTOR_SESSION_ACTIVE_WRITER"
     d, _ = discovery(tmp_path / "other", "EXECUTOR_RUNNING", codexPid=100, records=[{"ProcessId": 100, "CommandLine": "codex other-session"}])
     assert d["activeWriterPresent"] is False
+    assert bootstrap.classify_workflow(d) == "EXECUTOR_PID_OWNERSHIP_INCONCLUSIVE"
+
+
+def test_executor_session_ownership_distinguishes_reused_pid_and_other_session(tmp_path):
+    d, _ = discovery(tmp_path / "reused", "EXECUTOR_RUNNING", codexPid=99, records=[
+        {"ProcessId": 99, "CommandLine": "codex unrelated-session"},
+    ])
+    assert d["executorPidAlive"] is True
+    assert d["executorPidOwned"] is False
+    assert bootstrap.classify_workflow(d) == "EXECUTOR_PID_OWNERSHIP_INCONCLUSIVE"
+    d, _ = discovery(tmp_path / "different", "EXECUTOR_RUNNING", codexPid=99, records=[
+        {"ProcessId": 99, "CommandLine": "codex unrelated-session"},
+        {"ProcessId": 100, "CommandLine": "codex session-087"},
+    ])
+    assert bootstrap.classify_workflow(d) == "EXECUTOR_SESSION_ACTIVE_WRITER"
 
 
 def test_watcher_detection_prevents_duplicate_start(tmp_path):
@@ -122,12 +159,12 @@ def test_architect_probe_uses_durable_dynamic_identity_and_closes_read_only(monk
 
     closed = []
     class Bridge:
-        def assistant_baseline(self): return {"count": 2, "text_hash": "new"}
+        def assistant_baseline(self): return {"count": 2, "text_hash": "b" * 64}
         def generation_visible(self): return False
         def close(self): closed.append(True)
 
     monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda endpoint, conversation: Bridge()))
-    state = {"state": "ARCHITECT_RUNNING", "architectBaseline": {"count": 1, "text_hash": "old"}}
+    state = {"state": "ARCHITECT_RUNNING", "architectBaseline": {"count": 1, "text_hash": "a" * 64}}
     observed = bootstrap.probe_architect("http://127.0.0.1:9333", "durable-architect-id", state)
     assert observed["classification"] == "CONSUME_EXISTING_ARCHITECT_RESPONSE"
     assert closed == [True]
@@ -158,3 +195,12 @@ def test_bootstrap_watcher_is_visible_and_brave_launch_is_governed():
     assert "--remote-debugging-port=$ArchitectPort" in script
     assert "--user-data-dir=$ArchitectProfile" in script
     assert "local_orchestrator_watcher.py" in script
+    assert "$reason" not in script
+    assert 'ARCHITECT_CDP_ABSENT' in script
+    assert 'ARCHITECT_CDP_UNVERIFIED' in script
+
+
+def test_repository_identity_is_exactly_governed_remote_and_branch():
+    assert bootstrap.repository_identity("https://github.com/nakfreeajer/affotech-agent-orchestrator.git") == bootstrap.EXPECTED_REPOSITORY_IDENTITY
+    assert bootstrap.repository_identity("git@github.com:nakfreeajer/affotech-agent-orchestrator.git") == bootstrap.EXPECTED_REPOSITORY_IDENTITY
+    assert bootstrap.repository_identity("https://github.com/other/repo.git") != bootstrap.EXPECTED_REPOSITORY_IDENTITY

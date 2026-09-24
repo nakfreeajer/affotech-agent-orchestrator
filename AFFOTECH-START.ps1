@@ -96,7 +96,9 @@ if ($Probe -eq $null -or -not $Probe.architectObservation) {
         }
         if (-not $ready) { Write-Host "BLOCKED: ARCHITECT_CDP_READINESS_TIMEOUT"; exit 7 }
         $Probe = Invoke-Recovery @("--probe-architect", "--endpoint", $Endpoint)
-    } elseif ($reason -ne "ARCHITECT_CDP_HEALTHY") {
+    } elseif ($CdpReason -eq "ARCHITECT_CDP_HEALTHY") {
+        Write-Host "BLOCKED: ARCHITECT_CDP_PROBE_UNAVAILABLE"; exit 8
+    } else {
         Write-Host "BLOCKED: ARCHITECT_CDP_UNVERIFIED"; exit 8
     }
 }
