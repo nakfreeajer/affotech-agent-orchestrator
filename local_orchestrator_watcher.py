@@ -98,6 +98,9 @@ class DiagnosticTracer:
             "rolloverRecoveryEpoch", "rolloverAutomaticRecoveryEpochCount",
             "rolloverAutomaticRecoveryNextEligibleAt", "rolloverAutomaticRecoveryMaxEpochs",
             "discussionPauseActive", "architectGenerating",
+            "postDiscussionEnvelopeRequired", "postDiscussionResumeEpoch", "postDiscussionProtocolTaskId",
+            "postDiscussionEnvelopeRepairAttempted", "postDiscussionEnvelopeRepairAwaiting",
+            "postDiscussionEnvelopeRepairTaskId", "postDiscussionEnvelopeRepairEpoch", "postDiscussionProtocolFailure",
         )
         return {key: current.get(key) for key in keys}
 
@@ -875,10 +878,19 @@ def architect_session_ready(response: str) -> bool:
     return str(response or "").strip() == READY
 
 
+ARCHITECT_MACHINE_PROTOCOL_CONTRACT = (
+    "While human discussion is active, Architect responses may be conversational. "
+    "Once Rony resolves the decision and discussion resumes, any workflow-bearing "
+    "response MUST end with exactly one valid ORCHESTRATOR_RESULT envelope. "
+    "F10 / ORCH:RESUME restores mandatory machine-envelope protocol."
+)
+
+
 def fresh_architect_bootstrap_payload(handover: str) -> str:
     """Build the deterministic wire payload used by every fresh Architect tab."""
     return (f"{handover}\n\n"
             "Fresh Architect session bootstrap protocol:\n"
+            f"{ARCHITECT_MACHINE_PROTOCOL_CONTRACT}\n"
             f"After accepting this handover, reply exactly:\n{READY}")
 
 
@@ -1291,6 +1303,11 @@ Preserve only the current authoritative working state required to continue safel
 
 Do not perform new project work. Do not issue another Executor milestone.
 Do not summarize obsolete history unless necessary to prevent regression.
+
+While human discussion is active, Architect responses may be conversational.
+Once Rony resolves the decision and discussion resumes, any workflow-bearing
+response MUST end with exactly one valid ORCHESTRATOR_RESULT envelope.
+F10 / ORCH:RESUME restores mandatory machine-envelope protocol.
 
 The output itself must be directly usable as the bootstrap prompt for the new Architect conversation.
 
@@ -4222,7 +4239,7 @@ ORCHESTRATOR_RESULT_RE = re.compile(
     r"classification=(ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT)\s*"
     r"action=(EXECUTE|HUMAN_REQUIRED|STOP)\s*"
     r"taskId=([^\r\n]+)\s*"
-    r"(?:documentation=(NOT_REQUIRED|REQUIRED|COMPLETE)\s*)?"
+    r"documentation=(NOT_REQUIRED|REQUIRED|COMPLETE)\s*"
     r"promptBegin\s*\r?\n?(.*?)\r?\npromptEnd\s*"
     r"</ORCHESTRATOR_RESULT>\s*$",
     re.S,
@@ -4248,6 +4265,8 @@ def parse_orchestrator_result(text: str, completed_task_id: str) -> dict[str, st
     candidate = text.rstrip()
     if candidate.endswith(COMPLETE):
         candidate = candidate[: -len(COMPLETE)].rstrip()
+    if candidate.count("<ORCHESTRATOR_RESULT>") != 1 or candidate.count("</ORCHESTRATOR_RESULT>") != 1:
+        raise ValueError("ARCHITECT_ENVELOPE_INVALID")
     match = ORCHESTRATOR_RESULT_RE.search(candidate)
     if not match or match.group(3).strip() != completed_task_id:
         raise ValueError("ARCHITECT_ENVELOPE_INVALID")
@@ -4511,6 +4530,26 @@ class LocalFirstOrchestrator:
     def _write_discussion_pause_marker(self, active: bool) -> None:
         atomic_write(self.state_dir / "discussion-pause.marker", ("PAUSED\n" if active else "RESUMED\n").encode("ascii"))
 
+    def _restore_machine_protocol_after_discussion(self) -> None:
+        """Durably create one machine-protocol epoch for the current task."""
+        task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
+        if not task_id:
+            return
+        epoch = int(self.state.get("postDiscussionResumeEpoch", 0) or 0) + 1
+        self.state.update({
+            "postDiscussionEnvelopeRequired": True,
+            "postDiscussionResumeEpoch": epoch,
+            "postDiscussionEnvelopeRepairAttempted": False,
+            "postDiscussionEnvelopeRepairTaskId": task_id,
+            "postDiscussionEnvelopeRepairEpoch": epoch,
+            "postDiscussionEnvelopeRepairAwaiting": False,
+            "postDiscussionProtocolTaskId": task_id,
+            "postDiscussionProtocolBaseline": self.state.get("architectDiscussionBaseline") or self.state.get("architectBaseline"),
+        })
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DISCUSSION_MACHINE_PROTOCOL_RESTORED", self.state, taskId=task_id, resumeEpoch=epoch)
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_EXPECTED", self.state, taskId=task_id, resumeEpoch=epoch)
+
     def request_discussion_pause(self) -> None:
         if self.discussion_pause_active():
             return
@@ -4523,6 +4562,7 @@ class LocalFirstOrchestrator:
         if not self.discussion_pause_active():
             return
         self._write_discussion_pause_marker(False)
+        self._restore_machine_protocol_after_discussion()
         task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
         print(f"ORCHESTRATOR RESUMED BY HUMAN state={self.state.get('state')} taskId={task_id}")
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_RESUME_REQUESTED", self.state, taskId=task_id)
@@ -4537,6 +4577,7 @@ class LocalFirstOrchestrator:
         if not self.discussion_pause_active():
             return
         self._write_discussion_pause_marker(False)
+        self._restore_machine_protocol_after_discussion()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "REMOTE_DISCUSSION_RESUME_REQUESTED", self.state)
 
 
@@ -5017,6 +5058,7 @@ class LocalFirstOrchestrator:
             "Do not repeat already accepted work.",
             "Do not invent work outside the established project direction.",
             "If an Executor or Documentation Curator action is appropriate, return the complete next instruction using the canonical ORCHESTRATOR_RESULT envelope.",
+            ARCHITECT_MACHINE_PROTOCOL_CONTRACT,
             "Set documentation=NOT_REQUIRED|REQUIRED|COMPLETE.",
             "NOT_REQUIRED means this decision does not require milestone/release documentation closure.",
             "REQUIRED means the accepted milestone/release needs one bounded documentation closure task before ordinary advancement.",
@@ -5353,6 +5395,7 @@ class LocalFirstOrchestrator:
         instruction = ("Verify the completed Executor report below, classify it, decide the next bounded action, "
                        "and finish with exactly one <ORCHESTRATOR_RESULT> envelope using taskId=" + task_id + ".\n"
             "The envelope must end the response; action=EXECUTE requires the complete next Executor prompt.\n\n")
+        instruction += ARCHITECT_MACHINE_PROTOCOL_CONTRACT + "\n\n"
         instruction += ("The Architect must also set documentation=NOT_REQUIRED|REQUIRED|COMPLETE: "
                         "NOT_REQUIRED when no milestone/release documentation closure applies; "
                         "REQUIRED when accepted work needs one bounded documentation closure task; "
@@ -5778,6 +5821,11 @@ class LocalFirstOrchestrator:
             self.save()
             raise ValueError("DOCUMENTATION_DISPOSITION_INVALID")
         self.state.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False, "architectFormatRecoveryTaskId": None})
+        self.state.update({
+            "postDiscussionEnvelopeRequired": False,
+            "postDiscussionEnvelopeRepairAwaiting": False,
+            "postDiscussionProtocolFailure": None,
+        })
         if documentation == "REQUIRED":
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_REQUIRED", self.state, taskId=task_id, disposition=documentation)
         if documentation == "COMPLETE":
@@ -5802,7 +5850,11 @@ class LocalFirstOrchestrator:
                 runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DOCUMENTATION_CLOSURE_TASK_STAGED", self.state, taskId=next_id, sourceTaskId=task_id)
         elif decision["action"] == "HUMAN_REQUIRED":
             self.state["architectResultFingerprint"] = fingerprint
-            self.state.update({"state": "HUMAN_REQUIRED", "nextPromptPath": None, "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})
+            self.state.update({
+                "state": "HUMAN_REQUIRED", "nextPromptPath": None,
+                "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED",
+                "architectDiscussionBaseline": self.state.get("architectBaseline"),
+            })
         else:
             self.state["architectResultFingerprint"] = fingerprint
             self.state.update({"state": "IDLE", "nextPromptPath": None, "humanRequiredReason": None})
@@ -5825,6 +5877,113 @@ class LocalFirstOrchestrator:
         self._active_process = process
         self.mark_executor_started(str(self.state["nextTaskId"]), int(process.pid), self._result_path(str(self.state["nextTaskId"])))
         return process
+
+    def _post_discussion_baseline_advanced(self, bridge: Any, response: str) -> bool:
+        """Prove that a completed response belongs to the resumed discussion epoch."""
+        baseline = self.state.get("postDiscussionProtocolBaseline") or self.state.get("architectDiscussionBaseline")
+        if not isinstance(baseline, dict):
+            return False
+        count = baseline.get("count")
+        text_hash = baseline.get("text_hash")
+        if not isinstance(count, int) or count < 0 or not isinstance(text_hash, str) or not text_hash:
+            return False
+        current_reader = getattr(bridge, "assistant_baseline", None)
+        if callable(current_reader):
+            try:
+                current = current_reader()
+            except Exception:
+                current = None
+            if isinstance(current, dict):
+                current_count = current.get("count")
+                current_hash = current.get("text_hash")
+                if isinstance(current_count, int) and current_count > count:
+                    return True
+                if current_hash and current_hash != text_hash:
+                    return True
+        return False
+
+    def request_post_discussion_envelope_repair(self, bridge: Any) -> bool:
+        """Request exactly one formatting-only envelope correction for this epoch."""
+        task_id = str(self.state.get("taskId") or "")
+        epoch = int(self.state.get("postDiscussionResumeEpoch", 0) or 0)
+        if (not self.state.get("postDiscussionEnvelopeRequired") or not task_id
+                or self.state.get("postDiscussionEnvelopeRepairAttempted")
+                or self.state.get("postDiscussionEnvelopeRepairTaskId") not in (None, "", task_id)
+                or self.state.get("postDiscussionEnvelopeRepairEpoch") not in (None, "", epoch)):
+            return False
+        message = "\n".join([
+            "Your previous completed response did not contain the required final ORCHESTRATOR_RESULT envelope.",
+            "Do not redo or re-evaluate the underlying task or human decision.",
+            "Return only the machine-readable envelope for your already-completed decision, preserving classification, action, documentation disposition, and the complete next Executor prompt where applicable.",
+            f"taskId={task_id}",
+            "The envelope must be the final content of the response.",
+        ])
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_REQUESTED", self.state, taskId=task_id, resumeEpoch=epoch)
+        sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result", None)
+        if not callable(sender):
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"})
+            self.save()
+            return False
+        try:
+            sender(message)
+        except Exception as error:
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, errorClass=type(error).__name__)
+            return False
+        baseline = bridge.assistant_baseline() if callable(getattr(bridge, "assistant_baseline", None)) else self.state.get("postDiscussionProtocolBaseline")
+        self.state.update({
+            "state": "ARCHITECT_RUNNING",
+            "postDiscussionEnvelopeRepairAttempted": True,
+            "postDiscussionEnvelopeRepairAwaiting": True,
+            "postDiscussionEnvelopeRepairTaskId": task_id,
+            "postDiscussionEnvelopeRepairEpoch": epoch,
+            "architectBaseline": baseline,
+            "humanRequiredReason": None,
+        })
+        self.save()
+        return True
+
+    def reconcile_post_discussion_response(self, bridge: Any, response: str, completed: bool = True) -> str:
+        """Consume or repair one response after F10/ORCH:RESUME."""
+        if not self.state.get("postDiscussionEnvelopeRequired"):
+            return "NOT_REQUIRED"
+        if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
+            return "GENERATING"
+        baseline = self.state.get("postDiscussionProtocolBaseline") or self.state.get("architectDiscussionBaseline")
+        if isinstance(response, str) and response.strip() and not (
+            isinstance(baseline, dict)
+            and isinstance(baseline.get("count"), int) and baseline.get("count") >= 0
+            and isinstance(baseline.get("text_hash"), str) and bool(baseline.get("text_hash"))
+        ):
+            task_id = str(self.state.get("taskId") or "")
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="BASELINE_UNPROVEN")
+            return "FAILED"
+        if not completed or not self._post_discussion_baseline_advanced(bridge, response):
+            return "WAIT"
+        task_id = str(self.state.get("taskId") or "")
+        try:
+            decision = self.accept_architect_response(response)
+        except (ValueError, RuntimeError):
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION", self.state, taskId=task_id)
+            self.state.update({"humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION"})
+            self.save()
+            if self.state.get("postDiscussionEnvelopeRepairAttempted"):
+                self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionEnvelopeRepairAwaiting": False})
+                self.save()
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id)
+                return "FAILED"
+            if self.request_post_discussion_envelope_repair(bridge):
+                return "REPAIR_REQUESTED"
+            return "FAILED"
+        if isinstance(decision, dict) and decision.get("action") == "DUPLICATE":
+            return "DUPLICATE"
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_ACCEPTED" if self.state.get("postDiscussionEnvelopeRepairAttempted") else "ARCHITECT_RESPONSE_ACCEPTED", self.state, taskId=task_id)
+        self.state["postDiscussionEnvelopeRepairAwaiting"] = False
+        self.save()
+        return str(decision.get("action") or "ACCEPTED")
 
 
 class DiscussionHotkeyController:
@@ -6147,8 +6306,15 @@ def run_executor_state_once(watcher: LocalFirstOrchestrator, launch: Callable[[s
     return watcher.state.get("state", "IDLE")
 
 
-def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: str, baseline: dict[str, Any] | None = None) -> str:
+def resident_human_decision_response(watcher: LocalFirstOrchestrator, response: str, baseline: dict[str, Any] | None = None, bridge: Any | None = None) -> str:
     """Consume one response while waiting for a business decision."""
+    if watcher.discussion_pause_active():
+        if isinstance(baseline, dict):
+            watcher.state["architectBaseline"] = baseline
+            watcher.save()
+        return "DISCUSSION"
+    if watcher.state.get("postDiscussionEnvelopeRequired"):
+        return watcher.reconcile_post_discussion_response(bridge, response, completed=True) if bridge is not None else "WAIT"
     if "<ORCHESTRATOR_RESULT>" not in response:
         if isinstance(baseline, dict):
             watcher.state["architectBaseline"] = baseline
@@ -7219,8 +7385,10 @@ def main() -> None:
                         watcher.state = watcher._load_state()
                         continue
                     response = str(observed.get("text") or "")
-                    disposition = resident_human_decision_response(watcher, response, human_wait_bridge.assistant_baseline())
-                    if disposition in {"EXECUTE", "STOP"}:
+                    disposition = resident_human_decision_response(
+                        watcher, response, human_wait_bridge.assistant_baseline(), bridge=human_wait_bridge
+                    )
+                    if disposition in {"EXECUTE", "STOP", "REPAIR_REQUESTED", "FAILED"}:
                         try:
                             human_wait_bridge.close()
                         except Exception:
@@ -7380,6 +7548,14 @@ def main() -> None:
                         watcher.reject_invalid_handover_response()
                         print("STATE=HUMAN_REQUIRED reason=ARCHITECT_HANDOVER_RESPONSE_INVALID")
                         break
+                    if watcher.state.get("postDiscussionEnvelopeRequired"):
+                        disposition = watcher.reconcile_post_discussion_response(
+                            bridge, observed["text"], completed=observed.get("state") == "COMPLETED"
+                        )
+                        baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
+                        if disposition in {"REPAIR_REQUESTED", "FAILED", "EXECUTE", "STOP", "HUMAN_REQUIRED"} and watcher.state.get("state") != "ARCHITECT_RUNNING":
+                            break
+                        continue
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
                             decision = watcher.consume_idle_architect_response(observed["text"], launch)

@@ -19,13 +19,14 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         WatcherInstanceLock, handle_architect_value_error,
                                         run_human_required_startup_once, DiscussionHotkeyController,
                                         RemoteDiscussionControlMonitor,
-                                        architect_process_tree_memory_bytes)
+                                        architect_process_tree_memory_bytes,
+                                        resident_human_decision_response)
 import local_orchestrator_watcher as watcher_module
 
 
 def envelope(task, action="EXECUTE", prompt="next task", documentation=None):
     body = prompt if action == "EXECUTE" else ""
-    documentation_line = f"documentation={documentation}\n" if documentation else ""
+    documentation_line = f"documentation={documentation or 'NOT_REQUIRED'}\n"
     return (f"explanation\n<ORCHESTRATOR_RESULT>\nclassification=ACCEPTED\n"
             f"action={action}\ntaskId={task}\n{documentation_line}promptBegin\n{body}\n"
             "promptEnd\n</ORCHESTRATOR_RESULT>")
@@ -6524,6 +6525,141 @@ def test_discussion_resume_does_not_change_human_required(tmp_path):
     watcher.request_discussion_resume()
     assert watcher.state["state"] == "HUMAN_REQUIRED"
     assert watcher.state["humanRequiredReason"] == "ARCHITECT_DECISION_HUMAN_REQUIRED"
+
+
+class _PostDiscussionBridge:
+    def __init__(self, entries):
+        self.entries = list(entries)
+        self.sent = []
+        self.generating = False
+
+    def generation_visible(self):
+        return self.generating
+
+    def assistant_baseline(self):
+        snapshot = json.dumps(self.entries, separators=(",", ":"), ensure_ascii=False)
+        return {"count": len(self.entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": list(self.entries)}
+
+    def submit_result_bounded(self, message):
+        self.sent.append(message)
+
+
+def _discussion_bridge_response(text, identifier):
+    return {"id": identifier, "text": text}
+
+
+def test_post_discussion_resume_restores_machine_protocol_and_accepts_valid_envelope(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-discuss", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})
+    watcher.save()
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("discussion decision", "old")])
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_discussion_resume()
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert watcher.state["postDiscussionResumeEpoch"] == 1
+    response = envelope("task-discuss", action="STOP")
+    bridge.entries.append(_discussion_bridge_response(response, "decision"))
+    assert resident_human_decision_response(watcher, response, bridge=bridge) == "STOP"
+    assert watcher.state["state"] == "IDLE"
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert bridge.sent == []
+
+
+def test_post_discussion_response_completed_before_f10_is_consumed_after_resume(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-before-resume", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})
+    bridge = _PostDiscussionBridge([
+        _discussion_bridge_response("initial human-required envelope", "initial"),
+        _discussion_bridge_response(envelope("task-before-resume", action="STOP"), "final-before-f10"),
+    ])
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_discussion_resume()
+    response = bridge.entries[-1]["text"]
+    assert watcher.reconcile_post_discussion_response(bridge, response) == "STOP"
+    assert watcher.state["state"] == "IDLE"
+    assert bridge.sent == []
+
+
+def test_post_discussion_conversation_while_paused_never_repairs(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-discuss", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})
+    bridge = _PostDiscussionBridge([])
+    watcher._write_discussion_pause_marker(True)
+    assert resident_human_decision_response(watcher, "ordinary conversational discussion", bridge=bridge) == "DISCUSSION"
+    assert bridge.sent == []
+    assert not watcher.state.get("postDiscussionEnvelopeRequired")
+
+
+def test_post_discussion_missing_envelope_repairs_once_and_accepts_correction(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-discuss", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})
+    watcher.save()
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("discussion", "old")])
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_discussion_resume()
+    missing = "Proceeding with the already decided bounded task.\nWORKTREE\nC:\\worktree"
+    bridge.entries.append(_discussion_bridge_response(missing, "decision"))
+    assert watcher.reconcile_post_discussion_response(bridge, missing) == "REPAIR_REQUESTED"
+    assert len(bridge.sent) == 1
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    corrected = envelope("task-discuss", action="STOP")
+    bridge.entries.append(_discussion_bridge_response(corrected, "repair"))
+    assert watcher.reconcile_post_discussion_response(bridge, corrected) == "STOP"
+    assert len(bridge.sent) == 1
+    assert watcher.state["state"] == "IDLE"
+
+
+def test_post_discussion_repair_failure_is_durable_and_prevents_second_repair(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-discuss", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})
+    watcher.save()
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("discussion", "old")])
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_discussion_resume()
+    missing = "A completed response without the required machine envelope."
+    bridge.entries.append(_discussion_bridge_response(missing, "decision"))
+    assert watcher.reconcile_post_discussion_response(bridge, missing) == "REPAIR_REQUESTED"
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    bridge.entries.append(_discussion_bridge_response("still conversational", "repair"))
+    assert restarted.reconcile_post_discussion_response(bridge, "still conversational") == "FAILED"
+    assert len(bridge.sent) == 1
+    assert restarted.state["state"] == "HUMAN_REQUIRED"
+    assert restarted.state["humanRequiredReason"] == "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"
+
+
+def test_remote_resume_restores_protocol_epoch_and_f9_f10_cycles_reset_repair_for_new_epoch(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-cycle", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 0, "text_hash": "before"}})
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_remote_discussion_resume()
+    assert watcher.state["postDiscussionResumeEpoch"] == 1
+    watcher.state["postDiscussionEnvelopeRepairAttempted"] = True
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_discussion_resume()
+    assert watcher.state["postDiscussionResumeEpoch"] == 2
+    assert watcher.state["postDiscussionEnvelopeRepairAttempted"] is False
+
+
+def test_post_discussion_wrong_task_and_strict_envelope_guards(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    wrong = envelope("other-task")
+    with pytest.raises(ValueError, match="ARCHITECT_ENVELOPE_INVALID"):
+        parse_orchestrator_result(wrong, "current-task")
+    missing_documentation = wrong.replace("documentation=NOT_REQUIRED\n", "")
+    with pytest.raises(ValueError, match="ARCHITECT_ENVELOPE_INVALID"):
+        parse_orchestrator_result(missing_documentation.replace("taskId=other-task", "taskId=current-task"), "current-task")
+    multiple = wrong + "\n" + wrong
+    with pytest.raises(ValueError, match="ARCHITECT_ENVELOPE_INVALID"):
+        parse_orchestrator_result(multiple, "other-task")
+    incomplete = envelope("current-task", prompt="")
+    with pytest.raises(ValueError, match="ARCHITECT_ENVELOPE_PROMPT_REQUIRED"):
+        parse_orchestrator_result(incomplete, "current-task")
+
+
+def test_architect_bootstrap_carries_permanent_post_discussion_contract():
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload("handover")
+    assert "While human discussion is active" in bootstrap
+    assert "F10 / ORCH:RESUME" in bootstrap
 
 
 def test_discussion_hotkey_unknown_key_is_ignored(tmp_path):
