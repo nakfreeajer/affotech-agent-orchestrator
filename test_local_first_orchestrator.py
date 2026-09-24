@@ -670,6 +670,72 @@ def test_stale_format_human_required_reenters_architect_without_executor_launch(
     assert watcher.state["executorResultPath"]
 
 
+def test_human_required_restart_rechecks_fresh_postlaunch_authorization(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    reason = "EXECUTOR_EXITED_WITHOUT_RESULT"
+    watcher.state.update({
+        "humanRequiredReason": reason,
+        "humanRequiredRecoveryAttemptedReason": reason,
+        "executorLaunchState": "POSTLAUNCH_NO_RESULT",
+    })
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", watcher.state["taskId"])
+    assert watcher_module.human_required_startup_recovery_due(
+        watcher, reason, reason
+    ) is True
+
+
+def test_human_required_restart_without_authorization_remains_passive(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    reason = "EXECUTOR_EXITED_WITHOUT_RESULT"
+    watcher.state.update({
+        "humanRequiredReason": reason,
+        "humanRequiredRecoveryAttemptedReason": reason,
+        "executorLaunchState": "POSTLAUNCH_NO_RESULT",
+    })
+    monkeypatch.delenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", raising=False)
+    assert watcher_module.human_required_startup_recovery_due(
+        watcher, reason, reason
+    ) is False
+
+
+def test_human_required_restart_wrong_task_authorization_fails_closed(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    reason = "EXECUTOR_EXITED_WITHOUT_RESULT"
+    watcher.state.update({
+        "humanRequiredReason": reason,
+        "humanRequiredRecoveryAttemptedReason": reason,
+        "executorLaunchState": "POSTLAUNCH_NO_RESULT",
+    })
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", "wrong-task")
+    assert watcher_module.human_required_startup_recovery_due(
+        watcher, reason, reason
+    ) is False
+
+
+def test_human_required_restart_same_task_consumed_authorization_reaches_one_shot_gate(tmp_path, monkeypatch):
+    watcher, _base, _worktree = postlaunch_recovery_fixture(tmp_path)
+    task_id = watcher.state["taskId"]
+    reason = "EXECUTOR_EXITED_WITHOUT_RESULT"
+    watcher.state.update({
+        "humanRequiredReason": reason,
+        "humanRequiredRecoveryAttemptedReason": reason,
+        "executorLaunchState": "POSTLAUNCH_NO_RESULT",
+        "humanRecoveryAuthorizationConsumed": True,
+        "humanRecoveryAuthorizedTaskId": task_id,
+        "codexPid": 4402,
+    })
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY", task_id)
+    assert watcher_module.human_required_startup_recovery_due(
+        watcher, reason, reason
+    ) is True
+    launches = []
+    assert run_human_required_startup_once(watcher, lambda *_: launches.append(1)) == "STOP"
+    assert launches == []
+    assert watcher.state["humanRecoveryAuthorizationError"] == "HUMAN_RECOVERY_AUTHORIZATION_CONSUMED"
+
+
 def test_000016_startup_shape_consumes_existing_response_once(tmp_path):
     watcher, base, _ = recovery_fixture(tmp_path)
     watcher.state.update({

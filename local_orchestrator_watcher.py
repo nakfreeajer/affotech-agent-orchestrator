@@ -6667,6 +6667,23 @@ def passive_human_required_wait(watcher: LocalFirstOrchestrator, poll_interval: 
     return watcher.state.get("state", "HUMAN_REQUIRED")
 
 
+def human_required_startup_recovery_due(
+    watcher: LocalFirstOrchestrator,
+    reason: str,
+    attempted_reason: Any,
+) -> bool:
+    """Allow one explicit current-task postlaunch authorization after restart."""
+    if attempted_reason != reason:
+        return True
+    task_id = str(watcher.state.get("taskId") or "")
+    return bool(
+        task_id
+        and reason == "EXECUTOR_EXITED_WITHOUT_RESULT"
+        and watcher.state.get("executorLaunchState") == "POSTLAUNCH_NO_RESULT"
+        and os.environ.get("ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY") == task_id
+    )
+
+
 def passive_architect_memory_sample_for_pause(
     watcher: LocalFirstOrchestrator,
     endpoint: str,
@@ -7015,14 +7032,15 @@ def main() -> None:
                     continue
                 reason = str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED")
                 attempted_reason = watcher.state.get("humanRequiredRecoveryAttemptedReason")
-                if attempted_reason != reason:
+                recovery_attempt_due = human_required_startup_recovery_due(watcher, reason, attempted_reason)
+                if recovery_attempt_due:
                     if watcher.recover_legacy_rollover_cutout():
                         continue
                     if watcher.recover_completed_confirmed_workflow():
                         continue
                     if watcher.recover_preempted_rollover_failure():
                         continue
-                if attempted_reason != reason and watcher.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED":
+                if recovery_attempt_due and watcher.state.get("humanRequiredReason") == "ARCHITECT_FORMAT_RECOVERY_TRANSPORT_FAILED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
                     recovery_bridge = None
@@ -7038,7 +7056,7 @@ def main() -> None:
                             continue
                     except Exception as error:
                         runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
-                if attempted_reason != reason and watcher.state.get("humanRequiredReason") == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
+                if recovery_attempt_due and watcher.state.get("humanRequiredReason") == "ARCHITECT_RESULT_TRANSPORT_EXHAUSTED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     runtime_log(logger, run_id, "ARCHITECT_ATTACH_START", watcher.state, conversationId=conversation_id)
                     recovery_bridge = None
@@ -7052,7 +7070,7 @@ def main() -> None:
                             runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                         else:
                             runtime_log(logger, run_id, "ARCHITECT_RESULT_DELIVERY_RECOVERY_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
-                if attempted_reason != reason:
+                if recovery_attempt_due:
                     state = run_human_required_startup_once(watcher, launch)
                     watcher.state["humanRequiredRecoveryAttemptedReason"] = reason
                     if watcher.state.get("state") == "HUMAN_REQUIRED":
