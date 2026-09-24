@@ -36,6 +36,8 @@ ARCHITECT_MEMORY_SAFETY_CEILING_BYTES = ARCHITECT_MEMORY_THRESHOLD_BYTES * 2
 ROLLOVER_RECOVERY_MAX_ATTEMPTS = 2
 ROLLOVER_RECOVERY_WINDOW_SECONDS = 300.0
 ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS = 5.0
+ROLLOVER_AUTOMATIC_RECOVERY_COOLDOWN_SECONDS = 5.0
+ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS = 3
 ROLLOVER_RECOVERY_ATTEMPT_ALLOWED = "ATTEMPT_ALLOWED"
 ROLLOVER_RECOVERY_WAIT_BACKOFF = "WAIT_BACKOFF"
 ROLLOVER_RECOVERY_EXHAUSTED = "EXHAUSTED"
@@ -93,6 +95,8 @@ class DiagnosticTracer:
             "architectMemoryMiB", "architectMemoryOwnership", "architectMemoryOwnershipSource",
             "architectMemorySessionId", "rolloverTrigger", "rolloverMaintenanceState",
             "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+            "rolloverRecoveryEpoch", "rolloverAutomaticRecoveryEpochCount",
+            "rolloverAutomaticRecoveryNextEligibleAt", "rolloverAutomaticRecoveryMaxEpochs",
             "discussionPauseActive", "architectGenerating",
         )
         return {key: current.get(key) for key in keys}
@@ -1550,7 +1554,82 @@ class ArchitectSessionRollover:
         state["rolloverLastFailureReason"] = state.get("rolloverHandoverRecoveryReason") or state.get("rolloverRecoveryTerminalReason")
         state["rolloverDeferredForTaskId"] = state.get("nextTaskId") or state.get("taskId")
         state["rolloverAutoAttemptCount"] = int(state.get("rolloverRecoveryAttemptCount", attempts) or attempts)
+        state["rolloverRecoveryRetryAfter"] = time.time() + ROLLOVER_RECOVERY_RETRY_DELAY_SECONDS
+        state.setdefault("rolloverAutomaticRecoveryEpochCount", 1)
+        state.setdefault("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS)
+        state.setdefault("rolloverRecoveryEpoch", 1)
+        state["rolloverAutomaticRecoveryNextEligibleAt"] = time.time() + ROLLOVER_AUTOMATIC_RECOVERY_COOLDOWN_SECONDS
         self.watcher.save()
+
+    def _automatic_recovery_epoch_eligible(self, task_id: str) -> bool:
+        """Return whether one durable automatic recovery epoch may begin."""
+        state = self.watcher.state
+        if not (
+            state.get("state") == "NEXT_PROMPT_READY"
+            and state.get("rolloverDue") is True
+            and state.get("rolloverPending") is True
+            and str(state.get("nextTaskId") or "") == str(task_id)
+            and state.get("rolloverMaintenanceState") == "DEFERRED"
+            and state.get("rolloverRecoveryState") in {None, "DEFERRED"}
+            and (
+                state.get("rolloverDeferredForTaskId") == task_id
+                or state.get("rolloverTransactionTaskId") == task_id
+                or state.get("rolloverAttemptedForTaskId") == task_id
+            )
+        ):
+            return False
+        max_epochs = int(state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0)
+        epochs = int(state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0)
+        eligible_at = float(state.get("rolloverAutomaticRecoveryNextEligibleAt", 0.0) or 0.0)
+        deferred_owner = str(state.get("rolloverDeferredForTaskId") or "")
+        if deferred_owner and deferred_owner != str(task_id):
+            return False
+        if epochs >= max_epochs or time.time() < eligible_at:
+            return False
+        active_pid = state.get("codexPid") or state.get("active_codex_pid")
+        if state.get("executorProcessState") == "RUNNING" and active_pid:
+            try:
+                if LocalWatcher.process_alive(int(active_pid)):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if state.get("executorActiveWriter") is True or state.get("governedExecutorActiveWriter") is True:
+            return False
+        return bool(state.get("rolloverTransactionId") or state.get("rolloverHandoverSendState") in {"UNSENT", "PENDING", "ACKNOWLEDGED", "AMBIGUOUS"})
+
+    def _begin_automatic_recovery_epoch(self, task_id: str) -> bool:
+        """Start one finite automatic epoch without discarding transaction evidence."""
+        state = self.watcher.state
+        max_epochs = int(state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0)
+        epochs = int(state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0)
+        if epochs >= max_epochs:
+            state["state"] = "HUMAN_REQUIRED"
+            state["humanRequiredReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+            state["rolloverRecoveryTerminalReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+            self.watcher.save()
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_EXHAUSTED", state, taskId=task_id, epochs=epochs, maxEpochs=max_epochs)
+            return False
+        now = time.time()
+        state.update({
+            "rolloverRecoveryEpoch": int(state.get("rolloverRecoveryEpoch", 0) or 0) + 1,
+            "rolloverAutomaticRecoveryEpochCount": epochs + 1,
+            "rolloverAutomaticRecoveryMaxEpochs": max_epochs,
+            "rolloverRecoveryState": "PENDING",
+            "rolloverMaintenanceState": "IN_PROGRESS",
+            "rolloverRecoveryAttemptCount": 0,
+            "rolloverRecoveryStartedAt": now,
+            "rolloverRecoveryLastAttemptAt": None,
+            "rolloverRecoveryRetryAfter": None,
+            "rolloverAutomaticRecoveryNextEligibleAt": None,
+            "rolloverDue": True,
+            "rolloverPending": True,
+        })
+        state.pop("rolloverRecoveryTerminalReason", None)
+        state.pop("rolloverDeferredForTaskId", None)
+        state.pop("rolloverLastFailureReason", None)
+        self.watcher.save()
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_EPOCH_STARTED", state, taskId=task_id, epoch=state["rolloverRecoveryEpoch"], epochCount=epochs + 1, maxEpochs=max_epochs)
+        return True
 
     def _record_recovery_success(self) -> None:
         state = self.watcher.state
@@ -1577,8 +1656,18 @@ class ArchitectSessionRollover:
             "rolloverDeferredForTaskId": state.get("nextTaskId") or state.get("taskId"),
         })
         state.pop("rolloverRecoveryRetryAfter", None)
+        state["rolloverPending"] = True
+        state.setdefault("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS)
+        state.setdefault("rolloverAutomaticRecoveryEpochCount", 1)
+        state.setdefault("rolloverRecoveryEpoch", 1)
+        state["rolloverAutomaticRecoveryNextEligibleAt"] = time.time() + ROLLOVER_AUTOMATIC_RECOVERY_COOLDOWN_SECONDS
+        if int(state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0) >= int(state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0):
+            state["state"] = "HUMAN_REQUIRED"
+            state["humanRequiredReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+            state["rolloverRecoveryTerminalReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
         self.watcher.save()
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_ROLLOVER_MAINTENANCE_DEFERRED", state, reason=reason)
+        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_DEFERRED", state, reason=reason, nextEligibleAt=state["rolloverAutomaticRecoveryNextEligibleAt"])
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover._enter_safety_cutout", "FUNCTION", "END", state, reason=reason, result="DEFERRED")
@@ -4207,6 +4296,28 @@ class LocalFirstOrchestrator:
         self._live_bottom_recovery_attempted: set[str] = set()
         self.state = self._load_state()
         self._operator_restart_rollover_recovery_available = self.state.get("rolloverMaintenanceState") == "DEFERRED"
+        if (
+            self.state.get("state") == "NEXT_PROMPT_READY"
+            and self.state.get("rolloverDue") is True
+            and self.state.get("rolloverPending") is True
+            and self.state.get("rolloverMaintenanceState") == "DEFERRED"
+            and self.state.get("nextTaskId")
+            and "rolloverAutomaticRecoveryEpochCount" not in self.state
+        ):
+            # Migrate an older deferred record to a durable finite budget.  The
+            # legacy operator-restart flag is retained for prepared UNSENT
+            # compatibility, but it can no longer reset an ambiguous/exhausted
+            # epoch once these fields exist.
+            self.state.update({
+                "rolloverRecoveryEpoch": 1,
+                "rolloverAutomaticRecoveryEpochCount": 1,
+                "rolloverAutomaticRecoveryMaxEpochs": ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS,
+                # Legacy DEFERRED records have no durable cooldown to honor;
+                # establish the first epoch immediately.  Subsequent failures
+                # write an explicit cooldown and cannot be bypassed by restart.
+                "rolloverAutomaticRecoveryNextEligibleAt": time.time(),
+            })
+            self.save()
         self.state.setdefault("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID)
         self.state.setdefault("executorSessionMode", "PERSISTENT")
         self.architect_memory_reader = None
@@ -6125,7 +6236,14 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         return False
     watcher.retire_completed_executor_ownership()
     next_task_id = str(watcher.state.get("nextTaskId") or "")
-    restart_recovery_available = bool(getattr(watcher, "_operator_restart_rollover_recovery_available", False))
+    operator_restart_available = bool(getattr(watcher, "_operator_restart_rollover_recovery_available", False))
+    restart_recovery_available = bool(
+        operator_restart_available
+        and (
+            "rolloverAutomaticRecoveryEpochCount" not in watcher.state
+            or (watcher.state.get("rolloverHandoverSendState") == "UNSENT" and not watcher.state.get("handoverRequested"))
+        )
+    )
     bridge = None
     def close_bridge() -> None:
         nonlocal bridge
@@ -6138,8 +6256,21 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     terminal_delivered_recovered = False
     prebudget_probe_performed = False
     prebudget_existing_response = None
+    if (
+        watcher.state.get("rolloverMaintenanceState") == "DEFERRED"
+        and "rolloverAutomaticRecoveryEpochCount" not in watcher.state
+    ):
+        watcher.state.update({
+            "rolloverRecoveryEpoch": 1,
+            "rolloverAutomaticRecoveryEpochCount": 1,
+            "rolloverAutomaticRecoveryMaxEpochs": ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS,
+            "rolloverAutomaticRecoveryNextEligibleAt": time.time(),
+        })
+        watcher.save()
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_DEFERRED", watcher.state, reason="LEGACY_DEFERRED_STATE_MIGRATED", nextEligibleAt=watcher.state["rolloverAutomaticRecoveryNextEligibleAt"])
+    automatic_epoch_eligible = watcher.session_rollover._automatic_recovery_epoch_eligible(next_task_id)
     terminal_candidate = watcher.session_rollover._terminal_same_task_transaction_eligible(
-        next_task_id, restart_recovery_available
+        next_task_id, restart_recovery_available or automatic_epoch_eligible
     )
     if terminal_candidate:
         transaction_id = str(watcher.state.get("rolloverTransactionId") or "").strip()
@@ -6163,6 +6294,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         next_task_id, restart_recovery_available
     )
     stale_retired = watcher.session_rollover._retire_stale_transaction_for_task(next_task_id)
+    rollover = watcher.session_rollover
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (active_pid and watcher.state.get("executorProcessState") == "RUNNING"
             and LocalWatcher.process_alive(int(active_pid))):
@@ -6173,7 +6305,13 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         nonlocal operator_restart_recovery
         operator_restart_recovery = True
         watcher._operator_restart_rollover_recovery_available = False
-        watcher.state.update({"rolloverRecoveryState": "PENDING", "rolloverRecoveryAttemptCount": 0})
+        watcher.state.update({
+            "rolloverRecoveryState": "PENDING",
+            "rolloverRecoveryAttemptCount": 0,
+            "rolloverAutomaticRecoveryEpochCount": int(watcher.state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0) or 1,
+            "rolloverAutomaticRecoveryMaxEpochs": int(watcher.state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS),
+            "rolloverRecoveryEpoch": int(watcher.state.get("rolloverRecoveryEpoch", 0) or 0) or 1,
+        })
         for key in ("rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt", "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason"):
             watcher.state.pop(key, None)
         watcher.save()
@@ -6182,13 +6320,59 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
     if terminal_delivered_recovered and restart_recovery_available:
         consume_operator_restart_recovery()
     elif watcher.state.get("rolloverMaintenanceState") == "DEFERRED" and watcher.state.get("rolloverDeferredForTaskId") == next_task_id:
-        if not restart_recovery_available:
+        if automatic_epoch_eligible:
+            watcher._operator_restart_rollover_recovery_available = False
+            if watcher.state.get("rolloverHandoverSendState") != "UNSENT" or watcher.state.get("handoverRequested"):
+                if bridge is None:
+                    try:
+                        conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+                        bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+                    except Exception:
+                        bridge = None
+                if bridge is None:
+                    runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_COOLDOWN", watcher.state, reason="ARCHITECT_ATTACH_UNAVAILABLE", nextEligibleAt=watcher.state.get("rolloverAutomaticRecoveryNextEligibleAt"))
+                    return False
+                try:
+                    if bool(getattr(bridge, "generation_visible", lambda: False)()):
+                        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_COOLDOWN", watcher.state, reason="ARCHITECT_GENERATING", nextEligibleAt=watcher.state.get("rolloverAutomaticRecoveryNextEligibleAt"))
+                        close_bridge()
+                        return False
+                    # The normal live-transaction pre-budget probe below is
+                    # the single response scan.  Promote the deferred record
+                    # to that read-only path without consuming another scan.
+                    watcher.state.update({
+                        "rolloverInProgress": True,
+                        "rolloverMaintenanceState": "RECONCILE_PENDING",
+                        "rolloverRecoveryState": "RECOVERING",
+                    })
+                    watcher.save()
+                except Exception:
+                    close_bridge()
+                    return False
+            attempts = int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0)
+            if attempts >= ROLLOVER_RECOVERY_MAX_ATTEMPTS:
+                if not watcher.session_rollover._begin_automatic_recovery_epoch(next_task_id):
+                    close_bridge()
+                    return False
+                runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_EPOCH_STARTED", watcher.state, taskId=next_task_id)
+            else:
+                watcher.state.update({
+                    "rolloverRecoveryState": "PENDING",
+                    "rolloverMaintenanceState": "IN_PROGRESS",
+                    "rolloverRecoveryRetryAfter": None,
+                    "rolloverAutomaticRecoveryNextEligibleAt": None,
+                })
+                watcher.save()
+                runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_ELIGIBLE", watcher.state, taskId=next_task_id, epoch=watcher.state.get("rolloverRecoveryEpoch"), sameEpoch=True)
+        elif restart_recovery_available:
+            consume_operator_restart_recovery()
+        else:
+            retry_after = float(watcher.state.get("rolloverAutomaticRecoveryNextEligibleAt", 0.0) or 0.0)
+            runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_COOLDOWN", watcher.state, nextEligibleAt=retry_after, remainingSeconds=max(0.0, retry_after - time.time()))
             _trace_rollover_gate(watcher, boundary_state, "DEFER", "MAINTENANCE_DEFERRED", function="service_deferred_rollover_once")
             return False
-        consume_operator_restart_recovery()
     elif (terminal_retired or stale_retired) and restart_recovery_available:
         consume_operator_restart_recovery()
-    rollover = watcher.session_rollover
     live_transaction = (
         watcher.state.get("rolloverDue") is True
         and watcher.state.get("rolloverPending") is True
@@ -6381,7 +6565,11 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             )
         )
         allow_same_task_unsent_recovery = bool(
-            operator_restart_recovery
+            (operator_restart_recovery or (
+                automatic_epoch_eligible
+                and watcher.state.get("rolloverHandoverSendState") == "UNSENT"
+                and not watcher.state.get("handoverRequested")
+            ))
             and send_state == "UNSENT"
             and not watcher.state.get("handoverRequested")
             and not recovery_evidence
@@ -6528,7 +6716,11 @@ def deferred_rollover_passive_wait_required(watcher: LocalFirstOrchestrator) -> 
         and state.get("rolloverMaintenanceState") == "DEFERRED"
         and next_task_id
         and state.get("rolloverDeferredForTaskId") == next_task_id
-        and not getattr(watcher, "_operator_restart_rollover_recovery_available", False)
+        and not (
+            getattr(watcher, "_operator_restart_rollover_recovery_available", False)
+            and "rolloverAutomaticRecoveryEpochCount" not in watcher.state
+        )
+        and int(watcher.state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0) < int(watcher.state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0)
     )
 
 
@@ -6595,7 +6787,12 @@ def passive_deferred_rollover_wait(
                     handoverResent=False,
                 )
     else:
-        wait_seconds = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+        interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+        next_epoch = float(watcher.state.get("rolloverAutomaticRecoveryNextEligibleAt", 0.0) or 0.0)
+        wait_seconds = min(interval, max(0.0, next_epoch - time.time())) if next_epoch else interval
+        runtime_log(logger, run_id, "ROLLOVER_AUTO_RECOVERY_COOLDOWN", watcher.state,
+                    nextEligibleAt=next_epoch, remainingSeconds=max(0.0, next_epoch - time.time()) if next_epoch else None,
+                    noManualRestartRequired=True)
     if deferred_wait and getattr(watcher, "_rollover_passive_wait_logged_task", None) != task_id:
         watcher._rollover_passive_wait_logged_task = task_id
         runtime_log(

@@ -2535,6 +2535,95 @@ def test_reconciliation_true_exhaustion_defers_once(tmp_path, monkeypatch, exhau
     assert len(exhausted) == 1
 
 
+def test_deferred_rollover_self_rearms_after_cooldown_without_restart(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    transaction = "aa0000000000000000000090"
+    watcher.state.update({
+        "taskId": "000090", "lastCompletedTaskId": "000090", "nextTaskId": "000091",
+        "nextPromptPath": str(prompt), "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": False, "handoverRequested": True,
+        "rolloverTransactionId": transaction, "rolloverTransactionTaskId": "000091",
+        "rolloverAttemptedForTaskId": "000091", "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "DEFERRED", "rolloverRecoveryState": "DEFERRED",
+        "rolloverRecoveryTerminalReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "rolloverDeferredForTaskId": "000091", "rolloverAutomaticRecoveryEpochCount": 1,
+        "rolloverAutomaticRecoveryMaxEpochs": 3, "rolloverAutomaticRecoveryNextEligibleAt": 105.0,
+        "architectConversationId": "OLD", "executorProcessState": "EXITED",
+    })
+    watcher.save()
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 100.0)
+    assert watcher_module.deferred_rollover_passive_wait_required(watcher) is True
+    assert watcher.session_rollover._automatic_recovery_epoch_eligible("000091") is False
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 106.0)
+    assert watcher.session_rollover._automatic_recovery_epoch_eligible("000091") is True
+    assert watcher.session_rollover._begin_automatic_recovery_epoch("000091") is True
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 2
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 0
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverMaintenanceState"] == "IN_PROGRESS"
+    assert watcher._operator_restart_rollover_recovery_available is False
+
+
+def test_deferred_rollover_reconciles_existing_response_before_epoch_retry(tmp_path, monkeypatch):
+    watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    transaction = "aa0000000000000000000091"
+    response = f"handover\nRollover transaction ID: {transaction}\nARCHITECT_HANDOVER_READY"
+    watcher.state.update({
+        "taskId": "000090", "lastCompletedTaskId": "000090", "nextTaskId": "000091",
+        "nextPromptPath": str(prompt), "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": False, "handoverRequested": True,
+        "rolloverTransactionId": transaction, "rolloverTransactionTaskId": "000091",
+        "rolloverAttemptedForTaskId": "000091", "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "DEFERRED", "rolloverRecoveryState": "DEFERRED",
+        "rolloverRecoveryTerminalReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "rolloverDeferredForTaskId": "000091", "rolloverAutomaticRecoveryEpochCount": 1,
+        "rolloverAutomaticRecoveryMaxEpochs": 3, "rolloverAutomaticRecoveryNextEligibleAt": 1.0,
+        "architectConversationId": "OLD", "executorProcessState": "EXITED",
+    })
+    watcher.save()
+    events = []
+
+    class Bridge:
+        page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
+        def exact_user_message_payload_observed(self, _payload): return False
+        def generation_visible(self): return False
+        def _assistant_entries(self): return [{"id": "ready", "text": response}]
+        def close(self): pass
+
+    bridge = Bridge()
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 10.0)
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    def consume(_bridge, _response):
+        events.append("consume")
+        watcher.state.update({"rolloverDue": False, "rolloverPending": False, "rolloverInProgress": False, "handoverRequested": False, "architectConversationId": "FRESH"})
+        return True
+    monkeypatch.setattr(watcher, "process_pending_handover_response", consume)
+    assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is True
+    assert events == ["consume"]
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 1
+    assert watcher.state["rolloverDue"] is False
+    assert watcher.state["nextTaskId"] == "000091"
+
+
+def test_automatic_rollover_epochs_exhaust_into_human_required(tmp_path, monkeypatch):
+    watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
+    watcher.state.update({
+        "taskId": "000090", "nextTaskId": "000091", "rolloverDue": True,
+        "rolloverPending": True, "rolloverMaintenanceState": "DEFERRED",
+        "rolloverRecoveryState": "DEFERRED", "rolloverDeferredForTaskId": "000091",
+        "rolloverAutomaticRecoveryEpochCount": 3, "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverTransactionId": "aa0000000000000000000092", "rolloverTransactionTaskId": "000091",
+    })
+    watcher.save()
+    assert watcher.session_rollover._begin_automatic_recovery_epoch("000091") is False
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+    assert watcher.state["rolloverDue"] is True
+    assert watcher.state["rolloverPending"] is True
+
+
 def test_operator_restart_deferred_rollover_gets_one_attempt_then_successful_dispatch(tmp_path, monkeypatch):
     watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
     watcher.state.update({
@@ -2942,7 +3031,7 @@ def test_retired_transaction_token_cannot_satisfy_replacement(tmp_path):
     ) is True
 
 
-def test_prepared_unsent_transaction_reused_after_real_restart_path(tmp_path, monkeypatch):
+def test_deferred_ambiguous_transaction_is_not_replaced_by_restart(tmp_path, monkeypatch):
     watcher, _prompt, retired = _terminal_same_task_rollover_fixture(tmp_path)
     first = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     sent = []
@@ -2960,10 +3049,9 @@ def test_prepared_unsent_transaction_reused_after_real_restart_path(tmp_path, mo
     monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
     assert watcher_module.service_deferred_rollover_once(first, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
     prepared_id = first.state["rolloverTransactionId"]
-    prepared_generation = first.state["rolloverTransactionGeneration"]
-    assert prepared_id != retired
-    assert prepared_generation == 1
-    assert first.state["rolloverHandoverSendState"] == "UNSENT"
+    assert prepared_id == retired
+    assert "rolloverTransactionGeneration" not in first.state
+    assert first.state["rolloverHandoverSendState"] == "AMBIGUOUS"
 
     second = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     assert second._operator_restart_rollover_recovery_available is True
@@ -2981,13 +3069,9 @@ def test_prepared_unsent_transaction_reused_after_real_restart_path(tmp_path, mo
     retry_bridge = RetryBridge()
     monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: retry_bridge))
     assert watcher_module.service_deferred_rollover_once(second, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
-    assert len(sent) == 1
-    payload, persisted_id, persisted_generation = sent[0]
-    assert persisted_id == prepared_id
-    assert persisted_generation == prepared_generation
-    assert f"Rollover transaction ID: {prepared_id}" in payload
+    assert len(sent) == 0
     assert second.state["rolloverTransactionId"] == prepared_id
-    assert second.state["rolloverTransactionGeneration"] == prepared_generation
+    assert "rolloverRecoveryRetryAfter" in second.state
 
 
 def test_prepared_unsent_without_valid_generation_gets_new_identity(tmp_path):
