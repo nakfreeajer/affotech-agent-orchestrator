@@ -97,10 +97,11 @@ class DiagnosticTracer:
             "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
             "rolloverRecoveryEpoch", "rolloverAutomaticRecoveryEpochCount",
             "rolloverAutomaticRecoveryNextEligibleAt", "rolloverAutomaticRecoveryMaxEpochs",
-            "discussionPauseActive", "architectGenerating",
+            "discussionPauseActive", "discussionPauseEpoch", "architectGenerating",
             "postDiscussionEnvelopeRequired", "postDiscussionResumeEpoch", "postDiscussionProtocolTaskId",
             "postDiscussionEnvelopeRepairAttempted", "postDiscussionEnvelopeRepairAwaiting",
             "postDiscussionEnvelopeRepairTaskId", "postDiscussionEnvelopeRepairEpoch", "postDiscussionProtocolFailure",
+            "postDiscussionResumePauseEpoch",
         )
         return {key: current.get(key) for key in keys}
 
@@ -4253,12 +4254,30 @@ def atomic_write(path: str | os.PathLike[str], data: bytes) -> None:
     """Durably replace one local file without exposing a partial document."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    with temporary.open("wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, target)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.{os.getpid()}.{threading.get_ident()}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if descriptor != -1:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def parse_orchestrator_result(text: str, completed_task_id: str) -> dict[str, str]:
@@ -4308,6 +4327,7 @@ class LocalFirstOrchestrator:
     def __init__(self, project_dir: str, state_dir: str | os.PathLike[str] | None = None, process_factory: Callable[[str, Path], Any] | None = None):
         self.project_dir = Path(project_dir)
         self.state_dir = Path(state_dir or self.project_dir / ".agent-work" / "orchestrator")
+        self._state_lock = threading.RLock()
         self.results_dir, self.prompts_dir, self.logs_dir = (self.state_dir / name for name in ("results", "prompts", "logs"))
         self.inbox_dir = self.state_dir / "inbox"
         self.state_path = self.state_dir / "state.json"
@@ -4510,12 +4530,14 @@ class LocalFirstOrchestrator:
         return value
 
     def save(self) -> None:
-        tracer = diagnostic_trace_for(self)
-        before = dict(getattr(self, "_diagnostic_last_saved_state", {})) if tracer else {}
-        atomic_write(self.state_path, (json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
-        if tracer:
-            tracer.state_write(before, self.state)
-            self._diagnostic_last_saved_state = dict(self.state)
+        with self._state_lock:
+            tracer = diagnostic_trace_for(self)
+            before = dict(getattr(self, "_diagnostic_last_saved_state", {})) if tracer else {}
+            snapshot = dict(self.state)
+            atomic_write(self.state_path, (json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+            if tracer:
+                tracer.state_write(before, snapshot)
+                self._diagnostic_last_saved_state = snapshot
 
     def discussion_pause_active(self) -> bool:
         marker = self.state_dir / "discussion-pause.marker"
@@ -4532,52 +4554,95 @@ class LocalFirstOrchestrator:
 
     def _restore_machine_protocol_after_discussion(self) -> None:
         """Durably create one machine-protocol epoch for the current task."""
-        task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
-        if not task_id:
-            return
-        epoch = int(self.state.get("postDiscussionResumeEpoch", 0) or 0) + 1
-        self.state.update({
-            "postDiscussionEnvelopeRequired": True,
-            "postDiscussionResumeEpoch": epoch,
-            "postDiscussionEnvelopeRepairAttempted": False,
-            "postDiscussionEnvelopeRepairTaskId": task_id,
-            "postDiscussionEnvelopeRepairEpoch": epoch,
-            "postDiscussionEnvelopeRepairAwaiting": False,
-            "postDiscussionProtocolTaskId": task_id,
-            "postDiscussionProtocolBaseline": self.state.get("architectDiscussionBaseline") or self.state.get("architectBaseline"),
-        })
-        self.save()
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DISCUSSION_MACHINE_PROTOCOL_RESTORED", self.state, taskId=task_id, resumeEpoch=epoch)
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_EXPECTED", self.state, taskId=task_id, resumeEpoch=epoch)
+        with self._state_lock:
+            task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
+            needs_protocol = (
+                bool(task_id)
+                and self.state.get("state") == "HUMAN_REQUIRED"
+                and self.state.get("humanRequiredReason") in {
+                    "ARCHITECT_DECISION_HUMAN_REQUIRED",
+                    "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION",
+                    "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+                }
+            ) or (
+                bool(task_id)
+                and
+                self.state.get("state") == "ARCHITECT_RUNNING"
+                and self.state.get("postDiscussionEnvelopeRequired") is True
+            )
+            prior_state = dict(self.state)
+            if not needs_protocol:
+                changed = bool(self.state.get("postDiscussionEnvelopeRequired") or self.state.get("postDiscussionEnvelopeRepairAwaiting"))
+                self.state.update({"postDiscussionEnvelopeRequired": False, "postDiscussionEnvelopeRepairAwaiting": False})
+                if changed:
+                    self.save()
+                try:
+                    self._write_discussion_pause_marker(False)
+                except Exception:
+                    self.state = prior_state
+                    if changed:
+                        self.save()
+                    raise
+                return
+            pause_epoch = self.state.get("discussionPauseEpoch")
+            same_resume_epoch = (
+                self.state.get("postDiscussionEnvelopeRequired") is True
+                and self.state.get("postDiscussionProtocolTaskId") == task_id
+                and pause_epoch is not None
+                and self.state.get("postDiscussionResumePauseEpoch") == pause_epoch
+            )
+            if not same_resume_epoch:
+                epoch = int(self.state.get("postDiscussionResumeEpoch", 0) or 0) + 1
+                self.state.update({
+                    "postDiscussionEnvelopeRequired": True,
+                    "postDiscussionResumeEpoch": epoch,
+                    "postDiscussionEnvelopeRepairAttempted": False,
+                    "postDiscussionEnvelopeRepairTaskId": task_id,
+                    "postDiscussionEnvelopeRepairEpoch": epoch,
+                    "postDiscussionEnvelopeRepairAwaiting": False,
+                    "postDiscussionProtocolTaskId": task_id,
+                    "postDiscussionProtocolBaseline": self.state.get("architectDiscussionBaseline") or self.state.get("architectBaseline"),
+                    "postDiscussionResumePauseEpoch": pause_epoch,
+                })
+            self.save()
+            try:
+                self._write_discussion_pause_marker(False)
+            except Exception:
+                self.state = prior_state
+                try:
+                    self.save()
+                finally:
+                    raise
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "DISCUSSION_MACHINE_PROTOCOL_RESTORED", self.state, taskId=task_id, resumeEpoch=self.state.get("postDiscussionResumeEpoch"))
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_EXPECTED", self.state, taskId=task_id, resumeEpoch=self.state.get("postDiscussionResumeEpoch"))
 
     def request_discussion_pause(self) -> None:
-        if self.discussion_pause_active():
-            return
-        self._write_discussion_pause_marker(True)
-        task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
-        print(f"ORCHESTRATOR PAUSED BY HUMAN state={self.state.get('state')} taskId={task_id} F10=RESUME")
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_PAUSE_REQUESTED", self.state, taskId=task_id)
+        with self._state_lock:
+            if self.discussion_pause_active():
+                return
+            self._write_discussion_pause_marker(True)
+            task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
+            if task_id != "NONE":
+                self.state["discussionPauseEpoch"] = int(self.state.get("discussionPauseEpoch", 0) or 0) + 1
+                self.save()
+            print(f"ORCHESTRATOR PAUSED BY HUMAN state={self.state.get('state')} taskId={task_id} F10=RESUME")
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_PAUSE_REQUESTED", self.state, taskId=task_id)
 
     def request_discussion_resume(self) -> None:
-        if not self.discussion_pause_active():
-            return
-        self._write_discussion_pause_marker(False)
-        self._restore_machine_protocol_after_discussion()
-        task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
-        print(f"ORCHESTRATOR RESUMED BY HUMAN state={self.state.get('state')} taskId={task_id}")
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_RESUME_REQUESTED", self.state, taskId=task_id)
+        with self._state_lock:
+            if not self.discussion_pause_active():
+                return
+            self._restore_machine_protocol_after_discussion()
+            task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
+            print(f"ORCHESTRATOR RESUMED BY HUMAN state={self.state.get('state')} taskId={task_id}")
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_RESUME_REQUESTED", self.state, taskId=task_id)
 
     def request_remote_discussion_pause(self) -> None:
-        if self.discussion_pause_active():
-            return
-        self._write_discussion_pause_marker(True)
+        self.request_discussion_pause()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "REMOTE_DISCUSSION_PAUSE_REQUESTED", self.state)
 
     def request_remote_discussion_resume(self) -> None:
-        if not self.discussion_pause_active():
-            return
-        self._write_discussion_pause_marker(False)
-        self._restore_machine_protocol_after_discussion()
+        self.request_discussion_resume()
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "REMOTE_DISCUSSION_RESUME_REQUESTED", self.state)
 
 
@@ -5800,6 +5865,10 @@ class LocalFirstOrchestrator:
         return True
 
     def accept_architect_response(self, response: str) -> dict[str, str]:
+        with self._state_lock:
+            return self._accept_architect_response_locked(response)
+
+    def _accept_architect_response_locked(self, response: str) -> dict[str, str]:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         consumed = self.state.setdefault("consumedArchitectResponses", {})
         if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:
@@ -6002,12 +6071,27 @@ class DiscussionHotkeyController:
         self._thread_id = None
 
     def dispatch(self, key: str) -> bool:
-        if key == "F9":
-            self.watcher.request_discussion_pause()
-            return True
-        if key == "F10":
-            self.watcher.request_discussion_resume()
-            return True
+        try:
+            if key == "F9":
+                self.watcher.request_discussion_pause()
+                return True
+            if key == "F10":
+                self.watcher.request_discussion_resume()
+                return True
+        except Exception as error:
+            task_id = self.watcher.state.get("taskId") or self.watcher.state.get("nextTaskId")
+            runtime_log(
+                getattr(self.watcher, "runtime_logger", None),
+                getattr(self.watcher, "runtime_run_id", None),
+                "DISCUSSION_CONTROL_DISPATCH_FAILED",
+                self.watcher.state,
+                key=key,
+                taskId=task_id,
+                exceptionClass=type(error).__name__,
+                safeDisposition="DISCUSSION_CONTROL_FAIL_CLOSED",
+            )
+            self.emit(f"DISCUSSION_CONTROL_DISPATCH_FAILED key={key} error={type(error).__name__} safeDisposition=DISCUSSION_CONTROL_FAIL_CLOSED")
+            return False
         return False
 
     def start(self, log: Callable[[str], None] | None = None) -> bool:

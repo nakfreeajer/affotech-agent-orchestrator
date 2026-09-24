@@ -20,7 +20,8 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         run_human_required_startup_once, DiscussionHotkeyController,
                                         RemoteDiscussionControlMonitor,
                                         architect_process_tree_memory_bytes,
-                                        resident_human_decision_response)
+                                        resident_human_decision_response,
+                                        dispatch_next_prompt_once)
 import local_orchestrator_watcher as watcher_module
 
 
@@ -6660,6 +6661,134 @@ def test_architect_bootstrap_carries_permanent_post_discussion_contract():
     bootstrap = watcher_module.fresh_architect_bootstrap_payload("handover")
     assert "While human discussion is active" in bootstrap
     assert "F10 / ORCH:RESUME" in bootstrap
+
+
+def test_concurrent_save_calls_use_serialized_unique_atomic_writes(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def save_worker(index):
+        try:
+            watcher.state[f"concurrent-{index}"] = index
+            barrier.wait()
+            watcher.save()
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=save_worker, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    persisted = json.loads(watcher.state_path.read_text(encoding="utf-8"))
+    assert persisted["concurrent-0"] == 0
+    assert persisted["concurrent-1"] == 1
+
+
+def test_f10_after_next_prompt_ready_only_clears_pause_and_dispatches_once(tmp_path):
+    watcher, base, _ = recovery_fixture(tmp_path)
+    head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "refs/remotes/origin/hybrid-v2"], text=True).strip()
+    prompt = configured_project_prompt(base, head, "next-000100")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "000099", "lastCompletedTaskId": "000099", "nextTaskId": "000100", "architectConversationId": "ARCH", "rolloverDue": False, "rolloverPending": False})
+    watcher._write_discussion_pause_marker(True)
+    response = envelope("000099", prompt=prompt)
+    watcher.accept_architect_response(response)
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
+    assert controller.dispatch("F10") is True
+    assert not watcher.discussion_pause_active()
+    assert watcher.state.get("postDiscussionResumeEpoch") is None
+    launches = []
+    process = type("Process", (), {"pid": 12345})()
+    assert dispatch_next_prompt_once(watcher, lambda *_args: launches.append(1) or process, "endpoint", lambda: False) is process
+    assert len(launches) == 1
+
+
+def test_resume_for_unresolved_human_discussion_arms_once_and_repeated_f10_is_idempotent(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "000099", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})
+    watcher._write_discussion_pause_marker(True)
+    controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
+    assert controller.dispatch("F10") is True
+    assert watcher.state["postDiscussionResumeEpoch"] == 1
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert controller.dispatch("F10") is True
+    assert watcher.state["postDiscussionResumeEpoch"] == 1
+    assert controller.dispatch("F9") is True
+    assert controller.dispatch("F10") is True
+    assert watcher.state["postDiscussionResumeEpoch"] == 2
+
+
+@pytest.mark.parametrize("workflow_state", ["EXECUTOR_RUNNING", "RESULT_READY", "IDLE"])
+def test_f10_does_not_arm_unrelated_machine_protocol_epoch(tmp_path, workflow_state):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": workflow_state, "taskId": "000099", "humanRequiredReason": None})
+    watcher._write_discussion_pause_marker(True)
+    assert DiscussionHotkeyController(watcher, emit=lambda _message: None).dispatch("F10") is True
+    assert not watcher.discussion_pause_active()
+    assert watcher.state.get("postDiscussionResumeEpoch") is None
+    assert not watcher.state.get("postDiscussionEnvelopeRequired")
+
+
+def test_resume_persistence_failure_leaves_discussion_paused_and_hotkey_alive(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "000099", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED"})
+    watcher._write_discussion_pause_marker(True)
+    original_save = watcher.save
+    calls = []
+
+    def failing_save():
+        calls.append(1)
+        raise PermissionError("simulated state persistence failure")
+
+    monkeypatch.setattr(watcher, "save", failing_save)
+    controller = DiscussionHotkeyController(watcher, emit=lambda message: calls.append(message))
+    assert controller.dispatch("F10") is False
+    assert watcher.discussion_pause_active() is True
+    assert any(isinstance(item, str) and "DISCUSSION_CONTROL_DISPATCH_FAILED" in item for item in calls)
+    monkeypatch.setattr(watcher, "save", original_save)
+    assert controller.dispatch("F10") is True
+    assert not watcher.discussion_pause_active()
+
+
+@pytest.mark.parametrize("resume_method", ["request_discussion_resume", "request_remote_discussion_resume"])
+def test_concurrent_save_and_resume_are_serialized_and_keep_state_valid(tmp_path, resume_method):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "000099", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})
+    watcher._write_discussion_pause_marker(True)
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def competing_save():
+        try:
+            barrier.wait()
+            watcher.state["competingSave"] = True
+            watcher.save()
+        except Exception as error:
+            errors.append(error)
+
+    def resume():
+        try:
+            barrier.wait()
+            getattr(watcher, resume_method)()
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=competing_save), threading.Thread(target=resume)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    persisted = json.loads(watcher.state_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "HUMAN_REQUIRED"
+    assert persisted["taskId"] == "000099"
+    assert persisted.get("postDiscussionResumeEpoch") == 1
+    assert watcher.discussion_pause_active() is False
 
 
 def test_discussion_hotkey_unknown_key_is_ignored(tmp_path):
