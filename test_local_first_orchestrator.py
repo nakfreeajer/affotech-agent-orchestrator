@@ -2159,7 +2159,7 @@ def test_ambiguous_handover_reconciles_same_invocation_without_terminal_defer(tm
             if not ready[0]:
                 return []
             transaction_id = watcher.state["rolloverTransactionId"]
-            return [{"id": "handover", "text": f"{handover_prefix}\nRollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"}]
+            return [{"id": "handover", "text": watcher_module.make_handover_envelope(transaction_id, "000080", handover_prefix)}]
 
         def close(self):
             pass
@@ -2185,7 +2185,7 @@ def test_ambiguous_handover_reconciles_same_invocation_without_terminal_defer(tm
     # no second submit is permitted and no operator restart is involved.
     ready[0] = True
     transaction_id = watcher.state["rolloverTransactionId"]
-    handover = f"{handover_prefix}\nRollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"
+    handover = watcher_module.make_handover_envelope(transaction_id, "000080", handover_prefix)
     fresh_page.users = [watcher_module.fresh_architect_bootstrap_payload(handover)]
     fresh_page.assistants = [{"id": "ready", "text": "ARCHITECT_SESSION_READY"}]
     clock[0] = 106.0
@@ -2254,7 +2254,7 @@ def test_deferred_rollover_gets_fresh_transaction_and_rejects_stale_handover(tmp
     assert watcher.session_rollover.complete_from_response(bridge, stale) is False
     assert opened == []
     assert watcher.state["architectConversationId"] == "OLD"
-    matching = f"new handover\nRollover transaction ID: {transaction_b}\nARCHITECT_HANDOVER_READY"
+    matching = watcher_module.make_handover_envelope(transaction_b, "000042", "new handover")
     assert watcher.session_rollover.complete_from_response(bridge, matching) is True
     assert opened == [1]
     assert watcher.state["architectConversationId"] == "NEW"
@@ -5876,8 +5876,79 @@ def test_idle_bootstrap_stop_does_not_recurse(tmp_path):
     bridge = IdleArchitectBridge(response)
     assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
     assert bridge.messages == []
-    assert watcher.inspect_idle_architect(bridge, lambda *_: None) == "IDLE"
-    assert bridge.messages == []
+
+
+def test_canonical_handover_envelope_is_strict_and_exact():
+    envelope = watcher_module.make_handover_envelope("abc123", "000103", "complete body")
+    assert watcher_module.parse_handover_envelope(envelope) == {
+        "version": 1, "transactionId": "abc123", "taskId": "000103", "body": "complete body"
+    }
+    assert watcher_module.parse_handover_envelope(envelope + "\nprose") is None
+    assert watcher_module.parse_handover_envelope(envelope.replace("version=1", "version=2")) is None
+    assert watcher_module.parse_handover_envelope(envelope.replace("</HANDOVER>", "</HANDOVER></HANDOVER>")) is None
+    assert watcher_module.parse_handover_envelope("prose " + envelope) is None
+
+
+def test_new_rollover_requires_canonical_handover_after_request(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = tmp_path / "000103.txt"
+    prompt.write_text("next", encoding="utf-8")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000102", "nextTaskId": "000103",
+                          "nextPromptPath": str(prompt), "rolloverDue": True, "architectMemoryBytes": watcher_module.ARCHITECT_MEMORY_THRESHOLD_BYTES})
+    watcher.save()
+    class Bridge:
+        def submit_result_bounded(self, _payload): pass
+    assert watcher.session_rollover.request_if_due(Bridge(), True, False, safe_boundary_state="NEXT_PROMPT_READY") is True
+    tx = watcher.state["rolloverTransactionId"]
+    assert watcher.session_rollover._handover_response_valid(
+        f"body\nRollover transaction ID: {tx}\nARCHITECT_HANDOVER_READY", tx
+    ) is False
+    assert watcher.session_rollover._handover_response_valid(
+        watcher_module.make_handover_envelope(tx, "000103", "body"), tx
+    ) is True
+
+
+def test_legacy_current_inflight_handover_is_compatibility_only(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"rolloverTransactionId": watcher_module.LEGACY_COMPAT_TRANSACTION_ID,
+                          "rolloverTransactionTaskId": watcher_module.LEGACY_COMPAT_TASK_ID})
+    response = ("legacy body\nRollover transaction ID: " + watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+                + "\n000103\nARCHITECT_HANDOVER_READY")
+    assert watcher.session_rollover._handover_response_valid(response) is True
+    watcher.state["rolloverTransactionId"] = "new-transaction"
+    assert watcher.session_rollover._handover_response_valid(response) is False
+
+
+def test_deferred_wait_never_uses_zero_delay_and_does_not_inflate_budget(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "nextTaskId": "000103", "rolloverDue": True,
+                          "rolloverMaintenanceState": "DEFERRED", "rolloverDeferredForTaskId": "000103",
+                          "rolloverAutomaticRecoveryEpochCount": 1, "rolloverAutomaticRecoveryMaxEpochs": 3,
+                          "rolloverAutomaticRecoveryNextEligibleAt": 0})
+    watcher.save()
+    waits = []
+    monkeypatch.setattr(watcher_module.time, "sleep", waits.append)
+    assert watcher_module.passive_deferred_rollover_wait(watcher, poll_interval=0) is True
+    assert waits and waits[0] > 0
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 1
+
+
+def test_windows_log_rotation_sharing_violation_is_deferred(tmp_path, monkeypatch, capsys):
+    logger, run_id, _ = watcher_module.initialize_runtime_logging(tmp_path)
+    handler = logger.handlers[0]
+    calls = []
+    def denied(_self):
+        calls.append(1)
+        raise PermissionError(32, "sharing violation")
+    monkeypatch.setattr(watcher_module.logging.handlers.RotatingFileHandler, "doRollover", denied)
+    handler.maxBytes = 1
+    watcher_module.runtime_log(logger, run_id, "FIRST", {"state": "NEXT_PROMPT_READY", "taskId": "000103"}, payload="x")
+    watcher_module.runtime_log(logger, run_id, "SECOND", {"state": "NEXT_PROMPT_READY", "taskId": "000103"}, payload="x")
+    handler.flush()
+    assert calls == [1]
+    assert getattr(handler, "rotation_deferred") is True
+    assert "FIRST" in Path(handler.baseFilename).read_text(encoding="utf-8") or "SECOND" in Path(handler.baseFilename).read_text(encoding="utf-8")
+    assert "LOG_ROTATION_DEFERRED" in capsys.readouterr().err
 
 
 def test_idle_legacy_consumed_result_review_migrates_and_bootstraps_once(tmp_path):

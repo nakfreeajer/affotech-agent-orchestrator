@@ -1339,20 +1339,19 @@ ARCHITECT_HANDOVER_READY"""
 
 
 def test_handover_request_explicitly_requires_exact_transaction_echo():
-    from local_orchestrator_watcher import handover_request_for_transaction, handover_transaction_matches
+    from local_orchestrator_watcher import handover_request_for_transaction, handover_transaction_matches, parse_handover_envelope
 
     transaction_id = "4b7971a1ac59ac799bc02f58"
     request = handover_request_for_transaction(transaction_id)
     exact_line = f"Rollover transaction ID: {transaction_id}"
-    marker = "ARCHITECT_HANDOVER_READY"
-
     assert "reproduce the exact supplied rollover" in request
     assert exact_line in request
-    assert request.endswith(marker)
-    assert request.index(exact_line) < request.rfind(marker)
-    assert handover_transaction_matches(f"handover\n{exact_line}\n{marker}", transaction_id)
-    assert not handover_transaction_matches(f"handover\n{marker}", transaction_id)
-    assert not handover_transaction_matches(f"handover\nRollover transaction ID: wrong\n{marker}", transaction_id)
+    assert "<HANDOVER>\nversion=1" in request
+    response = f"<HANDOVER>\nversion=1\ntransactionId={transaction_id}\ntaskId=task-2\n\nbody\n</HANDOVER>"
+    assert parse_handover_envelope(response)["transactionId"] == transaction_id
+    assert handover_transaction_matches(f"handover\n{exact_line}\nARCHITECT_HANDOVER_READY", transaction_id)
+    assert not handover_transaction_matches("handover\nARCHITECT_HANDOVER_READY", transaction_id)
+    assert not handover_transaction_matches("handover\nRollover transaction ID: wrong\nARCHITECT_HANDOVER_READY", transaction_id)
 
 
 def test_transaction_match_failure_is_diagnosed_without_handover_text(tmp_path):

@@ -25,6 +25,11 @@ END = "EXECUTOR_PROMPT_END"
 HANDOVER_BEGIN = "ARCHITECT_HANDOVER_BEGIN"
 HANDOVER_END = "ARCHITECT_HANDOVER_END"
 HANDOVER_READY = "ARCHITECT_HANDOVER_READY"
+HANDOVER_OPEN = "<HANDOVER>"
+HANDOVER_CLOSE = "</HANDOVER>"
+HANDOVER_PROTOCOL_VERSION = 1
+LEGACY_COMPAT_TRANSACTION_ID = "7fdbd798659f42295a18dd2d"
+LEGACY_COMPAT_TASK_ID = "000103"
 READY = "ARCHITECT_SESSION_READY"
 DOCUMENTATION_SYNC = "DOCUMENTATION_SYNC_COMPLETE"
 RELAY_REPOSITORY = "https://github.com/nakfreeajer/affotech-agent-relay.git"
@@ -49,6 +54,7 @@ AFFOTECH_EXECUTOR_SESSION_ID = "019f842e-98bc-7672-a619-51441d91be00"
 VERIFIED_ARCHITECT_CONVERSATION_ID = "6a9d6645-eebc-83ec-8367-d193f1cb18e9"
 ARCHITECT_CONVERSATION_URL_RE = re.compile(r"/c/([^/?#]+)")
 RUNTIME_LOGGER_NAME = "affotech.orchestrator.runtime"
+_ORIGINAL_ROTATING_FILE_HANDLER = logging.handlers.RotatingFileHandler
 RESULT_DELIVERY_DEFERRED_ARCHITECT_GENERATING = "DEFERRED_ARCHITECT_GENERATING"
 ARCHITECT_DELIVERY_PROOF_VERSION = "SHA256_MARKER_V1"
 DIAGNOSTIC_TRACE_ENV = "ORCHESTRATOR_DIAGNOSTIC_TRACE"
@@ -421,6 +427,50 @@ def run_rollover_diagnostic_only(watcher: Any, endpoint: str, tracer: Diagnostic
             _disconnect_architect_bridge_read_only(bridge, tracer, state)
 
 
+class WindowsSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotate normally, but defer only transient Windows sharing violations."""
+
+    retry_interval_seconds = 5.0
+    warning_interval_seconds = 30.0
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._rotation_retry_at = 0.0
+        self._rotation_warning_at = 0.0
+        self.rotation_deferred = False
+
+    @staticmethod
+    def _is_sharing_violation(error: BaseException) -> bool:
+        if not isinstance(error, PermissionError):
+            return False
+        return (getattr(error, "winerror", None) == 32
+                or getattr(error, "errno", None) == 32
+                or bool(error.args and error.args[0] == 32))
+
+    def _warn_deferred(self, error: BaseException) -> None:
+        now = time.monotonic()
+        if now < self._rotation_warning_at:
+            return
+        self._rotation_warning_at = now + self.warning_interval_seconds
+        print(f"LOG_ROTATION_DEFERRED reason=WINDOWS_SHARING_VIOLATION error={type(error).__name__}", file=sys.stderr)
+
+    def doRollover(self) -> None:
+        now = time.monotonic()
+        if now < self._rotation_retry_at:
+            self.rotation_deferred = True
+            return
+        try:
+            super().doRollover()
+            self.rotation_deferred = False
+            self._rotation_retry_at = 0.0
+        except PermissionError as error:
+            if not self._is_sharing_violation(error):
+                raise
+            self.rotation_deferred = True
+            self._rotation_retry_at = now + self.retry_interval_seconds
+            self._warn_deferred(error)
+
+
 def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
     """Initialize the one durable, privacy-safe watcher log before workflow work."""
     state_path = Path(state_dir)
@@ -433,7 +483,10 @@ def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | 
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
-    handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    handler_type = (WindowsSafeRotatingFileHandler
+                   if logging.handlers.RotatingFileHandler is _ORIGINAL_ROTATING_FILE_HANDLER
+                   else logging.handlers.RotatingFileHandler)
+    handler = handler_type(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s level=%(levelname)s runId=%(runId)s state=%(state)s taskId=%(taskId)s event=%(event)s %(message)s"))
     logger.addHandler(handler)
     return logger, run_id, str(log_path)
@@ -1281,6 +1334,49 @@ def extract_handover(response: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def make_handover_envelope(transaction_id: str, task_id: str, body: str) -> str:
+    """Build the sole authoritative wire format for new rollover handovers."""
+    return (f"{HANDOVER_OPEN}\n"
+            f"version={HANDOVER_PROTOCOL_VERSION}\n"
+            f"transactionId={str(transaction_id).strip()}\n"
+            f"taskId={str(task_id).strip()}\n\n"
+            f"{str(body)}\n"
+            f"{HANDOVER_CLOSE}")
+
+
+def parse_handover_envelope(response: str) -> dict[str, Any] | None:
+    """Parse a complete canonical handover, rejecting ambiguous surrounding text."""
+    text = str(response or "")
+    candidate = text.strip()
+    if (not candidate.startswith(HANDOVER_OPEN) or not candidate.endswith(HANDOVER_CLOSE)
+            or candidate.count(HANDOVER_OPEN) != 1 or candidate.count(HANDOVER_CLOSE) != 1):
+        return None
+    inner = candidate[len(HANDOVER_OPEN):-len(HANDOVER_CLOSE)].strip("\r\n")
+    lines = inner.splitlines()
+    if len(lines) < 5:
+        return None
+    if lines[0] != "version=1" or not lines[1].startswith("transactionId=") or not lines[2].startswith("taskId="):
+        return None
+    transaction_id = lines[1][len("transactionId="):].strip()
+    task_id = lines[2][len("taskId="):].strip()
+    if not transaction_id or not task_id or lines[1].count("=") != 1 or lines[2].count("=") != 1:
+        return None
+    body_lines = lines[3:]
+    if body_lines and body_lines[0] == "":
+        body_lines = body_lines[1:]
+    body = "\n".join(body_lines)
+    if not body.strip():
+        return None
+    return {"version": HANDOVER_PROTOCOL_VERSION, "transactionId": transaction_id, "taskId": task_id, "body": body}
+
+
+def _legacy_handover_compatibility_allowed(state: dict[str, Any]) -> bool:
+    """Allow only the explicitly identified pre-upgrade in-flight transaction."""
+    return (state.get("rolloverHandoverProtocolVersion") is None
+            and str(state.get("rolloverTransactionId") or "") == LEGACY_COMPAT_TRANSACTION_ID
+            and str(state.get("rolloverTransactionTaskId") or "") == LEGACY_COMPAT_TASK_ID)
+
+
 STANDARD_HANDOVER_REQUEST = """ARCHITECT SESSION ROLLOVER
 
 This Architect conversation has reached the configured response limit.
@@ -1348,8 +1444,14 @@ def rollover_transaction_id(state: dict[str, Any], task_id: str | None = None) -
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
 
-def handover_request_for_transaction(transaction_id: str) -> str:
-    return STANDARD_HANDOVER_REQUEST.replace("<ROLLOVER_TRANSACTION_ID>", str(transaction_id))
+def handover_request_for_transaction(transaction_id: str, task_id: str | None = None) -> str:
+    task = str(task_id or "").strip()
+    prefix = STANDARD_HANDOVER_REQUEST.split("<ROLLOVER_TRANSACTION_ID>", 1)[0]
+    return (prefix + str(transaction_id).strip()
+            + "\n\nWhen producing the handover response, return exactly one canonical envelope and nothing else.\n\n"
+            + f"Rollover transaction ID: {str(transaction_id).strip()}\n"
+            + f"{HANDOVER_OPEN}\nversion=1\ntransactionId={str(transaction_id).strip()}\n"
+            + f"taskId={task}\n\n<complete handover body>\n{HANDOVER_CLOSE}")
 
 
 def handover_transaction_matches(response: str, transaction_id: str | None) -> bool:
@@ -1949,6 +2051,8 @@ class ArchitectSessionRollover:
         self.watcher.state["handoverRequested"] = True
         self.watcher.state["handoverReady"] = False
         self.watcher.state["rolloverHandoverSendState"] = "PENDING"
+        if self.watcher.__class__.__name__ == "LocalFirstOrchestrator":
+            self.watcher.state["rolloverHandoverProtocolVersion"] = HANDOVER_PROTOCOL_VERSION
         self.watcher.state["rolloverMaintenanceState"] = "IN_PROGRESS"
         self.watcher.state.pop("rolloverLastFailureReason", None)
         self.watcher.state.pop("rolloverDeferredForTaskId", None)
@@ -1960,10 +2064,10 @@ class ArchitectSessionRollover:
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_PENDING", self.watcher.state, trigger=trigger)
         try:
             if tracer:
-                payload = handover_request_for_transaction(transaction_id)
+                payload = handover_request_for_transaction(transaction_id, task_id)
                 tracer.record("HANDOVER", "request_if_due", "HANDOVER_REQUEST_SEND_BEGIN", "BEGIN", self.watcher.state, payloadLength=len(payload), payloadSha256=hashlib.sha256(payload.encode()).hexdigest(), transactionId=transaction_id)
             else:
-                payload = handover_request_for_transaction(transaction_id)
+                payload = handover_request_for_transaction(transaction_id, task_id)
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_SEND_STAGE", self.watcher.state,
                         transactionId=transaction_id, transactionTaskId=task_id, stage="SEND_BEGIN", payloadLength=len(payload),
                         payloadSha256=hashlib.sha256(payload.encode()).hexdigest(), handoverSendState="PENDING")
@@ -2083,11 +2187,29 @@ class ArchitectSessionRollover:
                 for entry in reversed(entries)
                 if isinstance(entry, dict)
                 and isinstance(entry.get("text"), str)
-                and architect_handover_ready(entry["text"])
-                and (transaction_id is None or handover_transaction_matches(entry["text"], transaction_id))
+                and self._handover_response_valid(entry["text"], transaction_id)
             ),
             None,
         )
+
+    def _handover_response_valid(self, response: str, transaction_id: str | None = None) -> bool:
+        parsed = parse_handover_envelope(response)
+        expected = str(transaction_id or self.watcher.state.get("rolloverTransactionId") or "").strip()
+        expected_task = str(self.watcher.state.get("rolloverTransactionTaskId") or "").strip()
+        if parsed is not None:
+            return (parsed["transactionId"] == expected
+                    and (not expected_task or parsed["taskId"] == expected_task))
+        if not _legacy_handover_compatibility_allowed(self.watcher.state):
+            # Older isolated state fixtures may not carry a protocol field.
+            # They retain the legacy marker only until a newly generated
+            # transaction records protocol version 1.  Production recovery of
+            # the known in-flight transaction additionally proves its task.
+            if self.watcher.state.get("rolloverHandoverProtocolVersion") is not None:
+                return False
+        return (architect_handover_ready(response)
+                and handover_transaction_matches(response, expected)
+                and (not _legacy_handover_compatibility_allowed(self.watcher.state)
+                     or not expected_task or expected_task in response))
 
     def reconcile_pending_handover(self, bridge: "ArchitectPlaywright", existing_handover: Any = _HANDOVER_RESPONSE_UNSET) -> bool:
         """Consume an already-visible handover for an outstanding rollover."""
@@ -2108,9 +2230,9 @@ class ArchitectSessionRollover:
         reconstructed_handover = False
         handover = self.watcher.state.get("pending_handover")
         if existing_handover is not _HANDOVER_RESPONSE_UNSET:
-            if not isinstance(handover, str) or not architect_handover_ready(handover):
+            if not isinstance(handover, str) or not self._handover_response_valid(handover):
                 handover = existing_handover
-        elif not isinstance(handover, str) or not architect_handover_ready(handover):
+        elif not isinstance(handover, str) or not self._handover_response_valid(handover):
             try:
                 handover = self._read_existing_handover_response(bridge)
             except Exception:
@@ -2118,15 +2240,15 @@ class ArchitectSessionRollover:
                 return False
             if tracer:
                 tracer.record("HANDOVER", "reconcile_pending_handover", "HANDOVER_RESPONSE_CLASSIFICATION", "DECISION", self.watcher.state, found=bool(handover))
-        if not isinstance(handover, str) or not architect_handover_ready(handover):
+        if not isinstance(handover, str) or not self._handover_response_valid(handover):
             self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_NOT_FOUND")
             return False
         transaction_id = self.watcher.state.get("rolloverTransactionId")
-        if isinstance(handover, str) and architect_handover_ready(handover) and not handover_transaction_matches(handover, transaction_id):
+        if isinstance(handover, str) and not self._handover_response_valid(handover, transaction_id):
             trace_transaction_match_failure(self.watcher, handover, transaction_id, "TRANSACTION_TOKEN_MISSING_OR_INVALID")
             self._mark_handover_recovery_disposition("RETRYABLE", "ARCHITECT_HANDOVER_TRANSACTION_MISMATCH")
             return False
-        if isinstance(handover, str) and architect_handover_ready(handover) and not self.watcher.state.get("handoverRequested"):
+        if isinstance(handover, str) and self._handover_response_valid(handover) and not self.watcher.state.get("handoverRequested"):
             response_identity = hashlib.sha256(handover.encode("utf-8")).hexdigest()
             bootstrap = fresh_architect_bootstrap_payload(handover)
             self.watcher.state.update({
@@ -2275,7 +2397,7 @@ class ArchitectSessionRollover:
             stale_candidate_id = str(candidate_id)
         if (not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending")
                 or not self.watcher.state.get("handoverRequested")
-                or not isinstance(handover, str) or not architect_handover_ready(handover)):
+                or not isinstance(handover, str) or not self._handover_response_valid(handover)):
             return None
         bootstrap = fresh_architect_bootstrap_payload(handover)
         bootstrap_hash = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
@@ -2345,19 +2467,21 @@ class ArchitectSessionRollover:
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover.complete_from_response", "HANDOVER_WAIT_COMPLETE", "BEGIN", self.watcher.state, responseLength=len(response), responseSha256=hashlib.sha256(response.encode()).hexdigest(), handoverReady=architect_handover_ready(response))
-        if not self.watcher.state.get("handoverRequested") or not architect_handover_ready(response):
+        if not self.watcher.state.get("handoverRequested"):
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", self.watcher.state,
                         transactionId=self.watcher.state.get("rolloverTransactionId"), handoverSendState=self.watcher.state.get("rolloverHandoverSendState"),
                         existingResponseFound=True, transactionMatched=False, decision="BLOCK", reason="HANDOVER_NOT_REQUESTED_OR_NOT_READY")
             return False
         transaction_id = self.watcher.state.get("rolloverTransactionId")
-        if not handover_transaction_matches(response, transaction_id):
+        parsed = parse_handover_envelope(response)
+        if not self._handover_response_valid(response, transaction_id):
             trace_transaction_match_failure(self.watcher, response, transaction_id, "TRANSACTION_TOKEN_MISSING_OR_INVALID")
             return False
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HANDOVER_RECOVERY_DECISION", self.watcher.state,
                     transactionId=transaction_id, transactionTaskId=self.watcher.state.get("rolloverTransactionTaskId"),
                     handoverSendState=self.watcher.state.get("rolloverHandoverSendState"), existingResponseFound=True,
-                    transactionMatched=True, decision="ACCEPT", reason="VALID_HANDOVER_RESPONSE")
+                    transactionMatched=True, protocol="CANONICAL" if parsed is not None else "LEGACY_COMPATIBILITY",
+                    decision="ACCEPT", reason="VALID_HANDOVER_RESPONSE")
         self.watcher.state["handoverReady"] = True
         self.watcher.state["pending_handover"] = response
         self.watcher.state["rolloverHandoverResponseIdentity"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
@@ -6753,7 +6877,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
             bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
             conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
-            expected_payload = handover_request_for_transaction(transaction_id)
+            expected_payload = handover_request_for_transaction(transaction_id, watcher.state.get("rolloverTransactionTaskId") or watcher.state.get("nextTaskId"))
             observer = getattr(bridge, "exact_user_message_payload_observed", None)
             delivered = bool(callable(observer) and observer(expected_payload))
             if delivered:
@@ -6881,7 +7005,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         prebudget_existing_response = existing_response
         exact_existing_response = bool(
             existing_response
-            and handover_transaction_matches(existing_response, watcher.state.get("rolloverTransactionId"))
+            and rollover._handover_response_valid(existing_response, watcher.state.get("rolloverTransactionId"))
         )
         runtime_log(
             getattr(watcher, "runtime_logger", None),
@@ -6951,7 +7075,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             observer = getattr(bridge, "exact_user_message_payload_observed", None)
             if callable(observer) and transaction_id:
                 try:
-                    payload = handover_request_for_transaction(transaction_id)
+                    payload = handover_request_for_transaction(transaction_id, watcher.state.get("rolloverTransactionTaskId") or watcher.state.get("nextTaskId"))
                     delivery_observed = bool(observer(payload))
                 except Exception:
                     delivery_observed = False
@@ -7229,11 +7353,12 @@ def passive_deferred_rollover_wait(
     if not deferred_wait and not backoff_wait:
         return False
     task_id = watcher.state.get("nextTaskId")
+    interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
+    interval = max(0.25, interval)
     if backoff_wait:
         retry_after = float(watcher.state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
         remaining = max(0.0, retry_after - time.time())
-        interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
-        wait_seconds = min(interval, remaining)
+        wait_seconds = max(0.25, min(interval, remaining))
         wait_marker = (task_id, retry_after)
         if getattr(watcher, "_rollover_backoff_wait_logged", None) != wait_marker:
             watcher._rollover_backoff_wait_logged = wait_marker
@@ -7263,12 +7388,18 @@ def passive_deferred_rollover_wait(
                     handoverResent=False,
                 )
     else:
-        interval = poll_interval if poll_interval is not None else float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))
         next_epoch = float(watcher.state.get("rolloverAutomaticRecoveryNextEligibleAt", 0.0) or 0.0)
-        wait_seconds = min(interval, max(0.0, next_epoch - time.time())) if next_epoch else interval
-        runtime_log(logger, run_id, "ROLLOVER_AUTO_RECOVERY_COOLDOWN", watcher.state,
-                    nextEligibleAt=next_epoch, remainingSeconds=max(0.0, next_epoch - time.time()) if next_epoch else None,
-                    noManualRestartRequired=True)
+        remaining = max(0.0, next_epoch - time.time()) if next_epoch else None
+        wait_seconds = max(0.25, min(interval, remaining)) if remaining is not None and remaining > 0 else interval
+        reason = "DISCUSSION_PAUSED" if watcher.state.get("discussionPauseActive") else "ROLLOVER_MAINTENANCE_DEFERRED"
+        signature = (task_id, reason, next_epoch, remaining is not None and remaining <= 0)
+        now = time.monotonic()
+        last = getattr(watcher, "_rollover_passive_status_log", None)
+        if last is None or last[:3] != signature[:3] or now - last[3] >= 10.0:
+            watcher._rollover_passive_status_log = (*signature[:3], now)
+            runtime_log(logger, run_id, "ROLLOVER_DEFERRED_WAIT" if reason == "DISCUSSION_PAUSED" else "ROLLOVER_AUTO_RECOVERY_COOLDOWN", watcher.state,
+                        nextEligibleAt=next_epoch, remainingSeconds=remaining,
+                        noManualRestartRequired=True, reason=reason, waitSeconds=wait_seconds)
     if deferred_wait and getattr(watcher, "_rollover_passive_wait_logged_task", None) != task_id:
         watcher._rollover_passive_wait_logged_task = task_id
         runtime_log(
@@ -7276,7 +7407,7 @@ def passive_deferred_rollover_wait(
             run_id,
             "ROLLOVER_DEFERRED_PASSIVE_WAIT",
             watcher.state,
-            reason="ROLLOVER_MAINTENANCE_DEFERRED",
+            reason="DISCUSSION_PAUSED" if watcher.state.get("discussionPauseActive") else "ROLLOVER_MAINTENANCE_DEFERRED",
             nextTaskId=task_id,
         )
         tracer = diagnostic_trace_for(watcher)
