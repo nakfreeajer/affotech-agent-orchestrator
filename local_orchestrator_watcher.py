@@ -1381,42 +1381,21 @@ STANDARD_HANDOVER_REQUEST = """ARCHITECT SESSION ROLLOVER
 
 This Architect conversation has reached the configured response limit.
 
-Prepare a complete handover prompt for a fresh ChatGPT Architect conversation.
+Prepare a complete handover body for a fresh ChatGPT Architect conversation.
+Preserve the authoritative working state, current milestone, verified results,
+unresolved blockers, non-regression rules, evidence pointers, and exact next
+Architect action. Do not perform new project work or issue another Executor
+milestone.
 
-Preserve only the current authoritative working state required to continue safely, including:
+Return exactly one handover envelope and nothing outside it:
 
-* Architect role and authority model
-* project/repository/branch identity
-* current accepted baseline
-* current milestone and Executor activity
-* latest verified results
-* unresolved blockers
-* permanent non-regression rules
-* important recent user corrections and lessons
-* what must NOT be repeated or reopened
-* browser/session/port state if relevant
-* authoritative evidence pointers
-* exact next expected Architect action
+<HANDOVER>
+version=1
+transactionId=<exact transaction id>
+taskId=<exact rollover task id>
 
-Do not perform new project work. Do not issue another Executor milestone.
-Do not summarize obsolete history unless necessary to prevent regression.
-
-While human discussion is active, Architect responses may be conversational.
-Once Rony resolves the decision and discussion resumes, any workflow-bearing
-response MUST end with exactly one valid ORCHESTRATOR_RESULT envelope.
-F10 / ORCH:RESUME restores mandatory machine-envelope protocol.
-
-The output itself must be directly usable as the bootstrap prompt for the new Architect conversation.
-
-When producing the handover response, reproduce the exact supplied rollover
-transaction ID on the line immediately before the final marker, using this
-exact line:
-
-Rollover transaction ID: <ROLLOVER_TRANSACTION_ID>
-
-The response must end with:
-
-ARCHITECT_HANDOVER_READY"""
+<complete handover body>
+</HANDOVER>"""
 
 
 def rollover_transaction_id(state: dict[str, Any], task_id: str | None = None) -> str:
@@ -1446,12 +1425,11 @@ def rollover_transaction_id(state: dict[str, Any], task_id: str | None = None) -
 
 def handover_request_for_transaction(transaction_id: str, task_id: str | None = None) -> str:
     task = str(task_id or "").strip()
-    prefix = STANDARD_HANDOVER_REQUEST.split("<ROLLOVER_TRANSACTION_ID>", 1)[0]
-    return (prefix + str(transaction_id).strip()
-            + "\n\nWhen producing the handover response, return exactly one canonical envelope and nothing else.\n\n"
-            + f"Rollover transaction ID: {str(transaction_id).strip()}\n"
-            + f"{HANDOVER_OPEN}\nversion=1\ntransactionId={str(transaction_id).strip()}\n"
-            + f"taskId={task}\n\n<complete handover body>\n{HANDOVER_CLOSE}")
+    return ("ARCHITECT SESSION ROLLOVER\n\n"
+            "Return exactly:\n\n"
+            f"{HANDOVER_OPEN}\nversion=1\ntransactionId={str(transaction_id).strip()}\n"
+            f"taskId={task}\n\n<complete handover body>\n{HANDOVER_CLOSE}\n\n"
+            "Nothing outside the envelope.")
 
 
 def handover_transaction_matches(response: str, transaction_id: str | None) -> bool:
@@ -2200,16 +2178,10 @@ class ArchitectSessionRollover:
             return (parsed["transactionId"] == expected
                     and (not expected_task or parsed["taskId"] == expected_task))
         if not _legacy_handover_compatibility_allowed(self.watcher.state):
-            # Older isolated state fixtures may not carry a protocol field.
-            # They retain the legacy marker only until a newly generated
-            # transaction records protocol version 1.  Production recovery of
-            # the known in-flight transaction additionally proves its task.
-            if self.watcher.state.get("rolloverHandoverProtocolVersion") is not None:
-                return False
+            return False
         return (architect_handover_ready(response)
                 and handover_transaction_matches(response, expected)
-                and (not _legacy_handover_compatibility_allowed(self.watcher.state)
-                     or not expected_task or expected_task in response))
+                and (not expected_task or expected_task in response))
 
     def reconcile_pending_handover(self, bridge: "ArchitectPlaywright", existing_handover: Any = _HANDOVER_RESPONSE_UNSET) -> bool:
         """Consume an already-visible handover for an outstanding rollover."""

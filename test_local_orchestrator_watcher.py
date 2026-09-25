@@ -512,7 +512,7 @@ def test_terminal_publisher_failure_preserves_pending_and_does_not_retire(tmp_pa
 
 
 def test_architect_rollover_counts_to_thirty_and_requests_once(tmp_path):
-    from local_orchestrator_watcher import ArchitectSessionRollover, STANDARD_HANDOVER_REQUEST
+    from local_orchestrator_watcher import ArchitectSessionRollover
     watcher = LocalWatcher(str(tmp_path), tmp_path / "state.json", runner=object())
     rollover = ArchitectSessionRollover(watcher)
     rollover.initialize_current_session()
@@ -528,8 +528,9 @@ def test_architect_rollover_counts_to_thirty_and_requests_once(tmp_path):
     watcher.state["architectMemoryBytes"] = 891289600
     assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
     assert not rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
-    request_prefix = STANDARD_HANDOVER_REQUEST.split("<ROLLOVER_TRANSACTION_ID>", 1)[0]
-    assert bridge.requests[0].startswith(request_prefix)
+    assert "<HANDOVER>" in bridge.requests[0]
+    assert "version=1" in bridge.requests[0]
+    assert "ARCHITECT_HANDOVER_READY" not in bridge.requests[0]
     assert watcher.state["handoverRequested"] is True
 
 
@@ -573,13 +574,14 @@ def test_orphaned_handover_is_reconciled_without_duplicate_send(tmp_path, monkey
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "rolloverDue": True,
                           "rolloverPending": True, "handoverRequested": False,
-                          "rolloverAttemptedForTaskId": "task-1"})
+                          "rolloverAttemptedForTaskId": "task-1", "rolloverTransactionId": "orphan-tx",
+                          "rolloverTransactionTaskId": "task-1", "rolloverHandoverProtocolVersion": 1})
     rollover = ArchitectSessionRollover(watcher)
     calls = []
 
     class Bridge:
         def _assistant_entries(self):
-            return [{"id": "handover", "text": "completed\nARCHITECT_HANDOVER_READY"}]
+            return [{"id": "handover", "text": watcher_module.make_handover_envelope("orphan-tx", "task-1", "completed")}]
         def submit_result_bounded(self, _value):
             raise AssertionError("orphan recovery must not resend handover")
 
@@ -613,7 +615,9 @@ def test_service_reconciles_orphan_before_requesting_new_handover(tmp_path, monk
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "task-1", "rolloverDue": True,
                           "rolloverPending": True, "handoverRequested": False,
-                          "rolloverAttemptedForTaskId": "task-1", "architectConversationId": "current"})
+                          "rolloverAttemptedForTaskId": "task-1", "architectConversationId": "current",
+                          "rolloverTransactionId": "orphan-tx", "rolloverTransactionTaskId": "task-1",
+                          "rolloverHandoverProtocolVersion": 1})
     calls = []
 
     class Page:
@@ -622,7 +626,7 @@ def test_service_reconciles_orphan_before_requesting_new_handover(tmp_path, monk
     class Bridge:
         page = Page()
         def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
-        def _assistant_entries(self): return [{"id": "handover", "text": "completed\nARCHITECT_HANDOVER_READY"}]
+        def _assistant_entries(self): return [{"id": "handover", "text": watcher_module.make_handover_envelope("orphan-tx", "task-1", "completed")}]
         def generation_visible(self): return False
         def close(self): pass
 
@@ -653,6 +657,7 @@ def _prebudget_reconciliation_fixture(tmp_path, response, *, recovery_started=99
         "rolloverRecoveryRetryAfter": retry_after, "rolloverTransactionId": "2b324cd32cefc00ef1790c36",
         "rolloverTransactionGeneration": 2, "rolloverTransactionTaskId": "000080",
         "rolloverAttemptedForTaskId": "000080", "architectConversationId": "6ab08bd2-7140-83ec-813b-8501af0993f5",
+        "rolloverHandoverProtocolVersion": 1,
     })
     watcher.save()
     return watcher, prompt
@@ -705,7 +710,7 @@ def _run_prebudget_case(tmp_path, monkeypatch, response, *, now=1000.0,
 
 
 def test_prebudget_probe_consumes_exact_response_before_exhaustion(tmp_path, monkeypatch):
-    response = "document\nRollover transaction ID: 2b324cd32cefc00ef1790c36\nARCHITECT_HANDOVER_READY"
+    response = "<HANDOVER>\nversion=1\ntransactionId=2b324cd32cefc00ef1790c36\ntaskId=000080\n\ndocument\n</HANDOVER>"
     watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(
         tmp_path, monkeypatch, response, recovery_started=0.0, recovery_attempts=2, retry_after=0.0)
     assert result is True
@@ -717,7 +722,7 @@ def test_prebudget_probe_consumes_exact_response_before_exhaustion(tmp_path, mon
 
 
 def test_prebudget_probe_consumes_exact_response_during_backoff(tmp_path, monkeypatch):
-    response = "document\nRollover transaction ID: 2b324cd32cefc00ef1790c36\nARCHITECT_HANDOVER_READY"
+    response = "<HANDOVER>\nversion=1\ntransactionId=2b324cd32cefc00ef1790c36\ntaskId=000080\n\ndocument\n</HANDOVER>"
     watcher, _prompt, bridge, attaches, processed, result = _run_prebudget_case(tmp_path, monkeypatch, response)
     assert result is True
     assert processed == [response]
@@ -1291,7 +1296,8 @@ def test_architect_rollover_fail_closed_preserves_old_tab_on_handover_or_new_tab
         def open_fresh_with_handover(self, value): raise RuntimeError("new tab failed")
     bridge = Bridge(); bridge.page = OldPage()
     assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
-    response = f"HANDOVER\nRollover transaction ID: {watcher.state['rolloverTransactionId']}\nARCHITECT_HANDOVER_READY"
+    response = (f"<HANDOVER>\nversion=1\ntransactionId={watcher.state['rolloverTransactionId']}\n"
+                "taskId=task-2\n\nbody\n</HANDOVER>")
     assert not rollover.complete_from_response(bridge, response)
     assert bridge.page.closed is False
     assert watcher.state["handoverReady"] is False
@@ -1309,7 +1315,7 @@ ROLLOVER TRANSACTION
 `4b7971a1ac59ac799bc02f58`
 
 ARCHITECT_HANDOVER_READY"""
-    canonical_format = f"handover\nRollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"
+    canonical_format = f"<HANDOVER>\nversion=1\ntransactionId={transaction_id}\ntaskId=000070\n\nbody\n</HANDOVER>"
     assert handover_transaction_matches(production_format, transaction_id)
     assert handover_transaction_matches(canonical_format, transaction_id)
     assert not handover_transaction_matches("handover\nARCHITECT_HANDOVER_READY", transaction_id)
@@ -1321,7 +1327,8 @@ ARCHITECT_HANDOVER_READY"""
     watcher.state.update({
         "state": "NEXT_PROMPT_READY", "taskId": "000069", "nextTaskId": "000070",
         "handoverRequested": True, "rolloverPending": True,
-        "rolloverTransactionId": transaction_id,
+        "rolloverTransactionId": transaction_id, "rolloverTransactionTaskId": "000070",
+        "rolloverHandoverProtocolVersion": 1,
     })
     watcher.save()
     rollover = ArchitectSessionRollover(watcher)
@@ -1335,6 +1342,8 @@ ARCHITECT_HANDOVER_READY"""
             reached.append("fresh")
             raise RuntimeError("fresh path reached")
     assert rollover.complete_from_response(Bridge(), production_format) is False
+    assert reached == []
+    assert rollover.complete_from_response(Bridge(), canonical_format) is False
     assert reached == [True, "fresh"]
 
 
@@ -1343,12 +1352,14 @@ def test_handover_request_explicitly_requires_exact_transaction_echo():
 
     transaction_id = "4b7971a1ac59ac799bc02f58"
     request = handover_request_for_transaction(transaction_id)
-    exact_line = f"Rollover transaction ID: {transaction_id}"
-    assert "reproduce the exact supplied rollover" in request
-    assert exact_line in request
     assert "<HANDOVER>\nversion=1" in request
+    assert f"transactionId={transaction_id}" in request
+    assert "ARCHITECT_HANDOVER_READY" not in request
+    assert "ARCHITECT_HANDOVER_BEGIN" not in request
+    assert "ARCHITECT_HANDOVER_END" not in request
     response = f"<HANDOVER>\nversion=1\ntransactionId={transaction_id}\ntaskId=task-2\n\nbody\n</HANDOVER>"
     assert parse_handover_envelope(response)["transactionId"] == transaction_id
+    exact_line = f"Rollover transaction ID: {transaction_id}"
     assert handover_transaction_matches(f"handover\n{exact_line}\nARCHITECT_HANDOVER_READY", transaction_id)
     assert not handover_transaction_matches("handover\nARCHITECT_HANDOVER_READY", transaction_id)
     assert not handover_transaction_matches("handover\nRollover transaction ID: wrong\nARCHITECT_HANDOVER_READY", transaction_id)
@@ -1393,7 +1404,7 @@ def test_successful_architect_rollover_switches_then_closes_old_tab_and_resets_c
         def open_fresh_with_handover(self, value): return new
         def current_session_memory_bytes(self): return 7
     bridge = Bridge(); assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
-    assert rollover.complete_from_response(bridge, f"handover\nRollover transaction ID: {watcher.state['rolloverTransactionId']}\nARCHITECT_HANDOVER_READY")
+    assert rollover.complete_from_response(bridge, f"<HANDOVER>\nversion=1\ntransactionId={watcher.state['rolloverTransactionId']}\ntaskId=task-2\n\nbody\n</HANDOVER>")
     assert bridge.page is new and old.closed
     assert watcher.state["architectResponseCount"] == 0
     assert watcher.state["handoverRequested"] is False
@@ -1429,7 +1440,7 @@ def test_rollover_identity_is_the_next_resident_attach_target(tmp_path):
 
     bridge = Bridge()
     assert rollover.request_if_due(bridge, True, False, safe_boundary_state="NEXT_PROMPT_READY")
-    assert rollover.complete_from_response(bridge, f"handover\nRollover transaction ID: {watcher.state['rolloverTransactionId']}\nARCHITECT_HANDOVER_READY")
+    assert rollover.complete_from_response(bridge, f"<HANDOVER>\nversion=1\ntransactionId={watcher.state['rolloverTransactionId']}\ntaskId=task-2\n\nbody\n</HANDOVER>")
     attach_targets = []
     for _ in range(2):
         attach_targets.append(watcher.state.get("architectConversationId"))

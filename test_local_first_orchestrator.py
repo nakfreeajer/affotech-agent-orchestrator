@@ -33,6 +33,16 @@ def envelope(task, action="EXECUTE", prompt="next task", documentation=None):
             "promptEnd\n</ORCHESTRATOR_RESULT>")
 
 
+def canonical_handover(watcher, body="complete handover", task_id=None, transaction_id=None):
+    """Create production-protocol evidence for a test rollover response."""
+    transaction_id = transaction_id or watcher.state.get("rolloverTransactionId") or "test-rollover-transaction"
+    task_id = task_id or watcher.state.get("rolloverTransactionTaskId") or watcher.state.get("nextTaskId") or "test-task"
+    watcher.state.setdefault("rolloverTransactionId", transaction_id)
+    watcher.state.setdefault("rolloverTransactionTaskId", task_id)
+    watcher.state["rolloverHandoverProtocolVersion"] = 1
+    return watcher_module.make_handover_envelope(transaction_id, task_id, body)
+
+
 def ready(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / ".agent-work" / "orchestrator")
     result = tmp_path / "report.txt"
@@ -825,7 +835,10 @@ def test_restart_recovers_delivered_pending_transaction_without_resend(tmp_path,
     class Bridge:
         page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
         def exact_user_message_payload_observed(self, payload):
-            return f"Rollover transaction ID: {transaction}" in payload
+            return (f"transactionId={transaction}" in payload
+                    and "taskId=000080" in payload
+                    and watcher_module.HANDOVER_OPEN in payload
+                    and watcher_module.HANDOVER_CLOSE in payload)
         def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
         def generation_visible(self): return False
         def _assistant_entries(self): return []
@@ -1538,7 +1551,7 @@ def test_rollover_persists_final_canonical_url_identity(tmp_path):
     provisional = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
     old_page = _AckPage("https://chatgpt.com/c/OLD")
     new_page = _ChangingAckPage(["https://chatgpt.com/c/WEB:" + provisional, "https://chatgpt.com/c/" + provisional])
-    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is True
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), canonical_handover(watcher)) is True
     assert watcher.state["architectConversationId"] == provisional
 
 
@@ -1549,7 +1562,7 @@ def test_rollover_final_identity_failure_closes_page_before_commit(tmp_path):
     provisional = "7e8916ac-bd6b-4186-8e40-4df52b5192c1"
     old_page = _AckPage("https://chatgpt.com/c/OLD")
     new_page = _ChangingAckPage(["https://chatgpt.com/c/WEB:" + provisional, "https://chatgpt.com/"])
-    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), canonical_handover(watcher)) is False
     assert new_page.closed is True
     assert old_page.closed is False
     assert watcher.state["architectConversationId"] == "OLD"
@@ -1603,7 +1616,7 @@ def test_new_conversation_url_alone_does_not_authorize_result_delivery(tmp_path,
     ticks = iter(range(100))
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
-    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), canonical_handover(watcher)) is False
     assert new_page.closed is True
     assert old_page.closed is False
     assert watcher.state["architectConversationId"] == "OLD"
@@ -1615,7 +1628,7 @@ def test_new_architect_handover_ack_must_finish_before_delivery_ready(tmp_path):
     watcher.save()
     old_page = _AckPage("https://chatgpt.com/c/OLD")
     new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "ARCHITECT_SESSION_READY"}])
-    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is True
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), canonical_handover(watcher)) is True
     assert watcher.state["architectConversationId"] == "NEW"
     assert old_page.closed is True
 
@@ -1629,7 +1642,7 @@ def test_generation_visible_new_architect_blocks_handover_ack_until_timeout(tmp_
     ticks = iter(range(1000))
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
-    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), canonical_handover(watcher)) is False
     assert new_page.closed is True
     assert old_page.closed is False
     assert watcher.state["architectConversationId"] == "OLD"
@@ -1641,7 +1654,7 @@ def test_invalid_new_architect_ack_fails_closed_before_authority_commit(tmp_path
     watcher.save()
     old_page = _AckPage("https://chatgpt.com/c/OLD")
     new_page = _AckPage("https://chatgpt.com/c/NEW", entries=[{"id": "ack", "text": "not the handover acknowledgement"}])
-    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(_rollover_bridge(old_page, new_page), canonical_handover(watcher)) is False
     assert new_page.closed is True
     assert old_page.closed is False
     assert watcher.state["architectConversationId"] == "OLD"
@@ -2265,7 +2278,7 @@ def test_acknowledged_handover_recovery_reconstructs_and_launches_staged_next_ta
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     prompt = tmp_path / "000054.txt"
     prompt.write_text("next bounded task", encoding="utf-8")
-    handover = "captured handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "captured handover", task_id="000054")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000053", "lastCompletedTaskId": "000053",
                           "nextTaskId": "000054", "nextPromptPath": str(prompt), "rolloverDue": True,
                           "rolloverPending": True, "rolloverInProgress": False, "rolloverAttemptedForTaskId": "000053",
@@ -2570,7 +2583,7 @@ def test_deferred_rollover_self_rearms_after_cooldown_without_restart(tmp_path, 
 def test_deferred_rollover_reconciles_existing_response_before_epoch_retry(tmp_path, monkeypatch):
     watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
     transaction = "aa0000000000000000000091"
-    response = f"handover\nRollover transaction ID: {transaction}\nARCHITECT_HANDOVER_READY"
+    response = canonical_handover(watcher, "handover", transaction_id=transaction, task_id="000091")
     watcher.state.update({
         "taskId": "000090", "lastCompletedTaskId": "000090", "nextTaskId": "000091",
         "nextPromptPath": str(prompt), "rolloverDue": True, "rolloverPending": True,
@@ -2916,7 +2929,7 @@ def test_terminal_delivered_transaction_is_revived_without_generation_three(tmp_
     class Bridge:
         page = type("Page", (), {"url": "https://chatgpt.com/c/OLD"})()
         def exact_user_message_payload_observed(self, payload):
-            assert f"Rollover transaction ID: {transaction}" in payload
+            assert f"transactionId={transaction}" in payload
             return True
         def assistant_baseline(self): return {"count": 0, "text_hash": "baseline"}
         def generation_visible(self): return False
@@ -3397,12 +3410,12 @@ def test_rollover_waits_for_new_conversation_url_before_switching(tmp_path, monk
     class Bridge:
         page = old_page
         def open_fresh_with_handover(self, handover):
-            assert handover.endswith("ARCHITECT_HANDOVER_READY")
+            assert handover.endswith(watcher_module.HANDOVER_CLOSE)
             return new_page
     ticks = iter(range(100))
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
-    assert watcher.session_rollover.complete_from_response(Bridge(), "private handover\nARCHITECT_HANDOVER_READY") is True
+    assert watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher, "private handover")) is True
     assert watcher.state["architectConversationId"] == "NEW_ID"
     assert not watcher.state.get("pending_handover")
     assert new_page.closed is False
@@ -3418,6 +3431,7 @@ def test_fresh_session_ready_is_strict_and_handover_marker_is_not_fresh_ack():
 
 def test_fresh_bootstrap_adds_ready_instruction_without_changing_handover_body(tmp_path, monkeypatch):
     sent = []
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
 
     class Context:
         def __init__(self, page): self.page = page
@@ -3436,7 +3450,7 @@ def test_fresh_bootstrap_adds_ready_instruction_without_changing_handover_body(t
     monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", submit)
     monkeypatch.setattr(ArchitectPlaywright, "exact_user_message_payload_observed", lambda _self, payload: payload in _self.page.users)
     bridge = ArchitectPlaywright(old)
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     assert bridge.open_fresh_with_handover(handover) is fresh
     assert sent[0].startswith(handover)
     assert sent[0].endswith("ARCHITECT_SESSION_READY")
@@ -3448,7 +3462,7 @@ def test_fresh_weak_acknowledgement_requires_exact_user_message(tmp_path, monkey
     watcher.state.update({"handoverRequested": True, "rolloverPending": True,
                           "architectConversationId": "OLD", "taskId": "000049"})
     watcher.save()
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     calls = []
 
     class Locator:
@@ -3553,7 +3567,7 @@ def test_fresh_click_noop_uses_one_same_page_enter_and_launches_staged_task_once
                           "nextTaskId": "000050", "nextPromptPath": str(prompt), "rolloverDue": True,
                           "rolloverPending": True, "handoverRequested": True, "architectConversationId": "OLD"})
     watcher.save()
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
 
     class Composer:
@@ -3638,7 +3652,7 @@ def test_fresh_button_and_enter_noop_fail_closed_without_second_tab(tmp_path, mo
                           "nextTaskId": "000050", "rolloverDue": True, "rolloverPending": True,
                           "handoverRequested": True, "architectConversationId": "OLD"})
     watcher.save()
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
 
     class Page:
         def __init__(self, url):
@@ -3690,7 +3704,7 @@ def test_unidentified_prior_fresh_page_never_creates_replacement_tab_after_resta
     class Bridge:
         page = type("Page", (), {"url": "https://chatgpt.com/c/OLD", "context": type("Context", (), {"pages": []})()})()
         def open_fresh_with_handover(self, _handover): calls.append(1); return None
-    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher, "handover")) is False
     assert calls == []
     assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state.get("humanRequiredReason") is None
@@ -3716,7 +3730,7 @@ def test_ambiguous_fresh_submission_persists_candidate_without_closing_it(tmp_pa
     old.context = Context(fresh)
     monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", lambda _self, _payload: (_ for _ in ()).throw(ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT")))
     bridge = ArchitectPlaywright(old)
-    assert watcher.session_rollover.complete_from_response(bridge, "private handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(bridge, canonical_handover(watcher, "private handover")) is False
     assert fresh.closed is False
     assert old.closed is False
     assert watcher.state["rolloverFreshCandidateConversationId"] == "CANDIDATE"
@@ -3748,7 +3762,7 @@ def test_ambiguous_fresh_candidate_is_reused_before_new_tab_creation(tmp_path):
     bridge = Bridge()
     watcher.state.update({"rolloverFreshCandidateConversationId": "NEW",
                           "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
-                          "pending_handover": "complete old handover\nARCHITECT_HANDOVER_READY"})
+                          "pending_handover": canonical_handover(watcher, "complete old handover", task_id="000050")})
     watcher.save()
     assert watcher.session_rollover.complete_from_response(bridge, watcher.state["pending_handover"]) is True
     assert calls == []
@@ -3760,7 +3774,7 @@ def test_ambiguous_fresh_candidate_is_reused_before_new_tab_creation(tmp_path):
 
 def test_fresh_candidate_reacquisition_uses_bootstrap_and_ready_proof(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "handoverRequested": True, "rolloverPending": True,
                           "rolloverDue": True, "rolloverAttemptedForTaskId": "000049", "architectConversationId": "OLD",
                           "taskId": "000049", "nextTaskId": "000050", "pending_handover": handover,
@@ -3791,7 +3805,7 @@ def test_fresh_candidate_reacquisition_uses_bootstrap_and_ready_proof(tmp_path):
 
 def test_stale_persisted_candidate_id_is_corrected_by_content_proof_and_reused(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     old_id = "6aac1369-7e48-83ec-b2bc-73797a88e6f5"
     stale_id = "WEB:204cb572-6571-4b81-9bbd-25f5cedcb073"
     fresh_id = "6aac98c9-571c-83ec-b11a-4bb8bc7744d1"
@@ -3848,7 +3862,7 @@ def test_stale_persisted_candidate_id_is_corrected_by_content_proof_and_reused(t
 
 def test_stale_persisted_candidate_without_proof_fails_closed_with_diagnostic(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "handover")
     watcher.state.update({"rolloverDue": True, "rolloverPending": True, "handoverRequested": True,
                           "architectConversationId": "OLD", "rolloverFreshCandidateConversationId": "STALE",
                           "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS"})
@@ -3867,7 +3881,7 @@ def test_stale_persisted_candidate_without_proof_fails_closed_with_diagnostic(tm
 
 def test_fresh_candidate_requires_exact_bootstrap_and_ready(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "handover")
     watcher.state.update({"rolloverPending": True, "rolloverDue": True, "handoverRequested": True,
                           "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS", "architectConversationId": "OLD"})
     bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
@@ -3889,7 +3903,7 @@ def test_fresh_candidate_requires_exact_bootstrap_and_ready(tmp_path):
 
 def test_ready_unidentified_candidate_is_reused_and_committed_without_new_tab(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "handoverRequested": True, "rolloverPending": True,
                           "rolloverDue": True, "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
                           "architectConversationId": "OLD", "taskId": "000049", "nextTaskId": "000050",
@@ -3930,7 +3944,7 @@ def test_ready_unidentified_candidate_is_reused_and_committed_without_new_tab(tm
 
 def test_multiple_proven_fresh_candidates_fail_closed(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "handover")
     bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
     watcher.state.update({"rolloverPending": True, "rolloverDue": True, "handoverRequested": True,
                           "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS", "architectConversationId": "OLD"})
@@ -3952,7 +3966,7 @@ def test_multiple_proven_fresh_candidates_fail_closed(tmp_path):
 
 def test_lost_handover_authority_is_reconstructed_before_candidate_discovery(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    handover = "complete old handover\nARCHITECT_HANDOVER_READY"
+    handover = canonical_handover(watcher, "complete old handover")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "rolloverDue": True, "rolloverPending": True,
                           "rolloverAttemptedForTaskId": "000049", "handoverRequested": False,
                           "taskId": "000049", "nextTaskId": "000050", "architectConversationId": "OLD",
@@ -4003,13 +4017,13 @@ def test_rollover_timeout_closes_only_fresh_page_and_preserves_authority(tmp_pat
     ticks = iter(range(100))
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
-    assert watcher.session_rollover.complete_from_response(Bridge(), "private handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher, "private handover")) is False
     assert new_page.closed is True
     assert old_page.closed is False
     assert watcher.state["architectConversationId"] == "OLD"
     assert watcher.state["rolloverPending"] is True
     assert watcher.state["handoverRequested"] is True
-    assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
+    assert watcher.state["pending_handover"].endswith(watcher_module.HANDOVER_CLOSE)
     assert watcher.state["state"] == "ARCHITECT_RUNNING"
 
 
@@ -4025,11 +4039,11 @@ def test_fresh_handover_submission_failure_closes_fresh_page(tmp_path):
     fresh_page.closed = False
     old_page.context = type("Context", (), {"new_page": lambda _self: fresh_page})()
     bridge = ArchitectPlaywright(old_page)
-    assert watcher.session_rollover.complete_from_response(bridge, "private handover\nARCHITECT_HANDOVER_READY") is False
+    assert watcher.session_rollover.complete_from_response(bridge, canonical_handover(watcher, "private handover")) is False
     assert fresh_page.closed is True
     assert bridge.page is old_page
     assert watcher.state["architectConversationId"] == "OLD"
-    assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
+    assert watcher.state["pending_handover"].endswith(watcher_module.HANDOVER_CLOSE)
 
 
 def test_rollover_failure_logs_phase_class_and_bounded_flattened_message(tmp_path):
@@ -4043,7 +4057,7 @@ def test_rollover_failure_logs_phase_class_and_bounded_flattened_message(tmp_pat
         def open_fresh_with_handover(self, _response):
             raise RuntimeError("some detailed rollover failure\nwith a second line" + "x" * 700)
     events = []
-    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY", emit=events.append) is False
+    assert watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher, "handover"), emit=events.append) is False
     for handler in logger.handlers:
         handler.flush()
     log = Path(log_path).read_text(encoding="utf-8")
@@ -4070,7 +4084,7 @@ def test_rollover_timeout_preserves_stable_error_code(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
     events = []
-    assert watcher.session_rollover.complete_from_response(Bridge(), "handover\nARCHITECT_HANDOVER_READY", emit=events.append) is False
+    assert watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher, "handover"), emit=events.append) is False
     assert any(event.startswith("ARCHITECT_NEW_CONVERSATION_ID_TIMEOUT ") for event in events)
 
 
@@ -5917,6 +5931,38 @@ def test_legacy_current_inflight_handover_is_compatibility_only(tmp_path):
     assert watcher.session_rollover._handover_response_valid(response) is True
     watcher.state["rolloverTransactionId"] = "new-transaction"
     assert watcher.session_rollover._handover_response_valid(response) is False
+
+
+def test_canonical_handover_matches_transaction_and_task_exactly(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"rolloverTransactionId": "tx-1", "rolloverTransactionTaskId": "000103",
+                          "rolloverHandoverProtocolVersion": 1})
+    valid = watcher_module.make_handover_envelope("tx-1", "000103", "body")
+    assert watcher.session_rollover._handover_response_valid(valid) is True
+    assert watcher.session_rollover._handover_response_valid(
+        watcher_module.make_handover_envelope("tx-2", "000103", "body")) is False
+    assert watcher.session_rollover._handover_response_valid(
+        watcher_module.make_handover_envelope("tx-1", "000104", "body")) is False
+
+
+def test_current_legacy_transaction_reconciles_without_resend(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "NEXT_PROMPT_READY", "nextTaskId": "000103",
+                          "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": True,
+                          "handoverRequested": True, "rolloverAttemptedForTaskId": "000103",
+                          "rolloverTransactionId": watcher_module.LEGACY_COMPAT_TRANSACTION_ID,
+                          "rolloverTransactionTaskId": watcher_module.LEGACY_COMPAT_TASK_ID,
+                          "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "RECONCILE_PENDING",
+                          "architectConversationId": "OLD"})
+    response = ("legacy body\nRollover transaction ID: " + watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+                + "\n000103\nARCHITECT_HANDOVER_READY")
+    sends = []
+    class Bridge:
+        def _assistant_entries(self): return [{"id": "existing", "text": response}]
+        def submit_result_bounded(self, payload): sends.append(payload)
+    monkeypatch.setattr(watcher, "process_pending_handover_response", lambda _bridge, _response: True)
+    assert watcher.session_rollover.reconcile_pending_handover(Bridge()) is True
+    assert sends == []
 
 
 def test_deferred_wait_never_uses_zero_delay_and_does_not_inflate_budget(tmp_path, monkeypatch):
