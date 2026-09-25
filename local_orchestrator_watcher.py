@@ -2840,6 +2840,53 @@ def assistant_entries_script() -> str:
             """
 
 
+def assistant_fast_snapshot_script() -> str:
+    """Read only the mounted assistant count and latest node signature."""
+    return r"""
+            () => {
+              const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
+                .filter((node) => node.isConnected);
+              const latest = nodes.length ? nodes[nodes.length - 1] : null;
+              const text = latest ? (latest.innerText || latest.textContent || '') : '';
+              return {
+                count: nodes.length,
+                latestMessageId: latest ? latest.getAttribute('data-message-id') : null,
+                latestText: text,
+                latestTextLength: text.length
+              };
+            }
+            """
+
+
+def assistant_latest_entry_script() -> str:
+    """Semantically extract one latest assistant node, never the transcript."""
+    return r"""
+            () => {
+              const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
+                .filter((node) => node.isConnected);
+              const node = nodes.length ? nodes[nodes.length - 1] : null;
+              if (!node) return null;
+              const clean = (source) => {
+                const clone = source.cloneNode(true);
+                clone.querySelectorAll(
+                  'button,[role="button"],[aria-hidden="true"],' +
+                  '[data-testid="writing-block-suggested-followups"],' +
+                  '[data-testid="writing-block-suggested-followups-surface"]'
+                ).forEach(control => control.remove());
+                return clone.innerText || clone.textContent || '';
+              };
+              const writingBlocks = [...node.querySelectorAll('[data-testid="writing-block-container"]')]
+                .filter((block) => block.isConnected);
+              return {
+                id: node.getAttribute('data-message-id'),
+                rawText: node.innerText || node.textContent || '',
+                text: clean(node),
+                semanticSource: writingBlocks.length ? 'WRITING_BLOCK' : 'STANDARD_RESPONSE'
+              };
+            }
+            """
+
+
 class ArchitectPlaywright:
     """Semantic Playwright boundary; it never targets AFFOTECH pages."""
     def __init__(self, page: Any):
@@ -2851,6 +2898,12 @@ class ArchitectPlaywright:
         self.initialSendActionReturned = False
         self.alternateSendAttempted = False
         self.alternateSendMethod = None
+        self._fast_observation_count = 0
+        self._latest_response_extraction_count = 0
+        self._full_history_scan_count = 0
+        self._historical_assistant_extraction_count = 0
+        self._historical_user_extraction_count = 0
+        self._observation_recovery_fallback_count = 0
 
     def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
         tracer = getattr(self, "diagnostic_trace", None)
@@ -2893,6 +2946,8 @@ class ArchitectPlaywright:
         return result
 
     def _assistant_entries(self) -> list[dict[str, str | None]]:
+        self._full_history_scan_count += 1
+        self._historical_assistant_extraction_count += 1
         started = time.monotonic()
         self._trace_operation("assistant_entries", "BEGIN", selector='[data-message-author-role="assistant"]', mutation=False)
         evaluate = getattr(self.page, "evaluate", None)
@@ -2961,6 +3016,108 @@ class ArchitectPlaywright:
             entries.append({"id": get_attribute("data-message-id"), "text": message.inner_text()})
         self._trace_operation("assistant_entries", "END", started, count=len(entries), mutation=False)
         return entries
+
+    def assistant_fast_snapshot(self) -> dict[str, Any]:
+        """Return a compact latest-only observation for healthy polling."""
+        self._fast_observation_count = getattr(self, "_fast_observation_count", 0) + 1
+        runtime_log(
+            getattr(self, "runtime_logger", None),
+            getattr(self, "runtime_run_id", None),
+            "ARCHITECT_FAST_OBSERVATION",
+            getattr(getattr(self, "runtime_watcher", None), "state", None),
+            observationCount=self._fast_observation_count,
+            fullHistoryScan=False,
+        )
+        if not hasattr(self, "page"):
+            entries = self._assistant_entries()
+            latest = entries[-1] if entries else {}
+            text = str(latest.get("text") or "")
+            return {
+                "count": len(entries),
+                "latestMessageId": latest.get("id"),
+                "latestText": text,
+                "latestTextHash": hashlib.sha256(text.encode()).hexdigest(),
+                "text_hash": hashlib.sha256(text.encode()).hexdigest(),
+                "latestTextLength": len(text),
+                "_fixtureEntries": True,
+            }
+        evaluate = getattr(self.page, "evaluate", None)
+        if evaluate is not None:
+            result = evaluate(assistant_fast_snapshot_script())
+            # Lightweight test doubles often return the old full-snapshot shape.
+            # Normalize it without changing the production DOM path.
+            if isinstance(result, list):
+                entries = [item for item in result if isinstance(item, dict)]
+                latest = entries[-1] if entries else {}
+                text = str(latest.get("text") or "")
+                text_hash = hashlib.sha256(text.encode()).hexdigest()
+                return {
+                    "count": len(entries),
+                    "latestMessageId": latest.get("id"),
+                    "latestText": text,
+                    "latestTextHash": text_hash,
+                    "text_hash": text_hash,
+                    "latestTextLength": len(text),
+                    "_fixtureEntries": True,
+                }
+            if not isinstance(result, dict):
+                raise RuntimeError("ASSISTANT_FAST_SNAPSHOT_INVALID")
+            text = str(result.get("latestText") or "")
+            text_hash = hashlib.sha256(text.encode()).hexdigest()
+            return {
+                "count": int(result.get("count") or 0),
+                "latestMessageId": result.get("latestMessageId"),
+                "latestTextHash": text_hash,
+                "text_hash": text_hash,
+                "latestTextLength": int(result.get("latestTextLength") or len(text)),
+                "latestText": text,
+            }
+        messages = self.page.locator('[data-message-author-role="assistant"]')
+        count = messages.count()
+        if not count:
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            return {"count": 0, "latestMessageId": None, "latestTextHash": empty_hash, "text_hash": empty_hash, "latestTextLength": 0, "latestText": ""}
+        latest = messages.nth(count - 1)
+        text = latest.inner_text()
+        identity = getattr(latest, "get_attribute", lambda _name: None)("data-message-id")
+        text_hash = hashlib.sha256(text.encode()).hexdigest()
+        return {"count": count, "latestMessageId": identity, "latestTextHash": text_hash, "text_hash": text_hash, "latestTextLength": len(text), "latestText": text}
+
+    def latest_assistant_entry(self) -> dict[str, Any] | None:
+        """Extract semantic text from only the latest mounted assistant node."""
+        self._latest_response_extraction_count = getattr(self, "_latest_response_extraction_count", 0) + 1
+        runtime_log(
+            getattr(self, "runtime_logger", None),
+            getattr(self, "runtime_run_id", None),
+            "ARCHITECT_LATEST_RESPONSE_EXTRACTED",
+            getattr(getattr(self, "runtime_watcher", None), "state", None),
+            extractionCount=self._latest_response_extraction_count,
+            fullHistoryScan=False,
+        )
+        if not hasattr(self, "page"):
+            entries = self._assistant_entries()
+            return entries[-1] if entries else None
+        evaluate = getattr(self.page, "evaluate", None)
+        if evaluate is not None:
+            result = evaluate(assistant_latest_entry_script())
+            if isinstance(result, list):
+                result = result[-1] if result else None
+            if result is None:
+                return None
+            if not isinstance(result, dict):
+                raise RuntimeError("ASSISTANT_LATEST_ENTRY_INVALID")
+            return {"id": result.get("id"), "text": result.get("text", ""), "rawText": result.get("rawText", ""), "semanticSource": result.get("semanticSource", "STANDARD_RESPONSE")}
+        return None
+
+    def observation_metrics(self) -> dict[str, int]:
+        return {
+            "fastObservations": getattr(self, "_fast_observation_count", 0),
+            "latestResponseExtractions": getattr(self, "_latest_response_extraction_count", 0),
+            "fullHistoryScans": getattr(self, "_full_history_scan_count", 0),
+            "historicalAssistantExtractions": getattr(self, "_historical_assistant_extraction_count", 0),
+            "historicalUserExtractions": getattr(self, "_historical_user_extraction_count", 0),
+            "observationRecoveryFallbacks": getattr(self, "_observation_recovery_fallback_count", 0),
+        }
 
     def assistant_baseline(self) -> dict[str, Any]:
         entries = self._assistant_entries()
@@ -3107,6 +3264,7 @@ class ArchitectPlaywright:
 
     def user_message_texts(self) -> list[str]:
         """Read all user messages without including expandable UI controls."""
+        self._historical_user_extraction_count += 1
         evaluate = getattr(self.page, "evaluate", None)
         if evaluate is not None:
             script = """
@@ -3122,8 +3280,13 @@ class ArchitectPlaywright:
         messages = self.page.locator('[data-message-author-role="user"]')
         return [messages.nth(index).inner_text() for index in range(messages.count())]
 
-    def exact_user_message_payload_observed(self, payload: str) -> bool:
+    def exact_user_message_payload_observed(self, payload: str, history: bool = False) -> bool:
         target = normalize_prompt(payload)
+        latest = self.latest_user_message()
+        if isinstance(latest, str) and normalize_prompt(latest) == target:
+            return True
+        if not history:
+            return False
         return any(normalize_prompt(text) == target for text in self.user_message_texts())
 
     def observe_exact_user_message(self, payload: str, timeout: float = FRESH_BOOTSTRAP_OBSERVATION_TIMEOUT_SECONDS, poll_interval: float = FRESH_BOOTSTRAP_OBSERVATION_POLL_SECONDS) -> bool:
@@ -3143,7 +3306,7 @@ class ArchitectPlaywright:
     def reconcile_unsent_submission(self, payload: str, timeout: float = 1.0) -> str:
         """Reconcile one ambiguous send on this page without allocating a tab."""
         try:
-            already_submitted = self.exact_user_message_payload_observed(payload)
+            already_submitted = self.exact_user_message_payload_observed(payload, history=True)
         except Exception:
             already_submitted = False
         if already_submitted:
@@ -3170,7 +3333,7 @@ class ArchitectPlaywright:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                if self.exact_user_message_payload_observed(payload):
+                if self.exact_user_message_payload_observed(payload, history=True):
                     self.sendActionAcknowledged = True
                     return "SENT"
             except Exception:
@@ -3226,6 +3389,9 @@ class ArchitectPlaywright:
         stable_hash = None
         stable_polls = 0
         poll_count = 0
+        self._observation_recovery_attempted = False
+        self._history_recovery_attempted = False
+        stability_poll_pending = False
         while True:
             poll_count += 1
             wait_conversation_id = getattr(self, "runtime_conversation_id", "UNAVAILABLE_AT_LAYER")
@@ -3235,23 +3401,68 @@ class ArchitectPlaywright:
                         conversationId=wait_conversation_id,
                         pollCount=poll_count, pollIntervalSeconds=poll_interval, generationVisible="NOT_SAMPLED_AT_LOG_POINT",
                         waitReason="NEW_RESPONSE", completionState=getattr(self, "last_state", "NOT_SAMPLED_AT_LOG_POINT"))
-            entries = self._assistant_entries()
-            snapshot = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
-            current = {"count": len(entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": entries}
-            identity_changed = current["count"] != baseline.get("count", 0) or current["text_hash"] != baseline.get("text_hash")
-            baseline_entries = baseline.get("entries", [])
-            baseline_pairs = {(entry.get("id"), entry.get("text")) for entry in baseline_entries}
-            changed_entries = [entry for entry in entries if (entry.get("id"), entry.get("text")) not in baseline_pairs]
-            text = changed_entries[-1].get("text", "") if changed_entries else (entries[-1].get("text", "") if entries else "")
-            if self.generation_visible():
+            if not stability_poll_pending and self.generation_visible():
                 stable_hash = None
                 stable_polls = 0
-                if identity_changed:
-                    self.last_state = "RUNNING"
-                else:
-                    self.last_state = "NOT_YET"
+                self.last_state = "RUNNING"
                 time.sleep(poll_interval)
                 continue
+            stability_poll_pending = False
+            current = self.assistant_fast_snapshot()
+            baseline_entries = baseline.get("entries", [])
+            baseline_latest = baseline_entries[-1] if baseline_entries else {}
+            baseline_latest_id = baseline.get("latestMessageId", baseline_latest.get("id"))
+            baseline_latest_hash = baseline.get("latestTextHash")
+            if baseline_latest_hash is None and baseline_latest:
+                baseline_latest_hash = hashlib.sha256(str(baseline_latest.get("text") or "").encode()).hexdigest()
+            identity_changed = (
+                current.get("count", 0) != baseline.get("count", 0)
+                or current.get("latestMessageId") != baseline_latest_id
+                or current.get("latestTextHash") != baseline_latest_hash
+            )
+            text = ""
+            if identity_changed:
+                if current.get("_fixtureEntries"):
+                    text = str(current.get("latestText") or "")
+                else:
+                    latest = self.latest_assistant_entry()
+                    text = str((latest or {}).get("text") or "")
+                if current.get("count", 0) != baseline.get("count", 0) and current.get("latestMessageId") == baseline_latest_id:
+                    if not getattr(self, "_history_recovery_attempted", False):
+                        self._history_recovery_attempted = True
+                        self._observation_recovery_fallback_count += 1
+                        runtime_log(
+                            getattr(self, "runtime_logger", None),
+                            getattr(self, "runtime_run_id", None),
+                            "ARCHITECT_FULL_HISTORY_SCAN",
+                            getattr(getattr(self, "runtime_watcher", None), "state", None),
+                            reason="AMBIGUOUS_LATEST_IDENTITY",
+                        )
+                        entries = self._assistant_entries()
+                        baseline_pairs = {(entry.get("id"), entry.get("text")) for entry in baseline_entries}
+                        changed_entries = [entry for entry in entries if (entry.get("id"), entry.get("text")) not in baseline_pairs]
+                        if changed_entries:
+                            text = str(changed_entries[-1].get("text") or "")
+                if not text and current.get("count", 0):
+                    if not getattr(self, "_observation_recovery_attempted", False):
+                        self._observation_recovery_attempted = True
+                        self._observation_recovery_fallback_count += 1
+                        runtime_log(
+                            getattr(self, "runtime_logger", None),
+                            getattr(self, "runtime_run_id", None),
+                            "ARCHITECT_OBSERVATION_RECOVERY_FALLBACK",
+                            getattr(getattr(self, "runtime_watcher", None), "state", None),
+                            reason="VIRTUALIZATION_RECOVERY",
+                            fullHistoryScan=False,
+                        )
+                        try:
+                            self.restore_live_bottom(delay=0)
+                        except Exception:
+                            pass
+                        time.sleep(poll_interval)
+                        continue
+                    self.last_state = "BLOCKED"
+                    return {"state": "BLOCKED", "text": ""}
             if identity_changed and text.strip():
                 if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text):
                     self.last_state = "COMPLETED"
@@ -3266,6 +3477,7 @@ class ArchitectPlaywright:
                     stable_polls = 1
                 if stable_polls < 2:
                     self.last_state = "RUNNING"
+                    stability_poll_pending = True
                     time.sleep(poll_interval)
                     continue
                 if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text) or extract_executor_prompt_envelope(text) is not None:
@@ -3286,7 +3498,7 @@ class ArchitectPlaywright:
             time.sleep(poll_interval)
 
     def submit_and_wait(self, message: str, poll_interval: float = 0.5) -> str:
-        baseline = self.assistant_baseline()
+        baseline = self.assistant_fast_snapshot()
         if not self.submit_user_and_confirm(message):
             raise RuntimeError("ARCHITECT_SUBMISSION_NOT_CONFIRMED")
         return self.wait_for_new_completed_response(baseline, poll_interval)
@@ -4119,14 +4331,16 @@ class LocalWatcher:
             return observed, baseline
         self.session_rollover.observe_complete_response(observed["text"])
         prompt = extract_executor_prompt(observed["text"]) or extract_executor_prompt_envelope(observed["text"])
-        next_baseline = bridge.assistant_baseline()
+        snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline")
+        next_baseline = snapshot()
         if prompt is None:
             return observed, next_baseline
         return {**observed, "prompt": prompt}, next_baseline
 
     def run_forever(self, bridge: ArchitectPlaywright, sleep_seconds: float = 0.5, response_timeout: float = 120.0, emit: Callable[[str], None] = print) -> None:
         self.session_rollover.sample_memory(emit=emit)
-        baseline = bridge.assistant_baseline()
+        snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline")
+        baseline = snapshot()
         emit("ARCHITECT_CONNECTED")
         emit(f"STARTUP_SCAN_MOUNTED count={bridge.assistant_count()}")
         startup_prompt = self.startup_candidate(bridge, scan_history=False)
@@ -4138,13 +4352,15 @@ class LocalWatcher:
         if history_scanned:
             bottom = bridge.restore_live_bottom()
             emit(f"LIVE_BOTTOM_RESTORE before={bottom.get('before')} after={bottom.get('after')}")
-            baseline = bridge.assistant_baseline()
-            emit(f"LIVE_BOTTOM_READY assistants={len(baseline.get('entries', []))}")
+            snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline")
+            baseline = snapshot()
+            emit(f"LIVE_BOTTOM_READY assistants={baseline.get('count', 0)}")
             if startup_prompt is None:
                 startup_prompt = self.startup_candidate(bridge, scan_history=False)
         if startup_prompt is not None:
             self._execute_prompt(bridge, startup_prompt, response_timeout, emit)
-            baseline = bridge.assistant_baseline()
+            snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline")
+            baseline = snapshot()
         else:
             emit("STATE=IDLE")
         while True:
@@ -5172,8 +5388,8 @@ class LocalFirstOrchestrator:
             raise
         self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectBootstrapDeliveryState": "CONFIRMED", "architectContactCount": int(self.state.get("architectContactCount", 0)) + 1})
         self.save()
-        if hasattr(bridge, "assistant_baseline"):
-            self.state["architectBaseline"] = bridge.assistant_baseline()
+        if hasattr(bridge, "assistant_fast_snapshot"):
+            self.state["architectBaseline"] = bridge.assistant_fast_snapshot()
             self.save()
         print("IDLE_GATE=continuation_sent")
         return True
@@ -5202,7 +5418,8 @@ class LocalFirstOrchestrator:
                 except Exception:
                     observed = False
         if observed:
-            baseline = bridge.assistant_baseline() if callable(getattr(bridge, "assistant_baseline", None)) else None
+            snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline", None)
+            baseline = snapshot() if callable(snapshot) else None
             self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectBootstrapDeliveryState": "CONFIRMED", "architectBootstrapAwaiting": True, "architectBaseline": baseline})
             self.save()
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_BOOTSTRAP_RECONCILED", self.state, hash=payload_hash)
@@ -5233,7 +5450,8 @@ class LocalFirstOrchestrator:
             return "IDLE"
         generation_visible = bridge.generation_visible()
         if generation_visible:
-            self.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": bridge.assistant_baseline()})
+            snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline", None)
+            self.state.update({"state": "ARCHITECT_RUNNING", "architectBaseline": snapshot() if callable(snapshot) else None})
             self.save()
             print("IDLE_GATE=generation_visible")
             print("IDLE_DIAGNOSTIC latestResponseFound=False latestResponseId=None latestResponseFingerprint=None latestResponseHasEnvelope=False generationVisible=True architectBootstrapAwaiting=%s architectBootstrapCount=%s architectContactCount=%s architectSendState=%s architectResultFingerprint=%s continuationSourceFingerprint=%s lastContinuationSourceFingerprint=%s responseConsumed=False continuationEligible=False requestArchitectBootstrapCalled=False requestArchitectBootstrapSent=False resultingState=%s" % (self.state.get("architectBootstrapAwaiting"), self.state.get("architectBootstrapCount", 0), self.state.get("architectContactCount", 0), self.state.get("architectSendState"), self.state.get("architectResultFingerprint"), self.state.get("continuationSourceFingerprint"), self.state.get("lastContinuationSourceFingerprint"), self.state.get("state")))
@@ -5482,8 +5700,9 @@ class LocalFirstOrchestrator:
                 if current.get("text_hash") and current.get("text_hash") != user_baseline.get("text_hash"):
                     return True
         assistant_baseline = self.state.get("architectDeliveryBaseline")
-        if usable_baseline(assistant_baseline) and callable(getattr(bridge, "assistant_baseline", None)):
-            current = bridge.assistant_baseline()
+        assistant_snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline", None)
+        if usable_baseline(assistant_baseline) and callable(assistant_snapshot):
+            current = assistant_snapshot()
             if usable_baseline(current):
                 if int(current.get("count", 0)) > int(assistant_baseline.get("count", 0)):
                     return True
@@ -5505,22 +5724,26 @@ class LocalFirstOrchestrator:
     def _result_delivery_wire_payload(self, payload: str, payload_hash: str) -> str:
         return f"ORCHESTRATOR_DELIVERY_SHA256={payload_hash}\n\n{payload}"
 
-    def _result_payload_proof(self, bridge: Any, payload: str, payload_hash: str | None = None) -> bool:
+    def _result_payload_proof(self, bridge: Any, payload: str, payload_hash: str | None = None, history: bool = True) -> bool:
         """Prove delivery from a user message, using marker or legacy proof."""
         expected_hash = payload_hash or hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        latest = getattr(bridge, "latest_user_message", None)
+        try:
+            observed_latest = latest() if callable(latest) else None
+        except Exception:
+            observed_latest = None
+        observed_messages = [observed_latest] if isinstance(observed_latest, str) else []
         messages = getattr(bridge, "user_message_texts", None)
-        if callable(messages):
+        if observed_latest is None and not callable(latest) and callable(messages):
             try:
-                observed_messages = messages()
+                observed_messages = [text for text in messages() if isinstance(text, str)]
             except Exception:
-                observed_messages = []
-        else:
-            latest = getattr(bridge, "latest_user_message", None)
+                pass
+        if history and callable(messages):
             try:
-                observed = latest() if callable(latest) else None
+                observed_messages = [text for text in messages() if isinstance(text, str)]
             except Exception:
-                observed = None
-            observed_messages = [observed] if isinstance(observed, str) else []
+                pass
         observed_messages = [text for text in observed_messages if isinstance(text, str)]
         if self.state.get("architectDeliveryProofVersion") == ARCHITECT_DELIVERY_PROOF_VERSION:
             marker = f"ORCHESTRATOR_DELIVERY_SHA256={expected_hash}"
@@ -5534,13 +5757,13 @@ class LocalFirstOrchestrator:
             for text in observed_messages
         )
 
-    def _exact_result_payload_observed(self, bridge: Any, payload: str) -> bool:
-        return self._result_payload_proof(bridge, payload)
+    def _exact_result_payload_observed(self, bridge: Any, payload: str, history: bool = True) -> bool:
+        return self._result_payload_proof(bridge, payload, history=history)
 
     def _wait_for_exact_result_payload(self, bridge: Any, payload: str, timeout: float = 2.0) -> bool:
         deadline = time.monotonic() + timeout
         while True:
-            if self._exact_result_payload_observed(bridge, payload):
+            if self._exact_result_payload_observed(bridge, payload, history=False):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -5661,7 +5884,7 @@ class LocalFirstOrchestrator:
                     taskId=task_id, payloadHash=payload_hash, deliveryStateBefore=delivery_state,
                     sendActionAttempted=False, sendMethod="PENDING", stage="PREPARE")
         if prior_hash == payload_hash and delivery_state == "CONFIRMED":
-            if not self._exact_result_payload_observed(bridge, payload):
+            if not self._exact_result_payload_observed(bridge, payload, history=False):
                 self.state.update({"architectSendState": "AMBIGUOUS", "architectSendError": "ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED", "architectDeliveryFailureClass": "ARCHITECT_DELIVERY_AMBIGUOUS"})
                 self.save()
                 raise ResultSubmissionError("ARCHITECT_RESULT_PAYLOAD_NOT_OBSERVED")
@@ -5672,7 +5895,7 @@ class LocalFirstOrchestrator:
         ambiguous_history = self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_AMBIGUOUS"
         pre_send_failure = (delivery_state == "FAILED" and self.state.get("architectDeliveryFailureClass") == "ARCHITECT_DELIVERY_PRE_SEND_FAILURE")
         if prior_hash == payload_hash and pre_send_failure:
-            if self._exact_result_payload_observed(bridge, payload):
+            if self._exact_result_payload_observed(bridge, payload, history=False):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
@@ -5680,7 +5903,7 @@ class LocalFirstOrchestrator:
                 self.clear_confirmed_stale_composer(bridge, payload, payload_hash)
                 return
         elif prior_hash == payload_hash and (delivery_state in {"PENDING", "AMBIGUOUS"} or (delivery_state == "FAILED" and ambiguous_history)):
-            if self._exact_result_payload_observed(bridge, payload):
+            if self._exact_result_payload_observed(bridge, payload, history=False):
                 baseline = self.state.get("architectDeliveryBaseline")
                 self.state.update({"state": "ARCHITECT_RUNNING", "architectSendState": "CONFIRMED", "architectSendError": None, "architectDeliveryFailureClass": None, "architectResultFingerprint": None, "architectBaseline": baseline, "humanRequiredReason": None})
                 self.save()
@@ -5691,7 +5914,8 @@ class LocalFirstOrchestrator:
             self.save()
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "RESULT_DELIVERY_AMBIGUOUS", self.state, hash=payload_hash, errorCode="ARCHITECT_DELIVERY_AMBIGUOUS")
             raise ResultSubmissionError("ARCHITECT_DELIVERY_AMBIGUOUS")
-        baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
+        snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline", None)
+        baseline = snapshot() if callable(snapshot) else None
         user_baseline = bridge.user_baseline() if hasattr(bridge, "user_baseline") else None
         self.state.update({
             "architectDeliveryTaskId": task_id,
@@ -5842,7 +6066,8 @@ class LocalFirstOrchestrator:
         runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "FORMAT_RECOVERY_REQUESTED", self.state)
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result")
         sender(message)
-        baseline = bridge.assistant_baseline() if hasattr(bridge, "assistant_baseline") else None
+        snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline", None)
+        baseline = snapshot() if callable(snapshot) else None
         self.state.update({"state": "ARCHITECT_RUNNING", "formatRecoveryCount": 1, "architectFormatRecoveryTaskId": task_id, "architectBaseline": baseline, "humanRequiredReason": None})
         self.save()
 
@@ -6791,7 +7016,8 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
         else:
             conversation_id = str(watcher.state.get("architectConversationId") or "")
-        baseline = bridge.assistant_baseline()
+        snapshot = getattr(bridge, "assistant_fast_snapshot", None) or getattr(bridge, "assistant_baseline")
+        baseline = snapshot()
         task_id = str(watcher.state.get("nextTaskId") or watcher.state.get("taskId") or "")
         legacy_task = str(watcher.state.get("taskId") or "")
         if (watcher.state.get("rolloverPending") and task_id
@@ -7580,10 +7806,7 @@ def main() -> None:
                         continue
                 baseline = watcher.state.get("architectBaseline")
                 if not isinstance(baseline, dict):
-                    entries = bridge._assistant_entries()
-                    prior = entries[:-1] if entries else []
-                    snapshot = json.dumps(prior, ensure_ascii=False, separators=(",", ":"))
-                    baseline = {"count": len(prior), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": prior}
+                    baseline = bridge.assistant_fast_snapshot()
                 while True:
                     try:
                         runtime_log(logger, run_id, "ARCHITECT_WAIT_BEGIN", watcher.state, conversationId=conversation_id,

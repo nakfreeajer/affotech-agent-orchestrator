@@ -1485,6 +1485,123 @@ def test_wait_for_new_response_recognizes_terminal_handover_marker_without_gener
     assert observed == {"state": "COMPLETED", "text": handover}
 
 
+def test_healthy_large_history_polling_uses_no_full_history_scan(monkeypatch):
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    class Page:
+        def __init__(self):
+            self.polls = 0
+        def evaluate(self, script):
+            if "latestTextLength" in script:
+                self.polls += 1
+                return {"count": 200, "latestMessageId": "a-199", "latestText": "unchanged", "latestTextLength": 9}
+            if "cloneNode" in script:
+                raise AssertionError("latest extraction is not allowed for unchanged polling")
+            return False
+
+    bridge = ArchitectPlaywright(Page())
+    baseline = bridge.assistant_fast_snapshot()
+    monkeypatch.setattr("local_orchestrator_watcher.time.sleep", lambda _delay: (_ for _ in ()).throw(KeyboardInterrupt))
+    try:
+        bridge.wait_for_new_response(baseline, poll_interval=0)
+    except KeyboardInterrupt:
+        pass
+    metrics = bridge.observation_metrics()
+    assert metrics["fastObservations"] >= 1
+    assert metrics["fullHistoryScans"] == 0
+    assert metrics["historicalAssistantExtractions"] == 0
+
+
+def test_new_response_extracts_only_latest_semantic_node():
+    from local_orchestrator_watcher import ArchitectPlaywright
+    complete = f"latest\n{BEGIN}\nprompt\n{END}\n{COMPLETE}"
+
+    class Page:
+        def __init__(self):
+            self.latest = False
+        def evaluate(self, script):
+            if "latestTextLength" in script:
+                return {"count": 101 if self.latest else 100, "latestMessageId": "new" if self.latest else "old", "latestText": complete if self.latest else "old", "latestTextLength": len(complete if self.latest else "old")}
+            if "cloneNode" in script:
+                return {"id": "new", "text": complete, "rawText": complete, "semanticSource": "STANDARD_RESPONSE"}
+            return False
+
+    page = Page()
+    bridge = ArchitectPlaywright(page)
+    baseline = bridge.assistant_fast_snapshot()
+    page.latest = True
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0)
+    assert observed == {"state": "COMPLETED", "text": complete}
+    metrics = bridge.observation_metrics()
+    assert metrics["fullHistoryScans"] == 0
+    assert metrics["latestResponseExtractions"] == 1
+
+
+def test_performance_harness_large_conversation_keeps_normal_observation_bounded(monkeypatch):
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    class Users:
+        def count(self): return 200
+        def nth(self, index):
+            return type("User", (), {"inner_text": lambda _self: "latest user" if index == 199 else f"user-{index}"})()
+
+    class Page:
+        def __init__(self): self.polls = 0
+        def evaluate(self, script):
+            if "latestTextLength" in script:
+                return {"count": 200, "latestMessageId": "assistant-199", "latestText": "stable", "latestTextLength": 6}
+            if "cloneNode" in script:
+                raise AssertionError("normal performance harness must not clone history")
+            return False
+        def locator(self, selector):
+            if 'data-message-author-role="user"' in selector:
+                return Users()
+            raise AssertionError("normal performance harness must not inspect assistant history through locators")
+
+    bridge = ArchitectPlaywright(Page())
+    baseline = bridge.assistant_fast_snapshot()
+    def tick(_delay):
+        bridge.page.polls += 1
+        if bridge.page.polls >= 30:
+            raise KeyboardInterrupt
+    monkeypatch.setattr("local_orchestrator_watcher.time.sleep", tick)
+    try:
+        bridge.wait_for_new_response(baseline, poll_interval=0)
+    except KeyboardInterrupt:
+        pass
+    assert bridge.page.polls == 30
+    assert bridge.exact_user_message_payload_observed("latest user")
+    metrics = bridge.observation_metrics()
+    assert metrics["fullHistoryScans"] == 0
+    assert metrics["historicalAssistantExtractions"] == 0
+    assert metrics["historicalUserExtractions"] == 0
+
+
+def test_latest_writing_block_extraction_preserves_semantics_without_history_scan():
+    from local_orchestrator_watcher import ArchitectPlaywright
+    class Page:
+        def evaluate(self, script):
+            assert "cloneNode" in script
+            return {"id": "latest", "text": "writing block prose", "rawText": "writing block prose", "semanticSource": "WRITING_BLOCK"}
+    bridge = ArchitectPlaywright(Page())
+    entry = bridge.latest_assistant_entry()
+    assert entry["text"] == "writing block prose"
+    assert entry["semanticSource"] == "WRITING_BLOCK"
+    assert bridge.observation_metrics()["fullHistoryScans"] == 0
+
+
+def test_normal_delivery_proof_uses_latest_user_message_before_history():
+    from local_orchestrator_watcher import LocalFirstOrchestrator
+    class Bridge:
+        def latest_user_message(self):
+            return "exact payload"
+        def user_message_texts(self):
+            raise AssertionError("normal proof must not scan historical users")
+    watcher = object.__new__(LocalFirstOrchestrator)
+    watcher.state = {}
+    assert watcher._result_payload_proof(Bridge(), "exact payload", history=False)
+
+
 def test_completion_fallback_rejects_generation_visible_and_malformed_envelopes():
     assert extract_executor_prompt_envelope(f"{BEGIN}\none\n{END}\n{BEGIN}\ntwo\n{END}") is None
     assert extract_executor_prompt_envelope(f"{BEGIN}\nouter {BEGIN}\ninner\n{END}\n{END}") is None
