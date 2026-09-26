@@ -3852,10 +3852,19 @@ class ArchitectPlaywright:
             if baseline_latest_hash is None and baseline_latest:
                 baseline_latest_hash = hashlib.sha256(str(baseline_latest.get("text") or "").encode()).hexdigest()
             baseline_full_history_hash = baseline.get("text_hash")
+            has_assistant_entry_identity = bool(
+                current.get("count", 0)
+                or baseline.get("count", 0)
+                or current.get("latestMessageId") is not None
+                or baseline_latest_id is not None
+            )
             identity_changed = (
                 current.get("count", 0) != baseline.get("count", 0)
                 or current.get("latestMessageId") != baseline_latest_id
-                or current.get("latestTextHash") != baseline_latest_hash
+                or (
+                    has_assistant_entry_identity
+                    and current.get("latestTextHash") != baseline_latest_hash
+                )
             )
             text = ""
             if identity_changed:

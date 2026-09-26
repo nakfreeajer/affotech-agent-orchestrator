@@ -4469,6 +4469,130 @@ class FakeResponseBridge(ArchitectPlaywright):
         return next(self.generation)
 
 
+class FakeFastSnapshotWaitBridge(ArchitectPlaywright):
+    def __init__(self, snapshots):
+        self.snapshots = iter(snapshots)
+        self.current = None
+        self.polls = 0
+        self.observed_snapshots = []
+
+    def assistant_fast_snapshot(self):
+        self.current = next(self.snapshots)
+        self.polls += 1
+        self.observed_snapshots.append(self.current)
+        return self.current
+
+    def generation_visible(self):
+        return False
+
+    def latest_assistant_entry(self):
+        entries = self.current.get("_fixtureEntries", []) if self.current else []
+        return entries[-1] if entries else None
+
+
+def _wait_snapshot(entries):
+    if not entries:
+        empty_hash = hashlib.sha256(b"").hexdigest()
+        return {"count": 0, "latestMessageId": None, "latestTextHash": empty_hash,
+                "text_hash": empty_hash, "latestTextLength": 0, "latestText": "", "_fixtureEntries": []}
+    latest = entries[-1]
+    text = str(latest.get("text") or "")
+    return {"count": len(entries), "latestMessageId": latest.get("id"),
+            "latestTextHash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "latestTextLength": len(text), "latestText": text, "_fixtureEntries": entries}
+
+
+def test_zero_assistant_empty_hash_mismatch_does_not_return_blocked(monkeypatch):
+    empty = _wait_snapshot([])
+    bridge = FakeFastSnapshotWaitBridge([empty])
+    class ContinuePolling(Exception):
+        pass
+    def stop_at_sleep(_delay):
+        raise ContinuePolling
+    monkeypatch.setattr(watcher_module.time, "sleep", stop_at_sleep)
+    baseline = {"count": 0, "latestMessageId": None, "latestTextHash": None, "text_hash": "baseline", "entries": []}
+    with pytest.raises(ContinuePolling):
+        bridge.wait_for_new_response(baseline, poll_interval=0.5)
+    assert bridge.polls == 1
+    assert bridge.last_state == "NOT_YET"
+
+
+def test_zero_assistant_reverse_empty_hash_mismatch_does_not_return_blocked(monkeypatch):
+    bridge = FakeFastSnapshotWaitBridge([{"count": 0, "latestMessageId": None, "latestTextHash": None,
+                                         "text_hash": "baseline", "latestText": "", "_fixtureEntries": []}])
+    class ContinuePolling(Exception):
+        pass
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: (_ for _ in ()).throw(ContinuePolling()))
+    baseline = {"count": 0, "latestMessageId": None,
+                "latestTextHash": hashlib.sha256(b"").hexdigest(), "entries": []}
+    with pytest.raises(ContinuePolling):
+        bridge.wait_for_new_response(baseline, poll_interval=0.5)
+    assert bridge.polls == 1
+    assert bridge.last_state == "NOT_YET"
+
+
+def test_empty_snapshot_then_new_assistant_materialization_is_observed(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    response = "new assistant answer\n" + watcher_module.COMPLETE
+    empty = _wait_snapshot([])
+    materialized = _wait_snapshot([{"id": "assistant-new", "text": response}])
+    bridge = FakeFastSnapshotWaitBridge([empty, materialized])
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "text_hash": "base", "entries": []},
+        poll_interval=0.5,
+    )
+    assert observed == {"state": "COMPLETED", "text": response}
+    assert bridge.polls == 2
+    assert bridge.last_wait_diagnostics["completionReason"] == "TERMINAL_COMPLETE_MARKER"
+
+
+def test_same_assistant_id_text_advance_and_new_identity_remain_detected(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    advanced = "advanced response\n" + watcher_module.COMPLETE
+    same_id_bridge = FakeFastSnapshotWaitBridge([_wait_snapshot([{"id": "assistant-same", "text": advanced}])])
+    same_id = same_id_bridge.wait_for_new_response(
+        {"count": 1, "latestMessageId": "assistant-same", "latestTextHash": "old-hash",
+         "text_hash": "old", "entries": []}, poll_interval=0.5,
+    )
+    assert same_id["state"] == "COMPLETED"
+    assert same_id_bridge.last_wait_diagnostics["candidateLatestAssistantIdentity"] == "assistant-same"
+
+    new_id_bridge = FakeFastSnapshotWaitBridge([_wait_snapshot([{"id": "assistant-new", "text": advanced}])])
+    new_id = new_id_bridge.wait_for_new_response(
+        {"count": 1, "latestMessageId": "assistant-old", "latestTextHash": "same-hash",
+         "text_hash": "old", "entries": []}, poll_interval=0.5,
+    )
+    assert new_id["state"] == "COMPLETED"
+    assert new_id_bridge.last_wait_diagnostics["candidateLatestAssistantIdentity"] == "assistant-new"
+
+
+def test_production_shaped_legacy_reemission_waits_through_empty_identity_then_completes(monkeypatch, tmp_path):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    response = (
+        "Existing authoritative rollover state and handover for task 000103\n"
+        "Rollover transaction ID: 7fdbd798659f42295a18dd2d\nARCHITECT_HANDOVER_READY"
+    )
+    bridge = FakeFastSnapshotWaitBridge([
+        _wait_snapshot([]),
+        _wait_snapshot([{"id": "assistant-legacy-handover", "text": response}]),
+    ])
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "text_hash": "pre-reemission", "entries": []},
+        poll_interval=0.5,
+    )
+    assert observed == {"state": "COMPLETED", "text": response}
+    assert bridge.observed_snapshots[0]["count"] == 0
+    assert bridge.observed_snapshots[0]["latestMessageId"] is None
+    assert bridge.observed_snapshots[0]["latestTextHash"] == hashlib.sha256(b"").hexdigest()
+    assert bridge.last_wait_diagnostics["pollCount"] == 2
+    assert bridge.last_wait_diagnostics["completionReason"] == "HANDOVER_READY_MARKER"
+
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state["rolloverHandoverProtocolVersion"] = None
+    assert watcher.session_rollover._handover_response_valid(observed["text"], "7fdbd798659f42295a18dd2d")
+
+
 def test_architect_generation_has_no_wall_clock_failure_authority(monkeypatch):
     monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
     bridge = FakeResponseBridge(
