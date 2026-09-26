@@ -1485,6 +1485,24 @@ def handover_request_for_transaction(transaction_id: str, task_id: str | None = 
             "Nothing outside the envelope.")
 
 
+def legacy_handover_reemission_request_for_transaction(transaction_id: str, task_id: str) -> str:
+    """Recover transport for the one pre-upgrade transaction, without new work."""
+    transaction = str(transaction_id or "").strip()
+    task = str(task_id or "").strip()
+    return (
+        "ARCHITECT HANDOVER TRANSPORT RECOVERY\n\n"
+        "This is transport recovery for the already-open rollover transaction below, not new Architect work. "
+        "Do not re-evaluate the milestone, make new product decisions, create a different task, or replace the "
+        "already-staged Executor prompt. Re-emit the complete handover for the same existing transaction and "
+        "preserve the already-established authoritative state.\n\n"
+        "For this pre-upgrade transaction only, return exactly the existing legacy handover response format:\n\n"
+        "<complete handover body>\n"
+        f"Rollover transaction ID: {transaction}\n"
+        "ARCHITECT_HANDOVER_READY\n\n"
+        f"The existing target task is {task}. Nothing outside the handover response."
+    )
+
+
 def handover_transaction_matches(response: str, transaction_id: str | None) -> bool:
     if not transaction_id:
         return True
@@ -2185,6 +2203,162 @@ class ArchitectSessionRollover:
             emit("STATE=ROLLOVER_PENDING")
             return False
 
+    def persisted_validated_handover(self) -> str | None:
+        """Load exact validated handover bytes from durable state, if present."""
+        state = self.watcher.state
+        response = state.get("pending_handover")
+        if not isinstance(response, str) or not response:
+            return None
+        transaction_id = str(state.get("rolloverTransactionId") or "")
+        if not self._handover_response_valid(response, transaction_id):
+            return None
+        digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        stored_digest = state.get("rolloverHandoverResponseIdentity")
+        if stored_digest and stored_digest != digest:
+            return None
+        if stored_digest != digest:
+            state["rolloverHandoverResponseIdentity"] = digest
+            state["rolloverHandoverResponseSource"] = "DURABLE_RECOVERY"
+            bootstrap = fresh_architect_bootstrap_payload(response)
+            state["rolloverFreshBootstrapPayloadHash"] = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
+            self.watcher.save()
+        return response
+
+    def _legacy_handover_reemission_epoch(self) -> int | None:
+        state = self.watcher.state
+        for key in ("rolloverRecoveryEpoch", "rolloverAutomaticRecoveryEpochCount"):
+            value = state.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
+    def _request_legacy_handover_reemission_once(self, bridge: "ArchitectPlaywright", task_id: str) -> tuple[str, str | None]:
+        """Re-emit only the exact in-flight legacy handover, once per durable epoch."""
+        state = self.watcher.state
+        transaction_id = str(state.get("rolloverTransactionId") or "")
+        epoch = self._legacy_handover_reemission_epoch()
+        allowed = bool(
+            _legacy_handover_compatibility_allowed(state)
+            and transaction_id
+            and str(state.get("rolloverTransactionTaskId") or "") == task_id
+            and str(state.get("nextTaskId") or "") == task_id
+            and state.get("state") == "NEXT_PROMPT_READY"
+            and state.get("rolloverDue") is True
+            and state.get("rolloverPending") is True
+            and state.get("handoverRequested") is True
+            and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
+            and state.get("postDiscussionProtocolRolloverCommittedTransactionId") != transaction_id
+            and state.get("discussionPauseActive") is not True
+            and state.get("executorActiveWriter") is not True
+            and state.get("governedExecutorActiveWriter") is not True
+            and self.watcher._exact_staged_prompt_recovery_task() == task_id
+            and epoch is not None
+        )
+        if not allowed:
+            return "NOT_ELIGIBLE", None
+        if (state.get("rolloverLegacyHandoverReemissionTransactionId") == transaction_id
+                and state.get("rolloverLegacyHandoverReemissionAttemptedEpoch") == epoch):
+            return "ALREADY_ATTEMPTED", None
+
+        # Claim the one-shot before any browser submission so a restart or
+        # ambiguous send cannot duplicate the request in this recovery epoch.
+        state.update({
+            "rolloverLegacyHandoverReemissionTransactionId": transaction_id,
+            "rolloverLegacyHandoverReemissionAttemptedEpoch": epoch,
+            "rolloverLegacyHandoverReemissionState": "REQUESTING",
+        })
+        self.watcher.save()
+        request = legacy_handover_reemission_request_for_transaction(transaction_id, task_id)
+        baseline_reader = getattr(bridge, "assistant_baseline", None)
+        if not callable(baseline_reader):
+            baseline_reader = getattr(bridge, "assistant_fast_snapshot", None)
+        if not callable(baseline_reader):
+            state["rolloverLegacyHandoverReemissionState"] = "FAILED"
+            self.watcher.save()
+            return "FAILED", None
+        baseline = baseline_reader()
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+            "LEGACY_HANDOVER_REEMISSION_REQUESTED", state,
+            transactionId=transaction_id, taskId=task_id, recoveryEpoch=epoch,
+            requestSha256=hashlib.sha256(request.encode("utf-8")).hexdigest(),
+            conversationId=state.get("architectConversationId"),
+        )
+        try:
+            bridge.submit_result_bounded(request)
+            state["rolloverLegacyHandoverReemissionState"] = "SENT"
+            self.watcher.save()
+            observed = bridge.wait_for_new_response(baseline, poll_interval=0.5)
+        except Exception as error:
+            state.update({
+                "rolloverLegacyHandoverReemissionState": "AMBIGUOUS",
+                "rolloverRecoveryState": "RECOVERING",
+                "rolloverMaintenanceState": "RECONCILE_PENDING",
+            })
+            self.watcher.save()
+            runtime_log(
+                getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+                "LEGACY_HANDOVER_REEMISSION_WAIT", state,
+                transactionId=transaction_id, taskId=task_id, recoveryEpoch=epoch,
+                reason=type(error).__name__,
+            )
+            return "WAIT", None
+        response = observed.get("text") if isinstance(observed, dict) and observed.get("state") == "COMPLETED" else None
+        if not isinstance(response, str) or not self._handover_response_valid(response, transaction_id):
+            state["rolloverLegacyHandoverReemissionState"] = "INVALID_RESPONSE"
+            self.watcher.save()
+            runtime_log(
+                getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+                "LEGACY_HANDOVER_REEMISSION_REJECTED", state,
+                transactionId=transaction_id, taskId=task_id, recoveryEpoch=epoch,
+            )
+            return "INVALID", None
+        if not self.persist_validated_handover(response):
+            return "CONFLICT", None
+        state["rolloverLegacyHandoverReemissionState"] = "RESPONSE_PERSISTED"
+        self.watcher.save()
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+            "LEGACY_HANDOVER_REEMISSION_PERSISTED", state,
+            transactionId=transaction_id, taskId=task_id, recoveryEpoch=epoch,
+            responseSha256=hashlib.sha256(response.encode("utf-8")).hexdigest(),
+        )
+        return "VALIDATED", response
+
+    def persist_validated_handover(self, response: str) -> bool:
+        """Durably bind exact validated response bytes and hash before fresh-page work."""
+        state = self.watcher.state
+        transaction_id = str(state.get("rolloverTransactionId") or "")
+        if not self._handover_response_valid(response, transaction_id):
+            return False
+        digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        prior = state.get("pending_handover")
+        prior_digest = state.get("rolloverHandoverResponseIdentity")
+        prior_is_valid = (
+            isinstance(prior, str)
+            and bool(prior)
+            and self._handover_response_valid(prior, transaction_id)
+        )
+        if prior_digest and prior_digest != digest:
+            return False
+        if prior_is_valid and prior != response:
+            return False
+        bootstrap = fresh_architect_bootstrap_payload(response)
+        state.update({
+            "handoverReady": True,
+            "pending_handover": response,
+            "rolloverHandoverResponseIdentity": digest,
+            "rolloverFreshBootstrapPayloadHash": hashlib.sha256(bootstrap.encode("utf-8")).hexdigest(),
+            "rolloverRecoveryState": "RECOVERING",
+        })
+        self.watcher.save()
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+            "ROLLOVER_HANDOVER_DURABLE", state,
+            transactionId=transaction_id, taskId=state.get("rolloverTransactionTaskId"), responseSha256=digest,
+        )
+        return True
+
     def _read_existing_handover_response(self, bridge: "ArchitectPlaywright", transaction_id: str | None = None) -> str | None:
         """Read an existing semantic handover response without waiting or sending."""
         entries = bridge._assistant_entries()
@@ -2483,12 +2657,8 @@ class ArchitectSessionRollover:
                     handoverSendState=self.watcher.state.get("rolloverHandoverSendState"), existingResponseFound=True,
                     transactionMatched=True, protocol="CANONICAL" if parsed is not None else "LEGACY_COMPATIBILITY",
                     decision="ACCEPT", reason="VALID_HANDOVER_RESPONSE")
-        self.watcher.state["handoverReady"] = True
-        self.watcher.state["pending_handover"] = response
-        self.watcher.state["rolloverHandoverResponseIdentity"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
-        bootstrap = fresh_architect_bootstrap_payload(response)
-        self.watcher.state["rolloverFreshBootstrapPayloadHash"] = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
-        self.watcher.save()
+        if not self.persist_validated_handover(response):
+            return False
         runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_HANDOVER_READY", self.watcher.state)
         old_page = bridge.page
         new_page = None
@@ -2599,6 +2769,9 @@ class ArchitectSessionRollover:
             self.watcher.state.pop("rolloverFreshBootstrapPayloadHash", None)
             self.watcher.state.pop("rolloverFreshCandidateDiscoveryState", None)
             self.watcher.state.pop("rolloverFreshPageCreated", None)
+            self.watcher.state.pop("rolloverLegacyHandoverReemissionTransactionId", None)
+            self.watcher.state.pop("rolloverLegacyHandoverReemissionAttemptedEpoch", None)
+            self.watcher.state.pop("rolloverLegacyHandoverReemissionState", None)
             self.watcher.state.pop("rolloverTransactionId", None)
             self.watcher.state.pop("rolloverTransactionTaskId", None)
             self.watcher.state.pop("rolloverHandoverRecoveryDisposition", None)
@@ -7150,8 +7323,18 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
             except Exception:
                 bridge = None
-        existing_response = None
-        if bridge is not None:
+        existing_response = rollover.persisted_validated_handover()
+        response_source = "DURABLE_STATE" if existing_response else "BROWSER_HISTORY"
+        persisted_payload = watcher.state.get("pending_handover")
+        if isinstance(persisted_payload, str) and persisted_payload and existing_response is None:
+            watcher.state.update({
+                "state": "HUMAN_REQUIRED",
+                "humanRequiredReason": "ROLLOVER_DURABLE_HANDOVER_IDENTITY_INVALID",
+            })
+            watcher.save()
+            close_bridge()
+            return False
+        if existing_response is None and bridge is not None:
             try:
                 prebudget_probe_performed = True
                 existing_response = rollover._read_existing_handover_response(
@@ -7174,6 +7357,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             responseFound=bool(existing_response),
             transactionMatched=exact_existing_response,
             handoverResent=False,
+            responseSource=response_source if existing_response else "NOT_FOUND",
         )
         if exact_existing_response:
             try:
@@ -7183,6 +7367,28 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 return False
             finally:
                 close_bridge()
+        if (bridge is not None
+                and rollover_decision.action in {RolloverAction.START_RECOVERY_EPOCH, RolloverAction.START_RECOVERY_ATTEMPT}
+                and _legacy_handover_compatibility_allowed(watcher.state)):
+            task_id = str(watcher.state.get("nextTaskId") or "")
+            reemission_status, reemitted_response = rollover._request_legacy_handover_reemission_once(bridge, task_id)
+            if reemission_status == "VALIDATED" and reemitted_response is not None:
+                try:
+                    if watcher.process_pending_handover_response(bridge, reemitted_response):
+                        rollover._record_recovery_success()
+                        return True
+                    return False
+                finally:
+                    close_bridge()
+            if reemission_status in {"WAIT", "FAILED", "INVALID", "CONFLICT"}:
+                if reemission_status in {"INVALID", "CONFLICT"}:
+                    watcher.state.update({
+                        "state": "HUMAN_REQUIRED",
+                        "humanRequiredReason": f"LEGACY_HANDOVER_REEMISSION_{reemission_status}",
+                    })
+                    watcher.save()
+                close_bridge()
+                return False
         if (
             rollover_decision.action is RolloverAction.WAIT_RECONCILIATION
             and watcher.state.get("rolloverMaintenanceState") == "RECONCILE_PENDING"

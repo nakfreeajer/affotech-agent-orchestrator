@@ -6943,8 +6943,8 @@ def test_public_next_prompt_path_gates_rollover_until_exact_staged_envelope_is_r
     assert launches == []
 
 
-@pytest.mark.parametrize("delayed_visibility", [False, True], ids=["one-call", "multi-iteration"])
-def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(tmp_path, monkeypatch, delayed_visibility):
+@pytest.mark.parametrize("scenario", ["one-call", "multi-iteration", "invisible-history"], ids=["one-call", "multi-iteration", "invisible-history"])
+def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(tmp_path, monkeypatch, scenario):
     watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
     prompt_bytes_before = prompt.read_bytes()
     prompt_hash_before = hashlib.sha256(prompt_bytes_before).hexdigest()
@@ -6971,7 +6971,7 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
     # the first reconciliation probe and becomes visible only between public
     # NEXT_PROMPT_READY iterations.
     old_entries = [_discussion_bridge_response("old conversation baseline", "baseline")]
-    if not delayed_visibility:
+    if scenario == "one-call":
         old_entries.append(_discussion_bridge_response(legacy_handover, "preserved-legacy-handover"))
     watcher.state["architectDiscussionBaseline"] = {
         "count": 1,
@@ -7020,6 +7020,7 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
         def __init__(self):
             self.page = old_page
             self.sent = []
+            self.recovery_requests = []
 
         def _assistant_entries(self):
             return old_page.assistants
@@ -7034,6 +7035,9 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
             return True
 
         def open_fresh_with_handover(self, handover):
+            assert watcher.state.get("pending_handover") == handover
+            assert watcher.state.get("rolloverHandoverResponseIdentity") == hashlib.sha256(handover.encode("utf-8")).hexdigest()
+            ordered_trace.append((iteration[0], "handover_persisted_before_fresh_creation"))
             events.append("fresh_created")
             events.append("fresh_bootstrap_sent")
             ordered_trace.extend([(iteration[0], "fresh_architect_created"), (iteration[0], "fresh_bootstrap_sent")])
@@ -7041,7 +7045,19 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
             return fresh_page
 
         def submit_result_bounded(self, message):
-            self.sent.append(message)
+            assert message.startswith("ARCHITECT HANDOVER TRANSPORT RECOVERY")
+            assert tx in message and "000103" in message
+            self.recovery_requests.append(message)
+            ordered_trace.append((iteration[0], "legacy_handover_reemission_requested"))
+
+        def wait_for_new_response(self, _baseline, poll_interval=0.5):
+            assert self.recovery_requests, "must not fabricate a handover without the bounded recovery request"
+            assert poll_interval > 0
+            if scenario == "multi-iteration":
+                ordered_trace.append((iteration[0], "reemission_response_not_yet_visible"))
+                raise TimeoutError("synthetic delayed re-emission response")
+            ordered_trace.append((iteration[0], "legacy_handover_reemitted"))
+            return {"state": "COMPLETED", "text": legacy_handover}
 
         def close(self):
             return None
@@ -7134,25 +7150,37 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
     )
     ordered_trace.insert(0, (1, "public_iteration_started"))
     assert first_iteration_result is None
-    if delayed_visibility:
+    if scenario == "multi-iteration":
         assert watcher.state["rolloverInProgress"] is True
         assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
         assert watcher.state["rolloverRecoveryState"] == "RECOVERING"
         assert watcher_module._legacy_handover_must_precede_post_discussion_gate(watcher) is True
         assert launches == []
+        assert len(old_bridge.recovery_requests) == 1
         old_entries.append(_discussion_bridge_response(legacy_handover, "preserved-legacy-handover"))
         # Let iteration one's bounded reconciliation deadline expire, then
         # call the same public path for iteration two.
         iteration[0] = 2
         ordered_trace.append((2, "public_iteration_started"))
-        monkeypatch.setattr(watcher_module.time, "time", lambda: 106.0)
+        monkeypatch.setattr(watcher_module.time, "time", lambda: 2_000_000_000.0)
+        iteration2_pre_state = {key: watcher.state.get(key) for key in (
+            "postDiscussionEnvelopeRequired", "rolloverDue", "rolloverPending", "rolloverInProgress",
+            "handoverRequested", "rolloverHandoverSendState", "rolloverMaintenanceState",
+            "rolloverRecoveryState", "rolloverRecoveryRetryAfter", "rolloverTransactionId",
+            "rolloverTransactionTaskId", "nextTaskId", "postDiscussionProtocolTaskId",
+        )}
+        iteration2_legacy_precedence = watcher_module._legacy_handover_must_precede_post_discussion_gate(watcher)
+        iteration2_decision = watcher_module._evaluate_public_rollover_boundary(watcher, watcher.discussion_pause_active)
         run_result = watcher_module.run_next_prompt_ready_once(watcher, launch_executor, "endpoint", watcher.discussion_pause_active)
-        assert service_trace[:2] == [(1, False, True, "RECONCILE_PENDING"), (2, True, False, None)]
+        assert service_trace[:2] == [(1, False, True, "RECONCILE_PENDING"), (2, True, False, None)], (run_result, iteration2_pre_state, iteration2_legacy_precedence, iteration2_decision)
         assert ordered_trace == [
             (1, "public_iteration_started"),
+            (1, "legacy_handover_reemission_requested"),
+            (1, "reemission_response_not_yet_visible"),
             (1, "rollover_service_false"),
             (2, "public_iteration_started"),
             (2, "legacy_handover_validated"),
+            (2, "handover_persisted_before_fresh_creation"),
             (2, "fresh_architect_created"),
             (2, "fresh_bootstrap_sent"),
             (2, "fresh_ready"),
@@ -7160,12 +7188,30 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
             (2, "old_architect_closed"),
             (2, "rollover_service_true"),
         ]
+    elif scenario == "invisible-history":
+        assert legacy_handover not in [entry.get("text") for entry in old_bridge._assistant_entries()]
+        assert service_trace == [(1, True, False, None)]
+        assert len(old_bridge.recovery_requests) == 1
+        assert ordered_trace == [
+            (1, "public_iteration_started"),
+            (1, "legacy_handover_reemission_requested"),
+            (1, "legacy_handover_reemitted"),
+            (1, "legacy_handover_validated"),
+            (1, "handover_persisted_before_fresh_creation"),
+            (1, "fresh_architect_created"),
+            (1, "fresh_bootstrap_sent"),
+            (1, "fresh_ready"),
+            (1, "authority_committed"),
+            (1, "old_architect_closed"),
+            (1, "rollover_service_true"),
+        ]
     else:
         run_result = first_iteration_result
         assert service_trace == [(1, True, False, None)]
         assert ordered_trace == [
             (1, "public_iteration_started"),
             (1, "legacy_handover_validated"),
+            (1, "handover_persisted_before_fresh_creation"),
             (1, "fresh_architect_created"),
             (1, "fresh_bootstrap_sent"),
             (1, "fresh_ready"),
@@ -7223,6 +7269,137 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
     assert watcher.state["executorSessionMode"] == "PERSISTENT"
     assert old_page.closed is True
     assert prompt.read_bytes() == prompt_bytes_before
+
+
+def test_persisted_legacy_handover_survives_restart_without_old_browser_history(tmp_path, monkeypatch):
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    transaction_id = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    handover = (
+        "Authoritative AFFOTECH state for already-staged task 000103.\n"
+        f"Rollover transaction ID: {transaction_id}\nARCHITECT_HANDOVER_READY"
+    )
+    watcher.state.update({
+        "architectConversationId": "OLD-ARCHITECT",
+        "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorSessionMode": "PERSISTENT",
+        "discussionPauseActive": True,
+        "rolloverInProgress": True,
+        "rolloverMaintenanceState": "RECONCILE_PENDING",
+        "rolloverRecoveryState": "RECOVERING",
+        "rolloverHandoverRecoveryDisposition": "RETRYABLE",
+        "rolloverRecoveryRetryAfter": 1.0,
+        "rolloverAutomaticRecoveryNextEligibleAt": 1.0,
+        "postDiscussionEnvelopeRequired": True,
+        "postDiscussionProtocolTaskId": "000103",
+        "postDiscussionProtocolTransactionId": transaction_id,
+    })
+    watcher.save()
+    watcher.request_discussion_resume()
+    staged_before = prompt.read_bytes()
+    digest = hashlib.sha256(handover.encode("utf-8")).hexdigest()
+
+    # Model the crash boundary: exact validated response bytes are durably
+    # written, then the process stops before any fresh page is created.
+    assert watcher.session_rollover.persist_validated_handover(handover)
+    durable_state = json.loads(watcher.state_path.read_text(encoding="utf-8"))
+    assert durable_state["pending_handover"] == handover
+    assert durable_state["rolloverHandoverResponseIdentity"] == digest
+    assert "rolloverFreshPageCreated" not in durable_state
+
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.state["pending_handover"] == handover
+    assert restarted.session_rollover.persisted_validated_handover() == handover
+    events = []
+
+    class Page:
+        def __init__(self, conversation_id, assistant_text=""):
+            self.url = f"https://chatgpt.com/c/{conversation_id}"
+            self.assistant_text = assistant_text
+            self.closed = False
+            self.context = None
+
+        def evaluate(self, script):
+            if "stop-button" in script:
+                return False
+            if 'data-message-author-role="assistant"' in script:
+                return [_discussion_bridge_response(self.assistant_text, "ready")] if self.assistant_text else []
+            return []
+
+        def close(self):
+            self.closed = True
+            events.append("old_closed")
+
+    old_page = Page("OLD-ARCHITECT")
+    fresh_page = Page("NEW-ARCHITECT", "ARCHITECT_SESSION_READY")
+    old_page.context = type("Context", (), {"pages": [old_page]})()
+    fresh_page.context = type("Context", (), {"pages": [fresh_page]})()
+
+    class OldBridge:
+        page = old_page
+
+        def _assistant_entries(self):
+            raise AssertionError("restart recovery must not require old browser history")
+
+        def open_fresh_with_handover(self, exact_handover):
+            assert exact_handover == handover
+            assert restarted.state["pending_handover"] == handover
+            events.append("fresh_created_bootstrap_sent")
+            return fresh_page
+
+        def close(self):
+            pass
+
+    class FreshProtocolBridge(_PostDiscussionBridge):
+        def __init__(self):
+            super().__init__([_discussion_bridge_response("ARCHITECT_SESSION_READY", "ready")])
+
+    old_bridge = OldBridge()
+    fresh_protocol_bridge = FreshProtocolBridge()
+    monkeypatch.setattr(
+        watcher_module.ArchitectPlaywright,
+        "attach",
+        staticmethod(lambda _endpoint, conversation: old_bridge if conversation == "OLD-ARCHITECT" else fresh_protocol_bridge),
+    )
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _watcher, _bridge, requested: requested)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 2_000_000_000.0)
+
+    launches = []
+    restart_decision = watcher_module._evaluate_public_rollover_boundary(restarted, restarted.discussion_pause_active)
+    process = watcher_module.run_next_prompt_ready_once(
+        restarted,
+        lambda _body, _path: (launches.append("000103") or type("Process", (), {"pid": 91003})()),
+        "endpoint",
+        restarted.discussion_pause_active,
+    )
+    assert process is None and restarted.state["architectConversationId"] == "NEW-ARCHITECT", (
+        restart_decision,
+        {key: restarted.state.get(key) for key in (
+            "postDiscussionEnvelopeRequired", "postDiscussionProtocolRolloverCommittedTransactionId",
+            "rolloverDue", "rolloverPending", "rolloverInProgress", "handoverRequested",
+            "rolloverRecoveryState", "rolloverMaintenanceState", "architectConversationId",
+        )},
+    )
+    assert restarted.state["architectConversationId"] == "NEW-ARCHITECT"
+    assert restarted.state["rolloverDue"] is False
+    assert events == ["fresh_created_bootstrap_sent", "old_closed"]
+    assert restarted.state["postDiscussionEnvelopeRequired"] is True
+    repaired = envelope("000103", prompt=prompt_text)
+    fresh_protocol_bridge.entries.append(_discussion_bridge_response(repaired, "repair"))
+    assert watcher_module.service_post_discussion_protocol_gate_once(
+        restarted, "endpoint", restarted.discussion_pause_active,
+    ) == "EXECUTE"
+    assert len(fresh_protocol_bridge.sent) == 1
+    assert watcher_module.dispatch_next_prompt_once(
+        restarted,
+        lambda _body, _path: (launches.append("000103") or type("Process", (), {"pid": 91003})()),
+        "endpoint",
+        restarted.discussion_pause_active,
+    ) is not None
+    assert launches == ["000103"]
+    assert prompt.read_bytes() == staged_before
+    assert hashlib.sha256(prompt.read_bytes()).digest() == hashlib.sha256(staged_before).digest()
+    assert restarted.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
 
 
 def test_f9_pause_acknowledgement_is_durable_and_only_f10_resumes(tmp_path, monkeypatch, capsys):
