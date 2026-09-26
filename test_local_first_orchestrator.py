@@ -1,5 +1,6 @@
 import json
 import hashlib
+import ast
 import inspect
 import logging
 import os
@@ -6895,6 +6896,8 @@ def test_missing_envelope_reproduction_at_accepted_head_was_not_required_path(tm
 
 def test_public_next_prompt_path_gates_rollover_until_exact_staged_envelope_is_repaired(tmp_path, monkeypatch):
     watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({"rolloverTransactionId": "canonical-new-transaction", "rolloverHandoverProtocolVersion": 1})
+    watcher.save()
     bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
     watcher.state["architectDiscussionBaseline"] = bridge.assistant_baseline()
     watcher.save()
@@ -6940,8 +6943,279 @@ def test_public_next_prompt_path_gates_rollover_until_exact_staged_envelope_is_r
     assert launches == []
 
 
+def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(tmp_path, monkeypatch):
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    prompt_bytes_before = prompt.read_bytes()
+    prompt_hash_before = hashlib.sha256(prompt_bytes_before).hexdigest()
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    session_id = watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
+    legacy_handover = (
+        "Authoritative AFFOTECH state for already-staged task 000103.\n"
+        f"Rollover transaction ID: {tx}\nARCHITECT_HANDOVER_READY"
+    )
+    watcher.state.update({
+        "discussionPauseActive": True,
+        "executorSessionId": session_id,
+        "executorSessionMode": "PERSISTENT",
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+        "rolloverDeferredForTaskId": "000103",
+        "rolloverAutomaticRecoveryNextEligibleAt": 1.0,
+        "rolloverRecoveryRetryAfter": 1.0,
+        "rolloverHandoverProtocolVersion": None,
+        "architectConversationId": "OLD-ARCHITECT",
+        "postDiscussionEnvelopeRequired": False,
+        "postDiscussionEnvelopeRepairAttempted": False,
+    })
+    old_entries = [_discussion_bridge_response("old conversation baseline", "baseline")]
+    old_entries.append(_discussion_bridge_response(legacy_handover, "preserved-legacy-handover"))
+    watcher.state["architectDiscussionBaseline"] = {
+        "count": 1,
+        "text_hash": hashlib.sha256(json.dumps(old_entries[:1], separators=(",", ":")).encode()).hexdigest(),
+    }
+    watcher.save()
+    watcher._write_discussion_pause_marker(True)
+
+    events = []
+
+    class Page:
+        def __init__(self, conversation_id, assistants, event_name=None):
+            self.url = f"https://chatgpt.com/c/{conversation_id}"
+            self.assistants = assistants
+            self.closed = False
+            self.context = None
+            self.event_name = event_name
+            self.ready_event_emitted = False
+
+        def evaluate(self, script):
+            if "stop-button" in script:
+                return False
+            if 'data-message-author-role="assistant"' in script:
+                if (self.url.endswith("NEW-ARCHITECT") and not self.ready_event_emitted
+                        and self.assistants and self.assistants[-1].get("text") == "ARCHITECT_SESSION_READY"):
+                    self.ready_event_emitted = True
+                    events.append("fresh_ready_observed")
+                return self.assistants
+            if 'data-message-author-role="user"' in script:
+                return []
+            return []
+
+        def close(self):
+            self.closed = True
+            events.append("old_architect_closed")
+
+    old_page = Page("OLD-ARCHITECT", old_entries)
+    fresh_page = Page("NEW-ARCHITECT", [_discussion_bridge_response("ARCHITECT_SESSION_READY", "ready")])
+    old_page.context = type("Context", (), {"pages": [old_page]})()
+    fresh_page.context = type("Context", (), {"pages": [fresh_page]})()
+
+    class OldBridge:
+        def __init__(self):
+            self.page = old_page
+            self.sent = []
+
+        def _assistant_entries(self):
+            return old_page.assistants
+
+        def assistant_baseline(self):
+            return {"count": len(old_page.assistants), "text_hash": hashlib.sha256(json.dumps(old_page.assistants, separators=(",", ":")).encode()).hexdigest()}
+
+        def generation_visible(self):
+            return False
+
+        def exact_user_message_payload_observed(self, _payload):
+            return True
+
+        def open_fresh_with_handover(self, handover):
+            events.append("fresh_created")
+            events.append("fresh_bootstrap_sent")
+            self.sent.append(handover)
+            return fresh_page
+
+        def submit_result_bounded(self, message):
+            self.sent.append(message)
+
+        def close(self):
+            return None
+
+    old_bridge = OldBridge()
+
+    class FreshProtocolBridge(_PostDiscussionBridge):
+        def __init__(self):
+            super().__init__([_discussion_bridge_response("ARCHITECT_SESSION_READY", "ready")])
+
+    fresh_protocol_bridge = FreshProtocolBridge()
+    monkeypatch.setattr(
+        watcher_module.ArchitectPlaywright,
+        "attach",
+        staticmethod(lambda _endpoint, conversation: old_bridge if conversation == "OLD-ARCHITECT" else fresh_protocol_bridge),
+    )
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _watcher, _bridge, requested: requested)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 100.0)
+
+    original_process_handover = watcher.process_pending_handover_response
+
+    def observe_handover(bridge, response):
+        assert response == legacy_handover
+        events.append("legacy_handover_validated")
+        return original_process_handover(bridge, response)
+
+    monkeypatch.setattr(watcher, "process_pending_handover_response", observe_handover)
+    original_save = watcher.save
+    committed = []
+
+    def observe_save(*args, **kwargs):
+        result = original_save(*args, **kwargs)
+        if (watcher.state.get("architectConversationId") == "NEW-ARCHITECT"
+                and watcher.state.get("rolloverDue") is False
+                and not committed):
+            committed.append(True)
+            events.append("authority_committed")
+        return result
+
+    monkeypatch.setattr(watcher, "save", observe_save)
+
+    resume_bridge = _PostDiscussionBridge([_discussion_bridge_response("old discussion", "discussion")])
+    watcher.state["architectDiscussionBaseline"] = resume_bridge.assistant_baseline()
+    watcher.save()
+    watcher._write_discussion_pause_marker(True)
+    watcher.request_discussion_resume()
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+    assert watcher.state["discussionPauseActive"] is False
+    assert watcher.discussion_pause_active() is False
+    assert watcher_module._legacy_handover_must_precede_post_discussion_gate(watcher) is True
+    public_decision = watcher_module._evaluate_public_rollover_boundary(watcher, watcher.discussion_pause_active)
+    assert public_decision.action is watcher_module.RolloverAction.START_RECOVERY_EPOCH, public_decision
+
+    launches = []
+
+    def launch_executor(_prompt, _result_path):
+        launches.append("000103")
+        events.append("executor_launch")
+        return type("Process", (), {"pid": 91003})()
+
+    # This is the public NEXT_PROMPT_READY path. It enters the real dispatcher,
+    # recovery service, handover parser, fresh-session readiness proof and commit.
+    run_result = watcher_module.run_next_prompt_ready_once(watcher, launch_executor, "endpoint", watcher.discussion_pause_active)
+
+    assert events[:6] == [
+        "legacy_handover_validated", "fresh_created", "fresh_bootstrap_sent",
+        "fresh_ready_observed", "authority_committed", "old_architect_closed",
+    ], (run_result, events, {key: watcher.state.get(key) for key in ("rolloverDue", "rolloverPending", "rolloverInProgress", "handoverRequested", "rolloverMaintenanceState", "rolloverRecoveryState", "rolloverRecoveryAttemptCount", "humanRequiredReason", "rolloverHandoverRecoveryDisposition", "rolloverHandoverRecoveryReason", "rolloverRecoveryTerminalReason", "rolloverAutomaticRecoveryEpochCount", "rolloverDeferredForTaskId", "postDiscussionEnvelopeRepairAttempted", "postDiscussionProtocolFailure")}, public_decision)
+    assert watcher.state["architectConversationId"] == "NEW-ARCHITECT"
+    assert watcher.state["rolloverDue"] is False
+    assert watcher.state["rolloverPending"] is False
+    assert watcher.state["rolloverInProgress"] is False
+    assert watcher.state["handoverRequested"] is False
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert watcher.state["postDiscussionProtocolRolloverCommittedTransactionId"] == tx
+    assert watcher.state["postDiscussionEnvelopeRepairAttempted"] is True
+    assert watcher.state["postDiscussionEnvelopeRepairAwaiting"] is True
+    assert len(old_bridge.sent) == 1  # bootstrap only; no resend to old Architect
+    assert "Your previous completed response" not in old_bridge.sent[0]
+    assert len(fresh_protocol_bridge.sent) == 1
+    assert fresh_protocol_bridge.sent[0].startswith("Your previous completed response")
+    assert launches == []
+    assert events.count("legacy_handover_validated") == 1
+    assert events.count("fresh_created") == 1
+    assert events.count("fresh_bootstrap_sent") == 1
+    assert events.count("fresh_ready_observed") == 1
+    assert events.count("authority_committed") == 1
+    assert events.count("old_architect_closed") == 1
+
+    # The fresh Architect wraps exactly the immutable staged prompt; no content
+    # is regenerated or altered by protocol recovery.
+    repaired = envelope("000103", prompt=prompt_text)
+    fresh_protocol_bridge.entries.append(_discussion_bridge_response(repaired, "repaired-envelope"))
+    assert watcher_module.service_post_discussion_protocol_gate_once(
+        watcher, "endpoint", watcher.discussion_pause_active,
+    ) == "EXECUTE"
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert prompt.read_bytes() == prompt_bytes_before
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest() == prompt_hash_before
+    events.append("exact_envelope_accepted")
+
+    process = watcher_module.dispatch_next_prompt_once(
+        watcher, launch_executor, "endpoint", watcher.discussion_pause_active,
+    )
+    assert process is not None
+    assert launches == ["000103"]
+    assert events[-2:] == ["exact_envelope_accepted", "executor_launch"]
+    assert watcher.state["executorSessionId"] == session_id
+    assert watcher.state["executorSessionMode"] == "PERSISTENT"
+    assert old_page.closed is True
+    assert prompt.read_bytes() == prompt_bytes_before
+
+
+def test_f9_pause_acknowledgement_is_durable_and_only_f10_resumes(tmp_path, monkeypatch, capsys):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = watcher.prompts_dir / "000301.txt"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("bounded synthetic prompt\n", encoding="utf-8")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000300", "lastCompletedTaskId": "000300",
+        "nextTaskId": "000301", "nextPromptPath": str(prompt), "rolloverDue": True,
+        "rolloverPending": True, "rolloverInProgress": False, "discussionPauseActive": False,
+    })
+    watcher.save()
+    marker_writes = []
+    original_marker_write = watcher._write_discussion_pause_marker
+
+    def observe_marker(active):
+        marker_writes.append(active)
+        return original_marker_write(active)
+
+    monkeypatch.setattr(watcher, "_write_discussion_pause_marker", observe_marker)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    service_calls, launches = [], []
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_a, **_kw: service_calls.append(1))
+
+    watcher.request_discussion_pause()
+    first_ack = capsys.readouterr().out
+    assert "ORCHESTRATOR PAUSED BY HUMAN" in first_ack
+    assert watcher.discussion_pause_active() is True
+    assert watcher.state["discussionPauseActive"] is True
+    assert json.loads(watcher.state_path.read_text(encoding="utf-8"))["discussionPauseActive"] is True
+
+    watcher_module.run_next_prompt_ready_once(
+        watcher, lambda *_args: launches.append(1), "unused", watcher.discussion_pause_active,
+    )
+    assert service_calls == []
+    assert launches == []
+    assert watcher.state["rolloverDue"] is True
+
+    watcher.request_discussion_pause()
+    repeated_ack = capsys.readouterr().out
+    assert "ORCHESTRATOR ALREADY PAUSED" in repeated_ack
+    assert marker_writes == [True]
+
+    watcher.request_discussion_resume()
+    resume_ack = capsys.readouterr().out
+    assert "ORCHESTRATOR RESUMED BY HUMAN" in resume_ack
+    assert watcher.discussion_pause_active() is False
+    assert watcher.state["discussionPauseActive"] is False
+    assert json.loads(watcher.state_path.read_text(encoding="utf-8"))["discussionPauseActive"] is False
+
+    watcher.request_discussion_resume()
+    repeated_resume_ack = capsys.readouterr().out
+    assert "ORCHESTRATOR ALREADY RESUMED" in repeated_resume_ack
+    assert marker_writes == [True, False]
+    assert service_calls == [] and launches == []
+
+    source = Path(watcher_module.__file__).read_text(encoding="utf-8")
+    restore_start = source.index("def _restore_machine_protocol_after_discussion")
+    pause_start = source.index("def request_discussion_pause", restore_start)
+    restore_source = source[restore_start:pause_start]
+    assert restore_source.count("_write_discussion_pause_marker(False)") == 2
+    assert source.count("_write_discussion_pause_marker(False)") == 2
+
+
 def test_public_protocol_gate_waits_while_architect_generates(tmp_path, monkeypatch):
     watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({"rolloverTransactionId": "canonical-generating-transaction", "rolloverHandoverProtocolVersion": 1})
+    watcher.save()
     bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
     watcher.state["architectDiscussionBaseline"] = bridge.assistant_baseline()
     watcher.save()
@@ -7366,13 +7640,24 @@ def test_remote_monitor_startup_failure_isolated_from_workflow_state(tmp_path):
     assert watcher.state == before
 
 
-def test_remote_commands_write_only_canonical_marker_from_worker_path(tmp_path, monkeypatch):
+def test_remote_commands_persist_canonical_pause_state_from_worker_path(tmp_path, monkeypatch):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
-    monkeypatch.setattr(watcher, "save", lambda: (_ for _ in ()).throw(AssertionError("remote must not save state.json")))
+    original_save = watcher.save
+    saves = []
+
+    def observe_save():
+        saves.append(dict(watcher.state))
+        return original_save()
+
+    monkeypatch.setattr(watcher, "save", observe_save)
     watcher.request_remote_discussion_pause()
     assert watcher.discussion_pause_active() is True
+    assert watcher.state["discussionPauseActive"] is True
     watcher.request_remote_discussion_resume()
     assert watcher.discussion_pause_active() is False
+    assert watcher.state["discussionPauseActive"] is False
+    assert json.loads(watcher.state_path.read_text(encoding="utf-8"))["discussionPauseActive"] is False
+    assert len(saves) == 2
 
 
 def test_explicit_pause_marker_overrides_legacy_state_flag(tmp_path):

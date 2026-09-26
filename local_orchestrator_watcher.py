@@ -2574,6 +2574,10 @@ class ArchitectSessionRollover:
             if tracer:
                 tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id)
             self.watcher.state["architectConversationId"] = conversation_id
+            if (self.watcher.state.get("postDiscussionEnvelopeRequired") is True
+                    and self.watcher.state.get("postDiscussionProtocolTransactionId") == transaction_id
+                    and self.watcher.state.get("postDiscussionProtocolTaskId") == self.watcher.state.get("nextTaskId")):
+                self.watcher.state["postDiscussionProtocolRolloverCommittedTransactionId"] = transaction_id
             self.watcher.state["architectMemorySessionId"] = conversation_id
             self.watcher.state.pop("architectMemoryBytes", None)
             self.watcher.state.pop("architectMemoryMiB", None)
@@ -4914,8 +4918,8 @@ class LocalFirstOrchestrator:
             ) or bool(staged_task_id and self.state.get("discussionPauseActive"))
             prior_state = dict(self.state)
             if not needs_protocol:
-                changed = bool(self.state.get("postDiscussionEnvelopeRequired") or self.state.get("postDiscussionEnvelopeRepairAwaiting"))
-                self.state.update({"postDiscussionEnvelopeRequired": False, "postDiscussionEnvelopeRepairAwaiting": False})
+                changed = bool(self.state.get("postDiscussionEnvelopeRequired") or self.state.get("postDiscussionEnvelopeRepairAwaiting") or self.state.get("discussionPauseActive"))
+                self.state.update({"postDiscussionEnvelopeRequired": False, "postDiscussionEnvelopeRepairAwaiting": False, "discussionPauseActive": False})
                 if changed:
                     self.save()
                 try:
@@ -4946,6 +4950,7 @@ class LocalFirstOrchestrator:
                     "postDiscussionProtocolTransactionId": self.state.get("rolloverTransactionId") if staged_task_id else None,
                     "postDiscussionProtocolBaseline": self.state.get("architectDiscussionBaseline") or self.state.get("architectBaseline"),
                     "postDiscussionResumePauseEpoch": pause_epoch,
+                    "discussionPauseActive": False,
                 })
             self.save()
             try:
@@ -4962,18 +4967,25 @@ class LocalFirstOrchestrator:
     def request_discussion_pause(self) -> None:
         with self._state_lock:
             if self.discussion_pause_active():
+                task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
+                print(f"ORCHESTRATOR ALREADY PAUSED state={self.state.get('state')} taskId={task_id} F10=RESUME")
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_PAUSE_ALREADY_ACTIVE", self.state, taskId=task_id)
                 return
             self._write_discussion_pause_marker(True)
+            self.state["discussionPauseActive"] = True
             task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
             if task_id != "NONE":
                 self.state["discussionPauseEpoch"] = int(self.state.get("discussionPauseEpoch", 0) or 0) + 1
-                self.save()
+            self.save()
             print(f"ORCHESTRATOR PAUSED BY HUMAN state={self.state.get('state')} taskId={task_id} F10=RESUME")
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_PAUSE_REQUESTED", self.state, taskId=task_id)
 
     def request_discussion_resume(self) -> None:
         with self._state_lock:
             if not self.discussion_pause_active():
+                task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
+                print(f"ORCHESTRATOR ALREADY RESUMED state={self.state.get('state')} taskId={task_id}")
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "HUMAN_DISCUSSION_RESUME_ALREADY_ACTIVE", self.state, taskId=task_id)
                 return
             self._restore_machine_protocol_after_discussion()
             task_id = self.state.get("taskId") or self.state.get("nextTaskId") or "NONE"
@@ -6358,19 +6370,40 @@ class LocalFirstOrchestrator:
 
     def _post_discussion_staged_prompt_evidence_valid(self, task_id: str) -> bool:
         transaction_id = self.state.get("postDiscussionProtocolTransactionId")
-        return bool(
-            transaction_id
-            and self._exact_staged_prompt_recovery_task() == str(task_id or "")
-            and str(transaction_id) == str(self.state.get("rolloverTransactionId") or "")
-        )
+        task_id = str(task_id or "")
+        if (not transaction_id or self.state.get("postDiscussionProtocolTaskId") != task_id
+                or str(self.state.get("nextTaskId") or "") != task_id):
+            return False
+        if (self._exact_staged_prompt_recovery_task() == task_id
+                and str(transaction_id) == str(self.state.get("rolloverTransactionId") or "")):
+            return True
+        # A successful fresh-Architect authority commit retires the live rollover
+        # transaction. Preserve its identity as protocol evidence until the
+        # staged-prompt envelope is consumed.
+        if (str(self.state.get("postDiscussionProtocolRolloverCommittedTransactionId") or "") != str(transaction_id)
+                or self.state.get("rolloverDue") is not False
+                or self.state.get("rolloverPending") is not False
+                or self.state.get("rolloverInProgress") is not False
+                or self.state.get("handoverRequested") is not False
+                or not self.state.get("architectConversationId")):
+            return False
+        prompt_value = self.state.get("nextPromptPath")
+        expected = self.prompts_dir / f"{task_id}.txt"
+        record = self.state.get("taskWorktrees", {}).get(task_id)
+        try:
+            return bool(
+                prompt_value
+                and Path(str(prompt_value)).resolve() == expected.resolve()
+                and expected.is_file() and expected.stat().st_size > 0
+                and isinstance(record, dict) and str(record.get("taskId") or "") == task_id
+                and record.get("worktreePath") and Path(str(record["worktreePath"])).is_dir()
+            )
+        except (OSError, RuntimeError, TypeError):
+            return False
 
     def _accept_exact_staged_prompt_envelope(self, response: str, task_id: str) -> dict[str, str]:
         """Accept only a wrapper around the already-persisted staged prompt."""
-        if (
-            self._exact_staged_prompt_recovery_task() != task_id
-            or str(self.state.get("postDiscussionProtocolTransactionId") or "")
-            != str(self.state.get("rolloverTransactionId") or "")
-        ):
+        if not self._post_discussion_staged_prompt_evidence_valid(task_id):
             raise ValueError("ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID")
         decision = parse_orchestrator_result(response, task_id)
         if decision["action"] != "EXECUTE":
@@ -6392,6 +6425,7 @@ class LocalFirstOrchestrator:
             "postDiscussionEnvelopeRepairAwaiting": False,
             "postDiscussionProtocolFailure": None,
         })
+        self.state.pop("postDiscussionProtocolRolloverCommittedTransactionId", None)
         consumed[fingerprint] = {
             "taskId": task_id,
             "classification": decision["classification"],
@@ -6410,6 +6444,11 @@ class LocalFirstOrchestrator:
                 or self.state.get("postDiscussionEnvelopeRepairAttempted")
                 or self.state.get("postDiscussionEnvelopeRepairTaskId") not in (None, "", task_id)
                 or self.state.get("postDiscussionEnvelopeRepairEpoch") not in (None, "", epoch)):
+            return False
+        if self.state.get("postDiscussionProtocolTransactionId") and not self._post_discussion_staged_prompt_evidence_valid(task_id):
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="STAGED_PROMPT_EVIDENCE_INVALID")
             return False
         message = "\n".join([
             "Your previous completed response did not contain the required final ORCHESTRATOR_RESULT envelope.",
@@ -6439,6 +6478,7 @@ class LocalFirstOrchestrator:
             "postDiscussionEnvelopeRepairTaskId": task_id,
             "postDiscussionEnvelopeRepairEpoch": epoch,
             "architectBaseline": baseline,
+            "postDiscussionProtocolBaseline": baseline,
             "humanRequiredReason": None,
         })
         self.save()
@@ -6474,7 +6514,7 @@ class LocalFirstOrchestrator:
         if not completed or not self._post_discussion_baseline_advanced(bridge, response):
             return "WAIT"
         task_id = str(self.state.get("postDiscussionProtocolTaskId") or self.state.get("taskId") or "")
-        staged_task_id = self._exact_staged_prompt_recovery_task()
+        staged_task_id = task_id if self._post_discussion_staged_prompt_evidence_valid(task_id) else None
         try:
             if staged_task_id and staged_task_id == task_id:
                 decision = self._accept_exact_staged_prompt_envelope(response, staged_task_id)
@@ -7047,7 +7087,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                     return False
             attempts = int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0)
             if attempts >= ROLLOVER_RECOVERY_MAX_ATTEMPTS:
-                if not watcher.session_rollover._begin_automatic_recovery_epoch(next_task_id):
+                if not watcher.session_rollover._begin_automatic_recovery_epoch(next_task_id, rollover_decision):
                     close_bridge()
                     return False
                 runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_EPOCH_STARTED", watcher.state, taskId=next_task_id)
@@ -7393,7 +7433,8 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
         if tracer:
             tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="NOT_NEXT_PROMPT_READY", rolloverServiceCalled=False)
         return None
-    if watcher.state.get("postDiscussionEnvelopeRequired") is True:
+    if (watcher.state.get("postDiscussionEnvelopeRequired") is True
+            and not _legacy_handover_must_precede_post_discussion_gate(watcher)):
         disposition = service_post_discussion_protocol_gate_once(watcher, endpoint, paused, logger, run_id)
         _wait_after_post_discussion_protocol_gate(watcher, disposition)
         return None
@@ -7463,6 +7504,10 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
                 tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH", rolloverServiceCalled=True, rolloverServiceResult=rollover_result, rolloverComplete=False, authoritativeArchitectConversationId=watcher.state.get("architectConversationId"))
             runtime_log(logger, run_id, "NEXT_PROMPT_READY_DISPATCH_BLOCKED", watcher.state, reason="ROLLOVER_REQUIRED_BEFORE_DISPATCH", rolloverServiceResult=rollover_result)
             return None
+    if watcher.state.get("postDiscussionEnvelopeRequired") is True:
+        disposition = service_post_discussion_protocol_gate_once(watcher, endpoint, paused, logger, run_id)
+        _wait_after_post_discussion_protocol_gate(watcher, disposition)
+        return None
     if tracer:
         tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="LAUNCH", reason="ROLLOVER_COMPLETE" if rollover_called else "ROLLOVER_NOT_DUE", rolloverServiceCalled=rollover_called, rolloverServiceResult=rollover_result, rolloverComplete=rollover_complete, authoritativeArchitectConversationId=watcher.state.get("architectConversationId"), discussionPaused=bool(paused()))
     runtime_log(logger, run_id, "NEXT_PROMPT_READY", watcher.state)
@@ -7651,6 +7696,28 @@ def _fail_closed_public_rollover(watcher: LocalFirstOrchestrator, decision: Roll
     runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "HUMAN_REQUIRED", watcher.state, reason=f"ROLLOVER_EVALUATOR_{decision.reason}")
 
 
+def _legacy_handover_must_precede_post_discussion_gate(watcher: LocalFirstOrchestrator) -> bool:
+    """Allow only exact preserved legacy evidence to reach reconciliation first."""
+    state = watcher.state
+    task_id = str(state.get("nextTaskId") or "")
+    return bool(
+        state.get("postDiscussionEnvelopeRequired") is True
+        and state.get("state") == "NEXT_PROMPT_READY"
+        and state.get("rolloverDue") is True
+        and state.get("rolloverPending") is True
+        and state.get("rolloverInProgress") is False
+        and state.get("handoverRequested") is True
+        and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
+        and state.get("rolloverMaintenanceState") == "DEFERRED"
+        and task_id
+        and str(state.get("rolloverTransactionTaskId") or "") == task_id
+        and str(state.get("postDiscussionProtocolTaskId") or "") == task_id
+        and str(state.get("postDiscussionProtocolTransactionId") or "") == str(state.get("rolloverTransactionId") or "")
+        and _legacy_handover_compatibility_allowed(state)
+        and watcher._exact_staged_prompt_recovery_task() == task_id
+    )
+
+
 def service_post_discussion_protocol_gate_once(
     watcher: LocalFirstOrchestrator,
     endpoint: str,
@@ -7682,6 +7749,11 @@ def service_post_discussion_protocol_gate_once(
         if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
             runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="ARCHITECT_GENERATING")
             return "GENERATING"
+        if (watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId")
+                and not watcher.state.get("postDiscussionEnvelopeRepairAttempted")):
+            if watcher.request_post_discussion_envelope_repair(bridge):
+                return "REPAIR_REQUESTED"
+            return "FAILED"
         baseline = watcher.state.get("postDiscussionProtocolBaseline") or watcher.state.get("architectDiscussionBaseline") or {}
         waiter = getattr(bridge, "wait_for_new_response", None)
         if not callable(waiter):
@@ -7727,7 +7799,8 @@ def run_next_prompt_ready_once(
     run_id: str | None = None,
 ) -> Any:
     """Run one NEXT_PROMPT_READY iteration through the canonical evaluator."""
-    if watcher.state.get("postDiscussionEnvelopeRequired") is True:
+    if (watcher.state.get("postDiscussionEnvelopeRequired") is True
+            and not _legacy_handover_must_precede_post_discussion_gate(watcher)):
         disposition = service_post_discussion_protocol_gate_once(watcher, endpoint, paused, logger, run_id)
         _wait_after_post_discussion_protocol_gate(watcher, disposition)
         return None
