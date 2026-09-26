@@ -127,6 +127,10 @@ def evaluate_rollover_state(
     )
 
     # Identity and shape are validated before any wait/recovery decision.
+    if observations.safe_boundary_state is not None and observations.safe_boundary_state != workflow:
+        return _decision(RolloverAction.HUMAN_REQUIRED, "SAFE_BOUNDARY_STATE_MISMATCH", task_id, transaction_id)
+    if observations.next_task_id is not None and observations.next_task_id != task_id:
+        return _decision(RolloverAction.HUMAN_REQUIRED, "NEXT_TASK_OBSERVATION_MISMATCH", task_id, transaction_id)
     if observations.contradictory_live_transaction:
         return _decision(RolloverAction.HUMAN_REQUIRED, "CONTRADICTORY_LIVE_TRANSACTION", task_id, transaction_id)
     if due and pending and in_progress and not transaction_id:
@@ -185,23 +189,23 @@ def evaluate_rollover_state(
         if isinstance(recovery_retry_after, (int, float)) and float(recovery_retry_after) > now:
             return _decision(RolloverAction.WAIT_RECONCILIATION, "RECONCILIATION_DEADLINE_FUTURE", task_id, transaction_id, wait_until=float(recovery_retry_after))
 
-    max_epochs = durable_state.get("rolloverAutomaticRecoveryMaxEpochs", 0)
-    epochs = durable_state.get("rolloverAutomaticRecoveryEpochCount", 0)
-    try:
-        max_epochs_i = int(max_epochs)
-        epochs_i = int(epochs)
-    except (TypeError, ValueError):
-        return _decision(RolloverAction.HUMAN_REQUIRED, "RECOVERY_EPOCH_BUDGET_INVALID", task_id, transaction_id)
-    if max_epochs_i < 0 or epochs_i < 0:
-        return _decision(RolloverAction.HUMAN_REQUIRED, "RECOVERY_EPOCH_BUDGET_INVALID", task_id, transaction_id)
-    if epochs_i >= max_epochs_i and (due or pending or in_progress):
-        return _decision(RolloverAction.HUMAN_REQUIRED, "AUTOMATIC_RECOVERY_EXHAUSTED", task_id, transaction_id)
-
     next_eligible = durable_state.get("rolloverAutomaticRecoveryNextEligibleAt")
     if maintenance == "DEFERRED":
         deferred_owner_missing = not any((owner, transaction_task, attempted_task))
         if deferred_owner_missing:
             return _decision(RolloverAction.HUMAN_REQUIRED, "DEFERRED_TASK_OWNER_MISSING", task_id, transaction_id)
+        epoch_value = durable_state.get("rolloverAutomaticRecoveryEpochCount")
+        max_epoch_value = durable_state.get("rolloverAutomaticRecoveryMaxEpochs")
+        if isinstance(epoch_value, bool) or isinstance(max_epoch_value, bool):
+            return _decision(RolloverAction.HUMAN_REQUIRED, "RECOVERY_EPOCH_BUDGET_INVALID", task_id, transaction_id)
+        try:
+            epochs_i = int(epoch_value)
+            max_epochs_i = int(max_epoch_value)
+        except (TypeError, ValueError):
+            return _decision(RolloverAction.HUMAN_REQUIRED, "RECOVERY_EPOCH_BUDGET_INVALID", task_id, transaction_id)
+        if epochs_i < 0 or max_epochs_i <= 0 or epochs_i >= max_epochs_i:
+            reason = "AUTOMATIC_RECOVERY_EXHAUSTED" if epochs_i >= max_epochs_i and epochs_i >= 0 and max_epochs_i > 0 else "RECOVERY_EPOCH_BUDGET_INVALID"
+            return _decision(RolloverAction.HUMAN_REQUIRED, reason, task_id, transaction_id)
         if isinstance(next_eligible, (int, float)) and float(next_eligible) > now:
             return _decision(RolloverAction.WAIT_COOLDOWN, "AUTOMATIC_RECOVERY_COOLDOWN", task_id, transaction_id, wait_until=float(next_eligible))
         return _decision(RolloverAction.START_RECOVERY_EPOCH, "AUTOMATIC_RECOVERY_COOLDOWN_EXPIRED", task_id, transaction_id)

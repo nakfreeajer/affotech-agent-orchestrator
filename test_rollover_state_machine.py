@@ -75,6 +75,18 @@ def test_discussion_pause_precedes_expired_cooldown_without_budget_change():
     assert decision.action is RolloverAction.WAIT_DISCUSSION
 
 
+def test_observation_identity_mismatch_fails_closed():
+    value = state()
+    boundary = decide(value, obs(safe_boundary_state="RESULT_READY"), 50)
+    task = decide(value, obs(next_task_id="000104"), 50)
+    matching = decide(value, obs(), 50)
+    assert boundary.action is RolloverAction.HUMAN_REQUIRED
+    assert boundary.reason == "SAFE_BOUNDARY_STATE_MISMATCH"
+    assert task.action is RolloverAction.HUMAN_REQUIRED
+    assert task.reason == "NEXT_TASK_OBSERVATION_MISMATCH"
+    assert matching.action is RolloverAction.WAIT_COOLDOWN
+
+
 def test_future_cooldown_waits_with_deadline():
     decision = decide(state(rolloverAutomaticRecoveryNextEligibleAt=100), now=50)
     assert decision.action is RolloverAction.WAIT_COOLDOWN
@@ -139,12 +151,55 @@ def test_production_shaped_000102_to_000103_fixture():
     assert decide(value, now=101).action is RolloverAction.START_RECOVERY_EPOCH
 
 
+def fresh_rollover_state():
+    return {
+        "state": "NEXT_PROMPT_READY",
+        "taskId": "000200",
+        "lastCompletedTaskId": "000200",
+        "nextTaskId": "000201",
+        "rolloverDue": True,
+        "rolloverPending": True,
+        "rolloverInProgress": False,
+        "handoverRequested": False,
+    }
+
+
+def test_fresh_rollover_without_epoch_budget_requests_handover():
+    assert decide(fresh_rollover_state(), obs(next_task_id="000201"), 50).action is RolloverAction.REQUEST_HANDOVER
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "rolloverAutomaticRecoveryEpochCount",
+        "rolloverAutomaticRecoveryMaxEpochs",
+    ],
+)
+def test_deferred_incomplete_epoch_budget_fails_closed(missing):
+    value = state()
+    value.pop(missing)
+    decision = decide(value, now=50)
+    assert decision.action is RolloverAction.HUMAN_REQUIRED
+    assert decision.reason == "RECOVERY_EPOCH_BUDGET_INVALID"
+
+
+def test_normalization_then_request_journey_does_not_invent_budget():
+    original = fresh_rollover_state()
+    first = decide({**original, "rolloverPending": False}, obs(next_task_id="000201"), 50)
+    normalized = {**original, "rolloverPending": True}
+    second = decide(normalized, obs(next_task_id="000201"), 50)
+    assert first.action is RolloverAction.NORMALIZE_STATE
+    assert first.normalization == "SET_PENDING_ONLY_AFTER_SAFE_BOUNDARY_VALIDATION"
+    assert second.action is RolloverAction.REQUEST_HANDOVER
+    assert original["rolloverPending"] is True
+
+
 def test_scheduler_has_no_legacy_identity_or_special_task_rule():
     source = inspect.getsource(evaluate_rollover_state)
     assert "7fdbd798659f42295a18dd2d" not in source
     assert '"000103"' not in source
-    first = decide(state(nextTaskId="task-B", rolloverTransactionTaskId="task-B", rolloverDeferredForTaskId="task-B"), now=101)
-    second = decide(state(nextTaskId="task-C", rolloverTransactionTaskId="task-C", rolloverDeferredForTaskId="task-C"), now=101)
+    first = decide(state(nextTaskId="task-B", rolloverTransactionTaskId="task-B", rolloverDeferredForTaskId="task-B"), obs(next_task_id="task-B"), now=101)
+    second = decide(state(nextTaskId="task-C", rolloverTransactionTaskId="task-C", rolloverDeferredForTaskId="task-C"), obs(next_task_id="task-C"), now=101)
     assert first.action is second.action is RolloverAction.START_RECOVERY_EPOCH
 
 
