@@ -2841,6 +2841,42 @@ def _terminal_same_task_rollover_fixture(tmp_path):
     return watcher, prompt, retired
 
 
+def test_transaction_lifecycle_authority_classifies_current_and_stale_evidence():
+    prepared = {
+        "state": "NEXT_PROMPT_READY", "nextTaskId": "000201",
+        "rolloverDue": True, "rolloverPending": True,
+        "rolloverTransactionId": "prepared-201", "rolloverTransactionTaskId": "000201",
+        "rolloverTransactionGeneration": 1, "rolloverHandoverSendState": "UNSENT",
+        "handoverRequested": False,
+    }
+    assert watcher_module.rollover_transaction_lifecycle_action(prepared, "000201") == "REUSE_PREPARED_UNSENT"
+
+    live = dict(prepared, rolloverHandoverSendState="AMBIGUOUS", handoverRequested=True)
+    assert watcher_module.rollover_transaction_lifecycle_action(live, "000201") == "RETAIN_CURRENT_TRANSACTION"
+    assert watcher_module.rollover_transaction_lifecycle_action(live, "000202") == "RETIRE_STALE_TRANSACTION"
+
+    terminal = dict(live, rolloverInProgress=False, rolloverMaintenanceState="DEFERRED",
+                    rolloverRecoveryState="DEFERRED",
+                    rolloverRecoveryTerminalReason="ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+                    rolloverAttemptedForTaskId="000201")
+    assert watcher_module.rollover_transaction_lifecycle_action(terminal, "000201", False) == "RETAIN_TERMINAL"
+    assert watcher_module.rollover_transaction_lifecycle_action(terminal, "000201", True) == "TERMINAL_RECOVERY_CANDIDATE"
+
+
+def test_transaction_lifecycle_authority_is_non_mutating_and_identity_stable():
+    state = {
+        "state": "NEXT_PROMPT_READY", "nextTaskId": "000301", "rolloverDue": True,
+        "rolloverPending": True, "rolloverTransactionId": "stable-301",
+        "rolloverTransactionTaskId": "000301", "rolloverHandoverSendState": "ACKNOWLEDGED",
+        "handoverRequested": True,
+    }
+    before = dict(state)
+    first = watcher_module.rollover_transaction_lifecycle_action(state, "000301")
+    second = watcher_module.rollover_transaction_lifecycle_action(state, "000301")
+    assert first == second == "RETAIN_CURRENT_TRANSACTION"
+    assert state == before
+
+
 def test_action_error_after_payload_delivery_reconciles_without_resend(tmp_path):
     watcher, prompt = _next_prompt_ready_fixture(tmp_path, due=True)
     watcher.state.update({

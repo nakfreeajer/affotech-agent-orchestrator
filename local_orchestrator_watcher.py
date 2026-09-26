@@ -1425,6 +1425,56 @@ def rollover_transaction_id(state: dict[str, Any], task_id: str | None = None) -
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
 
+def rollover_transaction_lifecycle_action(
+    state: dict[str, Any],
+    task_id: str,
+    operator_restart_available: bool = False,
+) -> str:
+    """Classify one transaction boundary before a lifecycle mutation.
+
+    This is deliberately protocol/lifecycle evidence only.  Scheduling remains
+    owned by ``evaluate_rollover_state`` and its runtime adapter.
+    """
+    current = str(task_id or "").strip()
+    transaction = str(state.get("rolloverTransactionId") or "").strip()
+    owner = str(state.get("rolloverTransactionTaskId") or "").strip()
+    attempted = str(state.get("rolloverAttemptedForTaskId") or "").strip()
+    if not transaction:
+        return "CREATE_TRANSACTION"
+    if (owner and owner != current) or (not owner and attempted and attempted != current):
+        return "RETIRE_STALE_TRANSACTION"
+    terminal = (
+        state.get("state") == "NEXT_PROMPT_READY"
+        and str(state.get("nextTaskId") or "") == current
+        and state.get("rolloverDue") is True
+        and state.get("rolloverPending") is True
+        and state.get("rolloverInProgress") is False
+        and state.get("rolloverMaintenanceState") == "DEFERRED"
+        and state.get("rolloverRecoveryState") == "DEFERRED"
+        and state.get("rolloverRecoveryTerminalReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
+        and owner == current
+        and attempted == current
+        and state.get("handoverRequested") is True
+        and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
+    )
+    if terminal:
+        return "TERMINAL_RECOVERY_CANDIDATE" if operator_restart_available else "RETAIN_TERMINAL"
+    prepared_unsent = (
+        state.get("state") == "NEXT_PROMPT_READY"
+        and str(state.get("nextTaskId") or "") == current
+        and state.get("rolloverDue") is True
+        and state.get("rolloverPending") is True
+        and state.get("rolloverHandoverSendState") == "UNSENT"
+        and state.get("handoverRequested") is False
+        and state.get("rolloverTransactionGeneration") is not None
+    )
+    if prepared_unsent:
+        return "REUSE_PREPARED_UNSENT"
+    if owner == current or (not owner and attempted == current):
+        return "RETAIN_CURRENT_TRANSACTION"
+    return "RETAIN_TRANSACTION"
+
+
 def handover_request_for_transaction(transaction_id: str, task_id: str | None = None) -> str:
     task = str(task_id or "").strip()
     return ("ARCHITECT SESSION ROLLOVER\n\n"
@@ -1822,31 +1872,20 @@ class ArchitectSessionRollover:
         return True
 
     def _terminal_same_task_transaction_eligible(self, task_id: str, operator_restart_available: bool) -> bool:
-        state = self.watcher.state
-        transaction_id = str(state.get("rolloverTransactionId") or "").strip()
-        owner = str(state.get("rolloverTransactionTaskId") or "").strip()
-        return bool(
-            state.get("state") == "NEXT_PROMPT_READY"
-            and str(state.get("nextTaskId") or "") == task_id
-            and state.get("rolloverDue") is True
-            and state.get("rolloverPending") is True
-            and state.get("rolloverInProgress") is False
-            and state.get("rolloverMaintenanceState") == "DEFERRED"
-            and state.get("rolloverRecoveryState") == "DEFERRED"
-            and state.get("rolloverRecoveryTerminalReason") == "ARCHITECT_ROLLOVER_SAFETY_CUTOUT"
-            and transaction_id
-            and owner == task_id
-            and state.get("rolloverAttemptedForTaskId") == task_id
-            and state.get("handoverRequested") is True
-            and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
-            and operator_restart_available
-        )
+        return rollover_transaction_lifecycle_action(
+            self.watcher.state, task_id, operator_restart_available
+        ) == "TERMINAL_RECOVERY_CANDIDATE"
 
     def _revive_terminal_delivered_transaction(self, task_id: str) -> bool:
         """Revive one terminal transaction whose exact request is already delivered."""
         state = self.watcher.state
         transaction_id = str(state.get("rolloverTransactionId") or "").strip()
-        if not transaction_id or str(state.get("rolloverTransactionTaskId") or "") != task_id:
+        if (
+            not transaction_id
+            or rollover_transaction_lifecycle_action(
+                state, task_id, bool(getattr(self.watcher, "_operator_restart_rollover_recovery_available", False))
+            ) != "TERMINAL_RECOVERY_CANDIDATE"
+        ):
             return False
         state.update({
             "rolloverDue": True,
@@ -1886,9 +1925,11 @@ class ArchitectSessionRollover:
         """Remove terminal evidence that belongs to an earlier task boundary."""
         state = self.watcher.state
         transaction_id = str(state.get("rolloverTransactionId") or "").strip()
-        owner = str(state.get("rolloverTransactionTaskId") or "").strip()
-        attempted = str(state.get("rolloverAttemptedForTaskId") or "").strip()
-        if not task_id or not transaction_id or not ((owner and owner != task_id) or (not owner and attempted and attempted != task_id)):
+        if (
+            not task_id
+            or not transaction_id
+            or rollover_transaction_lifecycle_action(state, task_id) != "RETIRE_STALE_TRANSACTION"
+        ):
             return False
         for key in (
             "rolloverTransactionId", "rolloverTransactionTaskId", "rolloverAttemptedForTaskId",
@@ -1943,7 +1984,10 @@ class ArchitectSessionRollover:
                 _trace_rollover_gate(self.watcher, boundary_state, "NO_TRIGGER", "MEMORY_BELOW_THRESHOLD", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
                 return False
         task_id = str(self.watcher.state.get("nextTaskId") or self.watcher.state.get("taskId") or "")
-        self._retire_stale_transaction_for_task(task_id)
+        lifecycle_action = rollover_transaction_lifecycle_action(self.watcher.state, task_id)
+        if lifecycle_action == "RETIRE_STALE_TRANSACTION":
+            self._retire_stale_transaction_for_task(task_id)
+            lifecycle_action = rollover_transaction_lifecycle_action(self.watcher.state, task_id)
         if task_id and self.watcher.state.get("rolloverAttemptedForTaskId") == task_id and not allow_same_task_unsent_recovery:
             _trace_rollover_gate(self.watcher, boundary_state, "SKIP", "ALREADY_ATTEMPTED_FOR_TASK", function="ArchitectSessionRollover.request_if_due", architectGenerating=architect_generating, executorRunning=executor_running)
             return False
@@ -1971,15 +2015,10 @@ class ArchitectSessionRollover:
             persisted_generation = 0
         prepared_unsent = (
             allow_same_task_unsent_recovery
-            and self.watcher.state.get("state") == "NEXT_PROMPT_READY"
-            and str(self.watcher.state.get("nextTaskId") or "") == task_id
-            and self.watcher.state.get("rolloverDue") is True
-            and self.watcher.state.get("rolloverPending") is True
+            and lifecycle_action == "REUSE_PREPARED_UNSENT"
             and bool(previous_transaction_id)
             and not isinstance(raw_generation, bool)
             and persisted_generation > 0
-            and self.watcher.state.get("rolloverHandoverSendState") == "UNSENT"
-            and self.watcher.state.get("handoverRequested") is False
             and previous_transaction_id != retired_transaction_id
         )
         if prepared_unsent:
