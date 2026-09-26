@@ -6825,6 +6825,163 @@ class LocalFirstOrchestrator:
         )
         return True
 
+    def consume_rollover_postfix_qualification_authorization(self) -> bool:
+        """Consume one epoch-3-bound human qualification without raising auto budget."""
+        from crash_recovery_bootstrap import (
+            LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+            LEGACY_POSTFIX_QUALIFICATION_FAILED_EPOCH,
+            _default_process_records,
+            _pid_alive,
+            _session_exists,
+            _session_writer_records,
+            validate_rollover_postfix_qualification,
+        )
+
+        expected_token = f"{LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID}:{LEGACY_POSTFIX_QUALIFICATION_FAILED_EPOCH}"
+        if os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION") != expected_token:
+            return False
+        records = _default_process_records()
+        watcher_running = any(
+            "local_orchestrator_watcher.py" in str(row.get("CommandLine") or "")
+            and str(row.get("ProcessId")) != str(os.getpid())
+            for row in records
+        )
+        session_id = str(self.state.get("executorSessionId") or "")
+
+        def discovery_for(state: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "state": state,
+                "stateDir": str(self.state_dir),
+                "repository": str(self.project_dir),
+                "watcherRunning": watcher_running,
+                "executorSessionExists": _session_exists(session_id),
+                "activeWriterPresent": bool(_session_writer_records(session_id, records)),
+                "executorPidAlive": _pid_alive(state.get("codexPid") or state.get("active_codex_pid"), records),
+                "executorPidAliveByField": {
+                    "codexPid": _pid_alive(state.get("codexPid"), records),
+                    "active_codex_pid": _pid_alive(state.get("active_codex_pid"), records),
+                },
+            }
+
+        eligible, reason = validate_rollover_postfix_qualification(discovery_for(self.state))
+        if not eligible or self._exact_staged_prompt_recovery_task(allow_human_required=True) != "000103":
+            runtime_log(
+                getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                "ROLLOVER_POSTFIX_QUALIFICATION_REJECTED", self.state,
+                reason=reason if not eligible else "STAGED_PROMPT_RUNTIME_EVIDENCE_MISMATCH",
+                stateMutation=False,
+            )
+            return False
+
+        # Re-read canonical durable bytes before consuming authorization. Preserve
+        # a human pause: this only changes the persisted recovery boundary; the
+        # main loop remains gated until the operator explicitly resumes.
+        try:
+            disk_state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            disk_state = None
+        if not isinstance(disk_state, dict):
+            return False
+        eligible, reason = validate_rollover_postfix_qualification(discovery_for(disk_state))
+        if not eligible:
+            runtime_log(
+                getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                "ROLLOVER_POSTFIX_QUALIFICATION_REJECTED", self.state,
+                reason=f"AUTHORITY_CHANGED_AFTER_PREFLIGHT:{reason}", stateMutation=False,
+            )
+            return False
+
+        artifact_dir = self.state_dir / "logs" / "diagnostic" / "legacy-handover-reemission"
+        artifact_paths = list(artifact_dir.glob(
+            f"{LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID}-epoch-{LEGACY_POSTFIX_QUALIFICATION_FAILED_EPOCH}-observation-*.json"
+        ))
+        if len(artifact_paths) != 1:
+            return False
+        artifact_path = artifact_paths[0]
+        artifact_bytes = artifact_path.read_bytes()
+        now = time.time()
+        previous_epoch = LEGACY_POSTFIX_QUALIFICATION_FAILED_EPOCH
+        qualification_epoch = previous_epoch + 1
+        ledger = list(self.state.get("rolloverPostfixQualificationAuthorizations") or [])
+        authorization = {
+            "transactionId": LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+            "taskId": "000103",
+            "failedEpoch": previous_epoch,
+            "qualificationEpoch": qualification_epoch,
+            "authorizedAt": now,
+            "diagnosticArtifact": str(artifact_path),
+            "diagnosticArtifactSha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "automaticRecoveryEpochCount": self.state.get("rolloverAutomaticRecoveryEpochCount"),
+            "automaticRecoveryMaxEpochs": self.state.get("rolloverAutomaticRecoveryMaxEpochs"),
+            "executorLaunchAuthorized": False,
+            "requiresNormalRolloverCompletion": True,
+            "discussionPausePreserved": bool(self.state.get("discussionPauseActive")),
+        }
+        with self._state_lock:
+            state = self.state
+            # Revalidate mutable in-memory authority immediately at the write boundary.
+            eligible, reason = validate_rollover_postfix_qualification(discovery_for(state))
+            if not eligible or state.get("rolloverRecoveryEpoch") != previous_epoch:
+                runtime_log(
+                    getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                    "ROLLOVER_POSTFIX_QUALIFICATION_REJECTED", state,
+                    reason=f"MUTATION_BOUNDARY_REJECTED:{reason}", stateMutation=False,
+                )
+                return False
+            prior_evidence = {
+                key: state.get(key) for key in (
+                    "state", "humanRequiredReason", "rolloverRecoveryState",
+                    "rolloverRecoveryAttemptCount", "rolloverRecoveryStartedAt",
+                    "rolloverRecoveryLastAttemptAt", "rolloverRecoveryRetryAfter",
+                    "rolloverRecoveryTerminalReason", "rolloverAutomaticRecoveryNextEligibleAt",
+                    "rolloverHandoverRecoveryDisposition", "rolloverHandoverRecoveryReason",
+                    "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+                    "rolloverLegacyHandoverReemissionState", "rolloverLegacyHandoverReemissionAttemptedEpoch",
+                    "rolloverDiagnosticRetryAuthorization", "rolloverDiagnosticRetryAuthorizationConsumedTransactionId",
+                )
+            }
+            authorization["previousEvidence"] = prior_evidence
+            ledger.append(dict(authorization))
+            state.update({
+                "rolloverPostfixQualificationAuthorizations": ledger,
+                "rolloverPostfixQualificationAuthorization": dict(authorization),
+                "state": "NEXT_PROMPT_READY",
+                "humanRequiredReason": None,
+                "rolloverRecoveryEpoch": qualification_epoch,
+                "rolloverRecoveryState": "RECOVERING",
+                "rolloverRecoveryAttemptCount": 0,
+                "rolloverRecoveryStartedAt": now,
+                "rolloverRecoveryLastAttemptAt": None,
+                "rolloverRecoveryRetryAfter": None,
+                "rolloverAutomaticRecoveryNextEligibleAt": None,
+                "rolloverMaintenanceState": "IN_PROGRESS",
+                "rolloverInProgress": True,
+                "rolloverDue": True,
+                "rolloverPending": True,
+                "handoverRequested": True,
+                "handoverReady": False,
+                # rolloverAutomaticRecoveryEpochCount/MaxEpochs and the pause
+                # marker/state are intentionally left unchanged.
+            })
+            for key in (
+                "rolloverRecoveryTerminalReason", "rolloverHandoverRecoveryDisposition",
+                "rolloverHandoverRecoveryReason", "rolloverHandoverRecoveryRetryAfter",
+                "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+            ):
+                state.pop(key, None)
+            self.save()
+        runtime_log(
+            getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+            "ROLLOVER_POSTFIX_QUALIFICATION_CONSUMED", self.state,
+            transactionId=LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID, taskId="000103",
+            failedEpoch=previous_epoch, qualificationEpoch=qualification_epoch,
+            automaticEpochCount=self.state.get("rolloverAutomaticRecoveryEpochCount"),
+            automaticEpochMax=self.state.get("rolloverAutomaticRecoveryMaxEpochs"),
+            discussionPausePreserved=bool(self.state.get("discussionPauseActive")),
+            executorLaunchAuthorized=False,
+        )
+        return True
+
     def _post_discussion_staged_prompt_evidence_valid(self, task_id: str) -> bool:
         transaction_id = self.state.get("postDiscussionProtocolTransactionId")
         task_id = str(task_id or "")
@@ -8522,11 +8679,19 @@ def main() -> None:
             _ACTIVE_DIAGNOSTIC_TRACE = None
         instance_lock.release()
         return
-    if os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY"):
+    if (os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY")
+            and not os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION")):
         if watcher.consume_rollover_diagnostic_retry_authorization():
             print("ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_CONSUMED; Executor launch remains blocked pending normal rollover recovery.")
         else:
             print("ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_REJECTED; workflow remains fail-closed.")
+    if os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION"):
+        if os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY"):
+            print("ROLLOVER_POSTFIX_QUALIFICATION_REJECTED; conflicting rollover authorizations supplied.")
+        elif watcher.consume_rollover_postfix_qualification_authorization():
+            print("ROLLOVER_POSTFIX_QUALIFICATION_CONSUMED; pause and Executor-launch gates remain authoritative.")
+        else:
+            print("ROLLOVER_POSTFIX_QUALIFICATION_REJECTED; workflow remains fail-closed.")
     discussion_paused = getattr(watcher, "discussion_pause_active", lambda: bool(watcher.state.get("discussionPauseActive")))
     if discussion_paused():
         print(f"ORCHESTRATOR PAUSED BY HUMAN state={watcher.state.get('state')} taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId') or 'NONE'}")

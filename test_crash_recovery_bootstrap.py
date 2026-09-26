@@ -310,6 +310,127 @@ def test_validated_durable_handover_blocks_unnecessary_diagnostic_retry(tmp_path
     assert bootstrap.validate_rollover_diagnostic_retry(d) == (False, "DURABLE_HANDOVER_EVIDENCE_INCOMPLETE")
 
 
+def _postfix_qualification_fixture(tmp_path, monkeypatch):
+    d, prompt = _rollover_retry_fixture(tmp_path, monkeypatch)
+    state = d["state"]
+    state.update({
+        "discussionPauseActive": True,
+        "taskId": "000102", "lastCompletedTaskId": "000102", "nextTaskId": "000103",
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+        "rolloverRecoveryEpoch": 3,
+        "rolloverAutomaticRecoveryEpochCount": 3, "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverLegacyHandoverReemissionTransactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 3,
+        "rolloverLegacyHandoverReemissionState": "INVALID_RESPONSE",
+        "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "DEFERRED", "rolloverRecoveryState": "DEFERRED",
+        "rolloverDiagnosticRetryAuthorizationConsumedTransactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+        "rolloverDiagnosticRetryAuthorization": {
+            "transactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+            "taskId": "000103", "previousEpoch": 2, "newEpoch": 3,
+        },
+        "rolloverRecoveryTerminalReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+    })
+    artifact_dir = Path(d["stateDir"]) / "logs" / "diagnostic" / "legacy-handover-reemission"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "transactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+        "taskId": "000103", "recoveryEpoch": 3, "observedState": "BLOCKED",
+        "textLengthChars": 0, "textUtf8Bytes": 0,
+        "textSha256": __import__("hashlib").sha256(b"").hexdigest(),
+        "artifactWritten": True,
+        "artifactPath": str(artifact_dir / f"{bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID}-epoch-3-observation-fixture.json"),
+        "waiterDiagnostics": {
+            "completionReason": "IDENTITY_CHANGED_WITH_EMPTY_TEXT", "pollCount": 1,
+            "baselineAssistantCount": 0, "candidateAssistantCount": 0,
+        },
+    }
+    (artifact_dir / f"{bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID}-epoch-3-observation-fixture.json").write_text(json.dumps(artifact), encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256", __import__("hashlib").sha256(prompt.read_bytes()).hexdigest().upper())
+    return d, prompt
+
+
+def test_postfix_qualification_is_exact_epoch_bound_and_keeps_auto_budget(tmp_path, monkeypatch):
+    d, prompt = _postfix_qualification_fixture(tmp_path, monkeypatch)
+    assert bootstrap.validate_rollover_postfix_qualification(d) == (True, "SAFE_TO_AUTHORIZE_ONE_POSTFIX_QUALIFICATION")
+    cases = [
+        ("state", "NEXT_PROMPT_READY", "STATE_NOT_HUMAN_REQUIRED"),
+        ("humanRequiredReason", "OTHER", "HUMAN_REQUIRED_REASON_MISMATCH"),
+        ("taskId", "000104", "COMPLETED_TASK_BOUNDARY_MISMATCH"),
+        ("lastCompletedTaskId", "000104", "COMPLETED_TASK_BOUNDARY_MISMATCH"),
+        ("rolloverTransactionId", "wrong", "TRANSACTION_IDENTITY_MISMATCH"),
+        ("rolloverTransactionTaskId", "000104", "TRANSACTION_IDENTITY_MISMATCH"),
+        ("nextTaskId", "000104", "NEXT_TASK_MISMATCH"),
+        ("rolloverRecoveryEpoch", 2, "FAILED_EPOCH_MISMATCH"),
+        ("rolloverLegacyHandoverReemissionState", "SENT", "FAILED_REEMISSION_EPOCH_NOT_PROVEN"),
+        ("executorSessionId", "other-session", "PERSISTENT_EXECUTOR_SESSION_MISMATCH"),
+        ("governedExecutorActiveWriter", True, "EXECUTOR_PROCESS_OR_WRITER_ACTIVE"),
+        ("rolloverAutomaticRecoveryMaxEpochs", 4, "AUTOMATIC_EPOCH_BUDGET_BOUNDARY_MISMATCH"),
+    ]
+    for field, value, expected_reason in cases:
+        previous = d["state"].get(field)
+        d["state"][field] = value
+        assert bootstrap.validate_rollover_postfix_qualification(d)[1] == expected_reason
+        if previous is None:
+            d["state"].pop(field)
+        else:
+            d["state"][field] = previous
+
+    d["watcherRunning"] = True
+    assert bootstrap.validate_rollover_postfix_qualification(d)[1] == "WATCHER_ALREADY_RUNNING"
+    d["watcherRunning"] = False
+    d["state"]["pending_handover"] = (
+        "Rollover transaction ID: 7fdbd798659f42295a18dd2d\n"
+        "taskId=000103\nARCHITECT_HANDOVER_READY"
+    )
+    assert bootstrap.validate_rollover_postfix_qualification(d)[1] == "VALIDATED_DURABLE_HANDOVER_ALREADY_EXISTS"
+    d["state"].pop("pending_handover")
+    d["state"]["rolloverPostfixQualificationAuthorizations"] = [{"transactionId": "7fdbd798659f42295a18dd2d", "failedEpoch": 3}]
+    assert bootstrap.validate_rollover_postfix_qualification(d)[1] == "FAILED_EPOCH_AUTHORIZATION_ALREADY_CONSUMED"
+    d["state"].pop("rolloverPostfixQualificationAuthorizations")
+
+    artifact = next((Path(d["stateDir"]) / "logs" / "diagnostic" / "legacy-handover-reemission").glob("*-epoch-3-observation-*.json"))
+    proof = json.loads(artifact.read_text(encoding="utf-8"))
+    proof["waiterDiagnostics"]["completionReason"] = "OTHER"
+    artifact.write_text(json.dumps(proof), encoding="utf-8")
+    assert bootstrap.validate_rollover_postfix_qualification(d)[1] == "EPOCH3_DIAGNOSTIC_PROOF_MISSING_OR_INVALID"
+    proof["waiterDiagnostics"]["completionReason"] = "IDENTITY_CHANGED_WITH_EMPTY_TEXT"
+    artifact.write_text(json.dumps(proof), encoding="utf-8")
+    prompt_bytes = prompt.read_bytes()
+    prompt.write_bytes(prompt_bytes + b"modified")
+    assert bootstrap.validate_rollover_postfix_qualification(d)[1] == "STAGED_PROMPT_IDENTITY_MISMATCH"
+    prompt.write_bytes(prompt_bytes)
+    artifact.unlink()
+    assert bootstrap.validate_rollover_postfix_qualification(d)[1] == "EPOCH3_DIAGNOSTIC_PROOF_MISSING_OR_INVALID"
+    assert prompt.exists()
+
+
+def test_postfix_qualification_cli_is_read_only_and_old_retry_stays_separate(tmp_path, monkeypatch, capsys):
+    d, _prompt = _postfix_qualification_fixture(tmp_path, monkeypatch)
+    state_dir = Path(d["stateDir"])
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps(d["state"]), encoding="utf-8")
+    before = (state_dir / "state.json").read_bytes()
+    monkeypatch.setattr(bootstrap, "_default_process_records", lambda: [])
+    monkeypatch.setattr(bootstrap, "_session_exists", lambda _session, _home=None: True)
+    assert bootstrap.main([
+        "--repository", str(Path(__file__).resolve().parent), "--state-dir", str(state_dir),
+        "--validate-rollover-postfix-qualification",
+    ]) == 0
+    assert (state_dir / "state.json").read_bytes() == before
+    output = json.loads(capsys.readouterr().out)
+    assert output["rolloverPostfixQualificationEligible"] is True
+    assert output["rolloverPostfixQualificationReason"] == "SAFE_TO_AUTHORIZE_ONE_POSTFIX_QUALIFICATION"
+    script = Path(__file__).with_name("AFFOTECH-START.ps1").read_text(encoding="utf-8")
+    assert "AuthorizeRolloverPostfixQualification" in script
+    assert "ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION" in script
+    assert script.index("if ($StatusOnly)") < script.index("ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION =")
+    assert 'recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"' in script
+    assert '-not $AuthorizeRolloverPostfixQualification' in script
+    assert "rolloverAutomaticRecoveryMaxEpochs" not in script
+
+
 def test_rollover_retry_cli_status_is_read_only_and_wrapper_authority_is_separate(tmp_path, monkeypatch, capsys):
     d, _prompt = _rollover_retry_fixture(tmp_path, monkeypatch)
     state_dir = Path(d["stateDir"])

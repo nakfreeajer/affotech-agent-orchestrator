@@ -8305,3 +8305,109 @@ def test_explicit_rollover_diagnostic_authorization_consumes_one_epoch_without_l
     assert watcher.consume_rollover_diagnostic_retry_authorization() is False
     assert watcher.state["rolloverRecoveryEpoch"] == epoch_after_first
     assert prompt.read_text(encoding="utf-8") == prompt_text
+
+
+def test_postfix_qualification_consumes_epoch_four_once_without_raising_auto_budget(tmp_path, monkeypatch):
+    import crash_recovery_bootstrap as bootstrap
+
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+        "discussionPauseActive": True, "rolloverInProgress": False,
+        "rolloverRecoveryEpoch": 3, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverLegacyHandoverReemissionTransactionId": "7fdbd798659f42295a18dd2d",
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 3,
+        "rolloverLegacyHandoverReemissionState": "INVALID_RESPONSE",
+        "rolloverHandoverProtocolVersion": None,
+        "rolloverDiagnosticRetryAuthorizationConsumedTransactionId": "7fdbd798659f42295a18dd2d",
+        "rolloverDiagnosticRetryAuthorization": {
+            "transactionId": "7fdbd798659f42295a18dd2d", "taskId": "000103",
+            "previousEpoch": 2, "newEpoch": 3,
+        },
+        "executorSessionId": "019f842e-98bc-7672-a619-51441d91be00",
+        "executorSessionMode": "PERSISTENT", "executorProcessState": "COMPLETED_WITH_RESULT",
+    })
+    watcher._write_discussion_pause_marker(True)
+    watcher.diagnostic_dir = watcher.state_dir / "logs" / "diagnostic"
+    artifact_dir = watcher.diagnostic_dir / "legacy-handover-reemission"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "transactionId": "7fdbd798659f42295a18dd2d", "taskId": "000103", "recoveryEpoch": 3,
+        "observedState": "BLOCKED", "textLengthChars": 0, "textUtf8Bytes": 0,
+        "textSha256": hashlib.sha256(b"").hexdigest(), "artifactWritten": True,
+        "artifactPath": str(artifact_dir / "7fdbd798659f42295a18dd2d-epoch-3-observation-fixture.json"),
+        "waiterDiagnostics": {"completionReason": "IDENTITY_CHANGED_WITH_EMPTY_TEXT", "pollCount": 1,
+                              "baselineAssistantCount": 0, "candidateAssistantCount": 0},
+    }
+    diagnostic = artifact_dir / "7fdbd798659f42295a18dd2d-epoch-3-observation-fixture.json"
+    diagnostic.write_text(json.dumps(artifact), encoding="utf-8")
+    diagnostic_before = diagnostic.read_bytes()
+    prompt_before = prompt.read_bytes()
+    monkeypatch.setattr(bootstrap, "LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256", hashlib.sha256(prompt_before).hexdigest().upper())
+    monkeypatch.setattr(bootstrap, "_git", lambda *_args: "")
+    monkeypatch.setattr(bootstrap, "_default_process_records", lambda: [])
+    monkeypatch.setattr(bootstrap, "_session_exists", lambda _session: True)
+    monkeypatch.setattr(bootstrap, "_session_writer_records", lambda _session, _records: [])
+    monkeypatch.setattr(bootstrap, "_pid_alive", lambda _pid, _records: False)
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION", "7fdbd798659f42295a18dd2d:3")
+    watcher.save()
+    assert bootstrap.validate_rollover_postfix_qualification({
+        "state": watcher.state, "stateDir": str(watcher.state_dir), "repository": str(watcher.project_dir),
+        "watcherRunning": False, "executorSessionExists": True, "activeWriterPresent": False,
+        "executorPidAlive": False, "executorPidAliveByField": {"codexPid": False, "active_codex_pid": False},
+    }) == (True, "SAFE_TO_AUTHORIZE_ONE_POSTFIX_QUALIFICATION")
+
+    launches = []
+    assert watcher.consume_rollover_postfix_qualification_authorization() is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["rolloverRecoveryEpoch"] == 4
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
+    assert watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state["rolloverRecoveryState"] == "RECOVERING"
+    assert watcher.state["rolloverMaintenanceState"] == "IN_PROGRESS"
+    assert watcher.state["rolloverInProgress"] is True
+    assert watcher.state["rolloverDue"] is True and watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverTransactionId"] == "7fdbd798659f42295a18dd2d"
+    assert watcher.state["rolloverTransactionTaskId"] == watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert watcher.state["discussionPauseActive"] is True
+    assert watcher.discussion_pause_active() is True
+    assert watcher.state["rolloverLegacyHandoverReemissionAttemptedEpoch"] == 3
+    assert watcher.state["rolloverDiagnosticRetryAuthorization"]["newEpoch"] == 3
+    assert watcher.state["rolloverPostfixQualificationAuthorization"]["failedEpoch"] == 3
+    assert watcher.state["rolloverPostfixQualificationAuthorization"]["qualificationEpoch"] == 4
+    assert watcher.state["rolloverPostfixQualificationAuthorization"]["executorLaunchAuthorized"] is False
+    assert prompt.read_bytes() == prompt_before
+    assert diagnostic.read_bytes() == diagnostic_before
+    assert launches == []
+
+    # The qualification itself cannot proceed through the pause; only explicit
+    # F10 releases it, after which the epoch-4 one-shot may be used once.
+    controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
+    assert controller.dispatch("F10") is True
+    assert watcher.discussion_pause_active() is False
+
+    class Bridge:
+        def __init__(self): self.sent = []
+        def assistant_baseline(self): return {"count": 2, "text_hash": "baseline"}
+        def submit_result_bounded(self, message): self.sent.append(message)
+        def wait_for_new_response(self, _baseline, poll_interval):
+            return {"state": "COMPLETED", "text": (
+                "Exact legacy handover taskId=000103\nRollover transaction ID: 7fdbd798659f42295a18dd2d\n"
+                "ARCHITECT_HANDOVER_READY"
+            )}
+
+    bridge = Bridge()
+    status, _response = watcher.session_rollover._request_legacy_handover_reemission_once(bridge, "000103")
+    assert status == "VALIDATED"
+    assert len(bridge.sent) == 1
+    repeated_status, _ = watcher.session_rollover._request_legacy_handover_reemission_once(bridge, "000103")
+    assert repeated_status == "ALREADY_ATTEMPTED"
+    assert len(bridge.sent) == 1
+    assert watcher.state["rolloverRecoveryEpoch"] == 4
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
+    assert launches == []
+    assert watcher.consume_rollover_postfix_qualification_authorization() is False
+    assert watcher.state["rolloverRecoveryEpoch"] == 4
+    assert prompt.read_text(encoding="utf-8") == prompt_text
