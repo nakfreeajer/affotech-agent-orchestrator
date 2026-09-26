@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
+import textwrap
 
 import pytest
 
@@ -256,6 +257,78 @@ def test_request_handover_requires_safe_boundary_and_prompt():
     )
     assert decide(value).action is RolloverAction.REQUEST_HANDOVER
     assert decide(value, obs(current_prompt_available=False)).action is RolloverAction.BLOCK_EXECUTOR_LAUNCH
+
+
+def _function_node(source: str, name: str) -> ast.FunctionDef:
+    tree = ast.parse(textwrap.dedent(source))
+    return next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    names = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            names.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            names.add(child.attr)
+    return names
+
+
+def _assert_delegated(source: str, function_name: str, required_call: str) -> None:
+    node = _function_node(source, function_name)
+    calls = _called_names(node)
+    assert required_call in calls, f"{function_name} must delegate to {required_call}"
+
+
+def test_rollover_transition_authority_structure_is_delegated():
+    source = inspect.getsource(watcher_module)
+    _assert_delegated(source, "run_next_prompt_ready_once", "_evaluate_public_rollover_boundary")
+    _assert_delegated(source, "dispatch_next_prompt_once", "_evaluate_public_rollover_boundary")
+    _assert_delegated(source, "deferred_rollover_passive_wait_required", "_evaluate_public_rollover_boundary")
+    _assert_delegated(source, "reconciliation_backoff_wait_required", "_evaluate_public_rollover_boundary")
+    _assert_delegated(source, "_automatic_recovery_epoch_eligible", "_evaluate_public_rollover_boundary")
+    for name in (
+        "_terminal_same_task_transaction_eligible",
+        "_retire_stale_transaction_for_task",
+        "_revive_terminal_delivered_transaction",
+        "request_if_due",
+    ):
+        _assert_delegated(source, name, "rollover_transaction_lifecycle_action")
+
+    evaluator_source = inspect.getsource(evaluate_rollover_state)
+    lifecycle_source = inspect.getsource(watcher_module.rollover_transaction_lifecycle_action)
+    assert "7fdbd798659f42295a18dd2d" not in evaluator_source
+    assert "000103" not in evaluator_source
+    assert "7fdbd798659f42295a18dd2d" not in lifecycle_source
+    assert "000103" not in lifecycle_source
+
+
+def test_rollover_transition_guard_detects_synthetic_duplicate_cooldown_authority():
+    bad = """
+    def deferred_rollover_passive_wait_required(watcher):
+        return watcher.state.get('rolloverAutomaticRecoveryNextEligibleAt', 0) > time.time()
+    """
+    with pytest.raises(AssertionError):
+        _assert_delegated(bad, "deferred_rollover_passive_wait_required", "_evaluate_public_rollover_boundary")
+
+
+def test_rollover_transition_guard_detects_synthetic_duplicate_reconciliation_authority():
+    bad = """
+    def reconciliation_backoff_wait_required(watcher):
+        state = watcher.state
+        return state.get('rolloverRecoveryRetryAfter', 0) > time.time()
+    """
+    with pytest.raises(AssertionError):
+        _assert_delegated(bad, "reconciliation_backoff_wait_required", "_evaluate_public_rollover_boundary")
+
+
+def test_rollover_transition_guard_protects_lifecycle_delegation():
+    bad = """
+    def _terminal_same_task_transaction_eligible(state, task_id):
+        return state.get('rolloverTransactionTaskId') == task_id
+    """
+    with pytest.raises(AssertionError):
+        _assert_delegated(bad, "_terminal_same_task_transaction_eligible", "rollover_transaction_lifecycle_action")
 
 
 def test_known_current_public_entry_path_reaches_expired_recovery():
