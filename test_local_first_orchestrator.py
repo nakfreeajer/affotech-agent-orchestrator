@@ -1707,6 +1707,10 @@ def test_memory_due_failed_rollover_blocks_next_prompt_dispatch(tmp_path, monkey
         watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
     )
     assert process is None
+    assert watcher.state["rolloverPending"] is True
+    process = watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: launches.append(1) or Process(), "endpoint", lambda: False
+    )
     assert maintenance_calls == [1]
     assert launches == []
 
@@ -1733,6 +1737,10 @@ def test_completed_architect_response_samples_before_next_prompt_dispatch(tmp_pa
     monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: order.append("rollover") or False)
     class Process:
         pid = 7002
+    assert watcher_module.dispatch_next_prompt_once(
+        watcher, lambda *_args: order.append("launch") or Process(), "endpoint", lambda: False
+    ) is None
+    assert watcher.state["rolloverPending"] is True
     assert watcher_module.dispatch_next_prompt_once(
         watcher, lambda *_args: order.append("launch") or Process(), "endpoint", lambda: False
     ) is None
@@ -1866,6 +1874,11 @@ def test_legacy_rollover_cutout_rederives_memory_authority(tmp_path, monkeypatch
     assert watcher.state["rolloverDue"] is True
     assert watcher.state["rolloverTrigger"] == "MEMORY_THRESHOLD"
     assert watcher.state["rolloverPending"] is False
+    watcher.state.update({
+        "rolloverPending": True,
+        "rolloverMaintenanceState": "IN_PROGRESS",
+        "rolloverRecoveryState": "PENDING",
+    })
 
     maintenance_calls = []
     monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: maintenance_calls.append(1) or False)
@@ -2236,11 +2249,12 @@ def test_deferred_rollover_gets_fresh_transaction_and_rejects_stale_handover(tmp
     monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1) or type("Process", (), {"pid": 4100})())
     assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
     assert launches == []
-    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state.get("humanRequiredReason") == "ROLLOVER_EVALUATOR_RECOVERY_EPOCH_BUDGET_INVALID"
 
     watcher.state.update({
         "state": "NEXT_PROMPT_READY", "taskId": "000041", "lastCompletedTaskId": "000041",
         "nextTaskId": "000042", "nextPromptPath": str(prompt_b), "rolloverDue": True,
+        "humanRequiredReason": None,
         "rolloverPending": True, "rolloverMaintenanceState": "DEFERRED",
         "rolloverDeferredForTaskId": "000041", "rolloverHandoverSendState": "UNSENT",
         "handoverRequested": False, "architectResponseCount": 30,
@@ -2359,7 +2373,7 @@ def _next_prompt_ready_fixture(tmp_path, *, due=False):
     prompt.write_text("next bounded task", encoding="utf-8")
     watcher.state.update({"state": "NEXT_PROMPT_READY", "taskId": "000040", "nextTaskId": "000041",
                           "nextPromptPath": str(prompt), "targetWorktree": str(tmp_path / "worktree"),
-                          "rolloverDue": due, "architectConversationId": "current"})
+                          "rolloverDue": due, "rolloverPending": due, "architectConversationId": "current"})
     watcher.save()
     return watcher, prompt
 
@@ -2419,12 +2433,17 @@ def test_next_prompt_ready_deferred_rollover_enters_resident_passive_wait(tmp_pa
             "rolloverMaintenanceState": "DEFERRED",
             "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
             "rolloverDue": True,
+            "rolloverAutomaticRecoveryEpochCount": 1,
+            "rolloverAutomaticRecoveryMaxEpochs": 3,
+            "rolloverAutomaticRecoveryNextEligibleAt": 100,
+            "rolloverRecoveryState": "DEFERRED",
         })
         return False
 
     monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", failed_rollover)
     monkeypatch.setattr(watcher, "launch_next", lambda _launch: launches.append(1))
     monkeypatch.setattr(watcher_module.time, "sleep", lambda interval: sleeps.append(interval))
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
     monkeypatch.setattr(watcher, "_load_state", lambda: watcher.state)
 
     for _ in range(3):
@@ -2432,7 +2451,7 @@ def test_next_prompt_ready_deferred_rollover_enters_resident_passive_wait(tmp_pa
 
     assert service_calls == [1]
     assert launches == []
-    assert len(sleeps) == 3
+    assert len(sleeps) == 2
     assert all(interval == 2.0 for interval in sleeps)
     assert watcher.state["state"] == "NEXT_PROMPT_READY"
     assert watcher.state["nextTaskId"] == "000041"
@@ -2644,6 +2663,10 @@ def test_operator_restart_deferred_rollover_gets_one_attempt_then_successful_dis
     watcher.state.update({
         "rolloverMaintenanceState": "DEFERRED",
         "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
+        "rolloverAutomaticRecoveryEpochCount": 1,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverAutomaticRecoveryNextEligibleAt": 0,
+        "rolloverRecoveryState": "DEFERRED",
     })
     watcher._operator_restart_rollover_recovery_available = True
     events = []
@@ -2672,6 +2695,10 @@ def test_operator_restart_failed_rollover_returns_to_passive_wait(tmp_path, monk
     watcher.state.update({
         "rolloverMaintenanceState": "DEFERRED",
         "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
+        "rolloverAutomaticRecoveryEpochCount": 1,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverAutomaticRecoveryNextEligibleAt": 0,
+        "rolloverRecoveryState": "DEFERRED",
     })
     watcher._operator_restart_rollover_recovery_available = True
     service_calls = []
@@ -2684,17 +2711,22 @@ def test_operator_restart_failed_rollover_returns_to_passive_wait(tmp_path, monk
             "rolloverMaintenanceState": "DEFERRED",
             "rolloverDeferredForTaskId": watcher.state["nextTaskId"],
             "rolloverDue": True,
+            "rolloverAutomaticRecoveryEpochCount": 1,
+            "rolloverAutomaticRecoveryMaxEpochs": 3,
+            "rolloverAutomaticRecoveryNextEligibleAt": 100,
+            "rolloverRecoveryState": "DEFERRED",
         })
         return False
 
     monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", failed_rollover)
     monkeypatch.setattr(watcher_module.time, "sleep", lambda interval: sleeps.append(interval))
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
     monkeypatch.setattr(watcher, "_load_state", lambda: watcher.state)
 
     assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
     assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: None, "endpoint", lambda: False) is None
     assert service_calls == [1]
-    assert sleeps == [2.0, 2.0]
+    assert sleeps == [2.0]
 
 
 def test_operator_restart_unsent_recovery_reaches_real_request_once(tmp_path, monkeypatch):
@@ -3290,6 +3322,7 @@ def test_next_prompt_ready_live_current_executor_still_blocks_dispatch(tmp_path,
     watcher, _prompt = _next_prompt_ready_fixture(tmp_path, due=True)
     watcher.state.update({"taskId": "000053", "lastCompletedTaskId": "000052", "nextTaskId": "000054",
                           "codexPid": 5300, "executorProcessState": "RUNNING"})
+    watcher.save()
     monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda pid: pid == 5300))
     monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: (_ for _ in ()).throw(AssertionError("must remain blocked before attach"))))
     launches = []

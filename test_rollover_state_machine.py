@@ -6,6 +6,7 @@ import inspect
 
 import pytest
 
+import local_orchestrator_watcher as watcher_module
 from rollover_state_machine import (
     RolloverAction,
     RolloverObservations,
@@ -257,10 +258,7 @@ def test_request_handover_requires_safe_boundary_and_prompt():
     assert decide(value, obs(current_prompt_available=False)).action is RolloverAction.BLOCK_EXECUTOR_LAUNCH
 
 
-@pytest.mark.xfail(strict=True, reason="known duplicated rollover authority; fixed by Commit C cutover")
 def test_known_current_public_entry_path_reaches_expired_recovery():
-    import local_orchestrator_watcher as watcher_module
-
     class FakeWatcher:
         def __init__(self):
             self.state = state(rolloverAutomaticRecoveryNextEligibleAt=1)
@@ -274,9 +272,11 @@ def test_known_current_public_entry_path_reaches_expired_recovery():
     service_called = []
     original_sleep = watcher_module.time.sleep
     original_dispatch = watcher_module.dispatch_next_prompt_once
+    original_passive = watcher_module.passive_deferred_rollover_wait
     try:
         watcher_module.time.sleep = lambda _seconds: None
         watcher_module.dispatch_next_prompt_once = lambda *args, **kwargs: service_called.append(True)
+        watcher_module.passive_deferred_rollover_wait = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("old passive authority was called"))
         watcher_module.run_next_prompt_ready_once(
             watcher,
             lambda *_args: None,
@@ -286,4 +286,112 @@ def test_known_current_public_entry_path_reaches_expired_recovery():
     finally:
         watcher_module.time.sleep = original_sleep
         watcher_module.dispatch_next_prompt_once = original_dispatch
+        watcher_module.passive_deferred_rollover_wait = original_passive
     assert service_called, "expired cooldown should reach the recovery service after Commit C"
+
+
+class _PublicPathWatcher:
+    def __init__(self, value):
+        self.state = value
+        self.reloaded = 0
+        self.saved = 0
+        self.launched = 0
+        self.runtime_logger = None
+        self.runtime_run_id = None
+
+    def _load_state(self):
+        self.reloaded += 1
+        return self.state
+
+    def save(self):
+        self.saved += 1
+
+    def retire_completed_executor_ownership(self):
+        return False
+
+    def launch_next(self, launch):
+        self.launched += 1
+        return launch(self.state.get("nextPromptPath", ""), None)
+
+
+def test_public_path_future_cooldown_waits_without_dispatch(monkeypatch):
+    watcher = _PublicPathWatcher(state(rolloverAutomaticRecoveryNextEligibleAt=100))
+    sleeps = []
+    dispatched = []
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
+    monkeypatch.setattr(watcher_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(watcher_module, "dispatch_next_prompt_once", lambda *args: dispatched.append(True))
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: None, "unused", lambda: False)
+    assert sleeps and 0 < sleeps[0] <= 2.0
+    assert not dispatched
+
+
+def test_public_path_expired_cooldown_reaches_dispatch(monkeypatch):
+    watcher = _PublicPathWatcher(state(rolloverAutomaticRecoveryNextEligibleAt=49))
+    dispatched = []
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
+    monkeypatch.setattr(watcher_module, "dispatch_next_prompt_once", lambda *args: dispatched.append(True))
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: None, "unused", lambda: False)
+    assert dispatched == [True]
+
+
+def test_public_path_reconciliation_deadline_waits_then_reaches_dispatch(monkeypatch):
+    value = state(
+        rolloverMaintenanceState="RECONCILE_PENDING",
+        rolloverInProgress=True,
+        rolloverRecoveryState="RECOVERING",
+        rolloverHandoverRecoveryDisposition="RETRYABLE",
+        rolloverRecoveryRetryAfter=100,
+    )
+    watcher = _PublicPathWatcher(value)
+    dispatched = []
+    sleeps = []
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
+    monkeypatch.setattr(watcher_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(watcher_module, "dispatch_next_prompt_once", lambda *args: dispatched.append(True))
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: None, "unused", lambda: False)
+    assert sleeps and not dispatched
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 101.0)
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: None, "unused", lambda: False)
+    assert dispatched == [True]
+
+
+def test_public_path_observation_mismatch_fails_closed(monkeypatch):
+    watcher = _PublicPathWatcher(fresh_rollover_state())
+    launched = []
+    monkeypatch.setattr(
+        watcher_module,
+        "build_rollover_observations",
+        lambda *_args: obs(safe_boundary_state="RESULT_READY", next_task_id="000201"),
+    )
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: launched.append(True), "unused", lambda: False)
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ROLLOVER_EVALUATOR_SAFE_BOUNDARY_STATE_MISMATCH"
+    assert not launched
+
+
+def test_public_path_discussion_pause_does_not_consume_recovery(monkeypatch):
+    watcher = _PublicPathWatcher(state(rolloverAutomaticRecoveryNextEligibleAt=1, rolloverRecoveryAttemptCount=1))
+    before = copy.deepcopy(watcher.state)
+    dispatched = []
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(watcher_module, "dispatch_next_prompt_once", lambda *args: dispatched.append(True))
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: None, "unused", lambda: True)
+    assert watcher.state == before
+    assert not dispatched
+
+
+def test_public_path_active_executor_and_writer_block(monkeypatch):
+    active = state(rolloverAutomaticRecoveryNextEligibleAt=1, executorProcessState="RUNNING", codexPid=123)
+    watcher = _PublicPathWatcher(active)
+    dispatched = []
+    monkeypatch.setattr(watcher_module.LocalWatcher, "process_alive", staticmethod(lambda _pid: True))
+    monkeypatch.setattr(watcher_module.time, "time", lambda: 50.0)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(watcher_module, "dispatch_next_prompt_once", lambda *args: dispatched.append(True))
+    watcher_module.run_next_prompt_ready_once(watcher, lambda *_: None, "unused", lambda: False)
+    assert not dispatched
+    writer = _PublicPathWatcher(state(rolloverAutomaticRecoveryNextEligibleAt=1, governedExecutorActiveWriter=True))
+    watcher_module.run_next_prompt_ready_once(writer, lambda *_: None, "unused", lambda: False)
+    assert not dispatched

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from rollover_state_machine import RolloverAction, RolloverDecision, RolloverObservations, evaluate_rollover_state
+
 COMPLETE = "ARCHITECT_RESPONSE_COMPLETE"
 BEGIN = "EXECUTOR_PROMPT_BEGIN"
 END = "EXECUTOR_PROMPT_END"
@@ -7226,6 +7228,35 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
         if tracer:
             tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="NOT_NEXT_PROMPT_READY", rolloverServiceCalled=False)
         return None
+    decision = _evaluate_public_rollover_boundary(watcher, paused)
+    if decision.action in {
+        RolloverAction.WAIT_DISCUSSION,
+        RolloverAction.WAIT_EXECUTOR,
+        RolloverAction.WAIT_ACTIVE_WRITER,
+        RolloverAction.WAIT_ARCHITECT,
+        RolloverAction.WAIT_COOLDOWN,
+        RolloverAction.WAIT_RECONCILIATION,
+        RolloverAction.BLOCK_EXECUTOR_LAUNCH,
+    }:
+        runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state,
+                    gateResult="BLOCK", reason=f"ROLLOVER_EVALUATOR_{decision.reason}",
+                    evaluatorAction=decision.action.value, rolloverServiceCalled=False)
+        _execute_public_rollover_decision_wait(watcher, decision, logger, run_id)
+        return None
+    if decision.action is RolloverAction.HUMAN_REQUIRED:
+        runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state,
+                    gateResult="BLOCK", reason=f"ROLLOVER_EVALUATOR_{decision.reason}",
+                    evaluatorAction=decision.action.value, rolloverServiceCalled=False)
+        _fail_closed_public_rollover(watcher, decision)
+        return None
+    if decision.action is RolloverAction.NORMALIZE_STATE:
+        runtime_log(logger, run_id, "CODEX_DISPATCH_GATE", watcher.state,
+                    gateResult="BLOCK", reason="ROLLOVER_EVALUATOR_NORMALIZE_STATE",
+                    evaluatorAction=decision.action.value, rolloverServiceCalled=False)
+        if decision.normalization == "SET_PENDING_ONLY_AFTER_SAFE_BOUNDARY_VALIDATION":
+            watcher.state["rolloverPending"] = True
+            watcher.save()
+        return None
     watcher.retire_completed_executor_ownership()
     active_pid = watcher.state.get("codexPid") or watcher.state.get("active_codex_pid")
     if (watcher.state.get("executorProcessState") == "RUNNING"
@@ -7399,6 +7430,81 @@ def passive_deferred_rollover_wait(
     return True
 
 
+def build_rollover_observations(
+    watcher: LocalFirstOrchestrator,
+    paused: Callable[[], bool],
+    safe_boundary_state: str | None = None,
+) -> RolloverObservations:
+    """Collect facts for the pure evaluator without deciding an action."""
+    state = watcher.state
+    active_pid = state.get("codexPid") or state.get("active_codex_pid")
+    process_alive = False
+    if active_pid and state.get("executorProcessState") == "RUNNING":
+        try:
+            process_alive = bool(LocalWatcher.process_alive(int(active_pid)))
+        except (TypeError, ValueError):
+            process_alive = False
+    session_matches = (
+        state.get("executorSessionId", AFFOTECH_EXECUTOR_SESSION_ID) == AFFOTECH_EXECUTOR_SESSION_ID
+        and state.get("executorSessionMode", "PERSISTENT") == "PERSISTENT"
+    )
+    owns_boundary = process_alive and bool(
+        state.get("governedExecutorActiveWriter") is True
+        or state.get("executorActiveWriter") is True
+        or session_matches
+    )
+    return RolloverObservations(
+        discussion_paused=bool(paused()),
+        safe_boundary_state=safe_boundary_state or state.get("state"),
+        next_task_id=state.get("nextTaskId"),
+        executor_process_alive=process_alive,
+        executor_owns_current_boundary=owns_boundary,
+        governed_executor_active_writer=bool(
+            state.get("governedExecutorActiveWriter") is True
+            or state.get("executorActiveWriter") is True
+        ),
+        architect_generating=bool(state.get("architectGenerating") is True),
+        current_prompt_available=bool(state.get("nextPromptPath")),
+    )
+
+
+def _evaluate_public_rollover_boundary(
+    watcher: LocalFirstOrchestrator,
+    paused: Callable[[], bool],
+    now: float | None = None,
+) -> RolloverDecision:
+    return evaluate_rollover_state(
+        watcher.state,
+        build_rollover_observations(watcher, paused, "NEXT_PROMPT_READY"),
+        time.time() if now is None else now,
+    )
+
+
+def _execute_public_rollover_decision_wait(
+    watcher: LocalFirstOrchestrator,
+    decision: RolloverDecision,
+    logger: logging.Logger | None,
+    run_id: str | None,
+) -> None:
+    interval = max(0.25, float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0")))
+    if decision.action in {RolloverAction.WAIT_COOLDOWN, RolloverAction.WAIT_RECONCILIATION} and decision.wait_until is not None:
+        wait_seconds = max(0.25, min(interval, max(0.0, decision.wait_until - time.time())))
+    else:
+        wait_seconds = interval
+    runtime_log(logger, run_id, "ROLLOVER_EVALUATOR_WAIT", watcher.state, action=decision.action.value, reason=decision.reason, waitSeconds=wait_seconds)
+    time.sleep(wait_seconds)
+    watcher.state = watcher._load_state()
+
+
+def _fail_closed_public_rollover(watcher: LocalFirstOrchestrator, decision: RolloverDecision) -> None:
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": f"ROLLOVER_EVALUATOR_{decision.reason}",
+    })
+    watcher.save()
+    runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "HUMAN_REQUIRED", watcher.state, reason=f"ROLLOVER_EVALUATOR_{decision.reason}")
+
+
 def run_next_prompt_ready_once(
     watcher: LocalFirstOrchestrator,
     launch: Callable[[str, Path], Any],
@@ -7407,12 +7513,28 @@ def run_next_prompt_ready_once(
     logger: logging.Logger | None = None,
     run_id: str | None = None,
 ) -> Any:
-    """Run one NEXT_PROMPT_READY iteration, including deferred passive waiting."""
-    if passive_deferred_rollover_wait(watcher, logger, run_id):
+    """Run one NEXT_PROMPT_READY iteration through the canonical evaluator."""
+    decision = _evaluate_public_rollover_boundary(watcher, paused)
+    if decision.action in {
+        RolloverAction.WAIT_DISCUSSION,
+        RolloverAction.WAIT_EXECUTOR,
+        RolloverAction.WAIT_ACTIVE_WRITER,
+        RolloverAction.WAIT_ARCHITECT,
+        RolloverAction.WAIT_COOLDOWN,
+        RolloverAction.WAIT_RECONCILIATION,
+        RolloverAction.BLOCK_EXECUTOR_LAUNCH,
+    }:
+        _execute_public_rollover_decision_wait(watcher, decision, logger, run_id)
+        return None
+    if decision.action is RolloverAction.HUMAN_REQUIRED:
+        _fail_closed_public_rollover(watcher, decision)
+        return None
+    if decision.action is RolloverAction.NORMALIZE_STATE:
+        if decision.normalization == "SET_PENDING_ONLY_AFTER_SAFE_BOUNDARY_VALIDATION":
+            watcher.state["rolloverPending"] = True
+            watcher.save()
         return None
     process = dispatch_next_prompt_once(watcher, launch, endpoint, paused, logger, run_id)
-    if process is None:
-        passive_deferred_rollover_wait(watcher, logger, run_id)
     return process
 
 
