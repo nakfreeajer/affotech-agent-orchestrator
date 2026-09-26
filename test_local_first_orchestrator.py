@@ -6798,6 +6798,88 @@ def test_post_discussion_missing_envelope_repairs_once_and_accepts_correction(tm
     assert watcher.state["state"] == "IDLE"
 
 
+def _staged_prompt_missing_envelope_fixture(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = watcher.prompts_dir / "000103.txt"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt_text = "INVOICE.PAYMENT.POSTSAVE.EXACT.RECEIPT.UX.HANDOFF.1A\nexact staged task\n"
+    prompt.write_text(prompt_text, encoding="utf-8")
+    worktree = tmp_path / "task-000103-worktree"
+    worktree.mkdir()
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000102", "lastCompletedTaskId": "000102",
+        "nextTaskId": "000103", "nextPromptPath": str(prompt),
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": False,
+        "handoverRequested": True, "handoverReady": False,
+        "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "DEFERRED",
+        "rolloverRecoveryState": "DEFERRED", "rolloverRecoveryAttemptCount": 2,
+        "rolloverAutomaticRecoveryEpochCount": 1, "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverTransactionId": "7fdbd798659f42295a18dd2d",
+        "rolloverTransactionTaskId": "000103", "rolloverAttemptedForTaskId": "000103",
+        "rolloverRecoveryTerminalReason": "ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "discussionPauseActive": True, "architectDiscussionBaseline": {"count": 1, "text_hash": "before"},
+        "taskWorktrees": {"000103": {"taskId": "000103", "worktreePath": str(worktree)}},
+    })
+    watcher.save()
+    watcher._write_discussion_pause_marker(True)
+    return watcher, prompt, prompt_text
+
+
+def test_missing_envelope_exact_staged_prompt_repairs_without_regeneration(tmp_path):
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
+    watcher.request_discussion_resume()
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+    missing = "Proceeding with the already prepared exact Executor task."
+    bridge.entries.append(_discussion_bridge_response(missing, "missing-envelope"))
+    assert watcher.reconcile_post_discussion_response(bridge, missing) == "REPAIR_REQUESTED"
+    corrected = envelope("000103", prompt=prompt_text)
+    bridge.entries.append(_discussion_bridge_response(corrected, "repair"))
+    before_hash = hashlib.sha256(prompt.read_bytes()).hexdigest()
+    assert watcher.reconcile_post_discussion_response(bridge, corrected) == "EXECUTE"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["nextTaskId"] == "000103"
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest() == before_hash
+    assert bridge.sent and len(bridge.sent) == 1
+
+
+@pytest.mark.parametrize("mutation", ["task", "transaction", "path", "missing"])
+def test_missing_envelope_staged_prompt_identity_mismatch_fails_closed(tmp_path, mutation):
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
+    watcher.request_discussion_resume()
+    missing = "Already prepared prompt, but no machine envelope."
+    bridge.entries.append(_discussion_bridge_response(missing, "missing-envelope"))
+    assert watcher.reconcile_post_discussion_response(bridge, missing) == "REPAIR_REQUESTED"
+    if mutation == "task":
+        corrected = envelope("000104", prompt=prompt_text)
+        bridge.entries.append(_discussion_bridge_response(corrected, "wrong-task"))
+    elif mutation == "transaction":
+        watcher.state["rolloverTransactionId"] = "different-transaction"
+        corrected = envelope("000103", prompt=prompt_text)
+        bridge.entries.append(_discussion_bridge_response(corrected, "wrong-transaction"))
+    elif mutation == "path":
+        watcher.state["nextPromptPath"] = str(tmp_path / "other.txt")
+        corrected = envelope("000103", prompt=prompt_text)
+        bridge.entries.append(_discussion_bridge_response(corrected, "wrong-path"))
+    else:
+        prompt.unlink()
+        corrected = envelope("000103", prompt=prompt_text)
+        bridge.entries.append(_discussion_bridge_response(corrected, "missing-prompt"))
+    assert watcher.reconcile_post_discussion_response(bridge, corrected) == "FAILED"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"
+
+
+def test_missing_envelope_reproduction_at_accepted_head_was_not_required_path(tmp_path):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state["discussionPauseActive"] = False
+    bridge = _PostDiscussionBridge([])
+    assert watcher.reconcile_post_discussion_response(bridge, "complete prose without envelope") == "NOT_REQUIRED"
+    assert bridge.sent == []
+
+
 def test_post_discussion_repair_failure_is_durable_and_prevents_second_repair(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     watcher.state.update({"state": "HUMAN_REQUIRED", "taskId": "task-discuss", "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED", "architectDiscussionBaseline": {"count": 1, "text_hash": "before"}})

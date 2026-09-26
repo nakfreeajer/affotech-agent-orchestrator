@@ -109,6 +109,7 @@ class DiagnosticTracer:
             "postDiscussionEnvelopeRequired", "postDiscussionResumeEpoch", "postDiscussionProtocolTaskId",
             "postDiscussionEnvelopeRepairAttempted", "postDiscussionEnvelopeRepairAwaiting",
             "postDiscussionEnvelopeRepairTaskId", "postDiscussionEnvelopeRepairEpoch", "postDiscussionProtocolFailure",
+            "postDiscussionProtocolTransactionId",
             "postDiscussionResumePauseEpoch",
         )
         return {key: current.get(key) for key in keys}
@@ -4895,7 +4896,8 @@ class LocalFirstOrchestrator:
     def _restore_machine_protocol_after_discussion(self) -> None:
         """Durably create one machine-protocol epoch for the current task."""
         with self._state_lock:
-            task_id = str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
+            staged_task_id = self._exact_staged_prompt_recovery_task()
+            task_id = staged_task_id or str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
             needs_protocol = (
                 bool(task_id)
                 and self.state.get("state") == "HUMAN_REQUIRED"
@@ -4909,7 +4911,7 @@ class LocalFirstOrchestrator:
                 and
                 self.state.get("state") == "ARCHITECT_RUNNING"
                 and self.state.get("postDiscussionEnvelopeRequired") is True
-            )
+            ) or bool(staged_task_id and self.state.get("discussionPauseActive"))
             prior_state = dict(self.state)
             if not needs_protocol:
                 changed = bool(self.state.get("postDiscussionEnvelopeRequired") or self.state.get("postDiscussionEnvelopeRepairAwaiting"))
@@ -4941,6 +4943,7 @@ class LocalFirstOrchestrator:
                     "postDiscussionEnvelopeRepairEpoch": epoch,
                     "postDiscussionEnvelopeRepairAwaiting": False,
                     "postDiscussionProtocolTaskId": task_id,
+                    "postDiscussionProtocolTransactionId": self.state.get("rolloverTransactionId") if staged_task_id else None,
                     "postDiscussionProtocolBaseline": self.state.get("architectDiscussionBaseline") or self.state.get("architectBaseline"),
                     "postDiscussionResumePauseEpoch": pause_epoch,
                 })
@@ -6320,9 +6323,80 @@ class LocalFirstOrchestrator:
                     return True
         return False
 
+    def _exact_staged_prompt_recovery_task(self) -> str | None:
+        """Return the pending task only when its staged prompt identity is exact."""
+        state = self.state
+        task_id = str(state.get("nextTaskId") or "").strip()
+        transaction_task = str(state.get("rolloverTransactionTaskId") or "").strip()
+        prompt_value = state.get("nextPromptPath")
+        if not (
+            state.get("state") in {"NEXT_PROMPT_READY", "ARCHITECT_RUNNING"}
+            and (state.get("state") == "NEXT_PROMPT_READY" or state.get("postDiscussionEnvelopeRepairAwaiting") is True)
+            and state.get("rolloverDue") is True
+            and state.get("rolloverPending") is True
+            and state.get("handoverRequested") is True
+            and state.get("rolloverTransactionId")
+            and transaction_task == task_id
+            and prompt_value
+            and task_id
+        ):
+            return None
+        path = Path(str(prompt_value))
+        expected = self.prompts_dir / f"{task_id}.txt"
+        try:
+            if path.resolve() != expected.resolve() or not path.is_file() or path.stat().st_size == 0:
+                return None
+            record = state.get("taskWorktrees", {}).get(task_id)
+            if not isinstance(record, dict) or str(record.get("taskId") or "") != task_id:
+                return None
+            if not record.get("worktreePath") or not Path(str(record["worktreePath"])).is_dir():
+                return None
+            path.read_bytes()
+        except (OSError, RuntimeError, TypeError):
+            return None
+        return task_id
+
+    def _accept_exact_staged_prompt_envelope(self, response: str, task_id: str) -> dict[str, str]:
+        """Accept only a wrapper around the already-persisted staged prompt."""
+        if (
+            self._exact_staged_prompt_recovery_task() != task_id
+            or str(self.state.get("postDiscussionProtocolTransactionId") or "")
+            != str(self.state.get("rolloverTransactionId") or "")
+        ):
+            raise ValueError("ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID")
+        decision = parse_orchestrator_result(response, task_id)
+        if decision["action"] != "EXECUTE":
+            raise ValueError("ARCHITECT_STAGED_PROMPT_ENVELOPE_INVALID")
+        prompt = Path(str(self.state["nextPromptPath"])).read_text(encoding="utf-8")
+        parsed_prompt = decision["prompt"].replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+        staged_prompt = prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+        if hashlib.sha256(parsed_prompt.encode("utf-8")).hexdigest() != hashlib.sha256(staged_prompt.encode("utf-8")).hexdigest():
+            raise ValueError("ARCHITECT_STAGED_PROMPT_HASH_MISMATCH")
+        fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        consumed = self.state.setdefault("consumedArchitectResponses", {})
+        if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:
+            return {"action": "DUPLICATE", "taskId": task_id}
+        self.state.update({
+            "architectResultFingerprint": fingerprint,
+            "state": "NEXT_PROMPT_READY",
+            "humanRequiredReason": None,
+            "postDiscussionEnvelopeRequired": False,
+            "postDiscussionEnvelopeRepairAwaiting": False,
+            "postDiscussionProtocolFailure": None,
+        })
+        consumed[fingerprint] = {
+            "taskId": task_id,
+            "classification": decision["classification"],
+            "action": decision["action"],
+            "state": "RECEIVED",
+            "origin": "POST_DISCUSSION_STAGED_PROMPT_REPAIR",
+        }
+        self.save()
+        return decision
+
     def request_post_discussion_envelope_repair(self, bridge: Any) -> bool:
         """Request exactly one formatting-only envelope correction for this epoch."""
-        task_id = str(self.state.get("taskId") or "")
+        task_id = str(self.state.get("postDiscussionProtocolTaskId") or self.state.get("taskId") or "")
         epoch = int(self.state.get("postDiscussionResumeEpoch", 0) or 0)
         if (not self.state.get("postDiscussionEnvelopeRequired") or not task_id
                 or self.state.get("postDiscussionEnvelopeRepairAttempted")
@@ -6374,16 +6448,20 @@ class LocalFirstOrchestrator:
             and isinstance(baseline.get("count"), int) and baseline.get("count") >= 0
             and isinstance(baseline.get("text_hash"), str) and bool(baseline.get("text_hash"))
         ):
-            task_id = str(self.state.get("taskId") or "")
+            task_id = str(self.state.get("postDiscussionProtocolTaskId") or self.state.get("taskId") or "")
             self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE"})
             self.save()
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="BASELINE_UNPROVEN")
             return "FAILED"
         if not completed or not self._post_discussion_baseline_advanced(bridge, response):
             return "WAIT"
-        task_id = str(self.state.get("taskId") or "")
+        task_id = str(self.state.get("postDiscussionProtocolTaskId") or self.state.get("taskId") or "")
+        staged_task_id = self._exact_staged_prompt_recovery_task()
         try:
-            decision = self.accept_architect_response(response)
+            if staged_task_id and staged_task_id == task_id:
+                decision = self._accept_exact_staged_prompt_envelope(response, staged_task_id)
+            else:
+                decision = self.accept_architect_response(response)
         except (ValueError, RuntimeError):
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION", self.state, taskId=task_id)
             self.state.update({"humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION"})
