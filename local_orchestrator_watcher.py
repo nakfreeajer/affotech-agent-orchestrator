@@ -7705,14 +7705,15 @@ def _legacy_handover_must_precede_post_discussion_gate(watcher: LocalFirstOrches
         and state.get("state") == "NEXT_PROMPT_READY"
         and state.get("rolloverDue") is True
         and state.get("rolloverPending") is True
-        and state.get("rolloverInProgress") is False
+        and type(state.get("rolloverInProgress")) is bool
         and state.get("handoverRequested") is True
         and state.get("rolloverHandoverSendState") in {"PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}
-        and state.get("rolloverMaintenanceState") == "DEFERRED"
+        and state.get("rolloverMaintenanceState") in {"DEFERRED", "IN_PROGRESS", "RECONCILE_PENDING"}
         and task_id
         and str(state.get("rolloverTransactionTaskId") or "") == task_id
         and str(state.get("postDiscussionProtocolTaskId") or "") == task_id
         and str(state.get("postDiscussionProtocolTransactionId") or "") == str(state.get("rolloverTransactionId") or "")
+        and str(state.get("postDiscussionProtocolRolloverCommittedTransactionId") or "") != str(state.get("rolloverTransactionId") or "")
         and _legacy_handover_compatibility_allowed(state)
         and watcher._exact_staged_prompt_recovery_task() == task_id
     )
