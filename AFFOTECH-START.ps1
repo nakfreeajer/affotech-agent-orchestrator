@@ -1,6 +1,7 @@
 param(
     [switch]$StatusOnly,
-    [string]$AuthorizeRetry
+    [string]$AuthorizeRetry,
+    [switch]$AuthorizeRolloverDiagnosticRetry
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +12,10 @@ $Bootstrap = Join-Path $Repository "crash_recovery_bootstrap.py"
 $Endpoint = "http://127.0.0.1:9333"
 $ArchitectProfile = "C:\BraveDebug\Architect"
 $ArchitectPort = 9333
+
+if ($AuthorizeRetry -and $AuthorizeRolloverDiagnosticRetry) {
+    throw "Choose only one authorization surface; Executor retry and rollover diagnostic retry are separate."
+}
 
 function Invoke-Recovery([string[]]$Extra) {
     $raw = & $Python $Bootstrap --repository $Repository --state-dir $StateDir @Extra
@@ -40,7 +45,7 @@ function Show-Summary($Report, [string]$AuthorizationMode) {
 }
 
 $Report = Invoke-Recovery @()
-$AuthorizationMode = if ($AuthorizeRetry) { "AUTHORIZE_RETRY_$AuthorizeRetry" } else { "NONE" }
+$AuthorizationMode = if ($AuthorizeRetry) { "AUTHORIZE_EXECUTOR_RETRY_$AuthorizeRetry" } elseif ($AuthorizeRolloverDiagnosticRetry) { "AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY" } else { "NONE" }
 Show-Summary $Report $AuthorizationMode
 
 if ($Report.discovery.watcherRunning) {
@@ -48,9 +53,20 @@ if ($Report.discovery.watcherRunning) {
     exit 0
 }
 
+$RolloverRetryReport = $null
+if ($AuthorizeRolloverDiagnosticRetry) {
+    $RolloverRetryReport = Invoke-Recovery @("--validate-rollover-diagnostic-retry")
+    Write-Host "Rollover diagnostic retry eligible: $($RolloverRetryReport.rolloverDiagnosticRetryEligible) reason=$($RolloverRetryReport.rolloverDiagnosticRetryReason)"
+}
+
 if ($StatusOnly) {
     Write-Host "STATUS_ONLY: no browser, watcher, authorization, or state mutation performed."
     exit 0
+}
+
+if ($AuthorizeRolloverDiagnosticRetry -and -not $RolloverRetryReport.rolloverDiagnosticRetryEligible) {
+    Write-Host "BLOCKED: $($RolloverRetryReport.rolloverDiagnosticRetryReason)"
+    exit 3
 }
 
 if ($AuthorizeRetry) {
@@ -74,8 +90,8 @@ if ($Probe -and $Probe.recoveryClassification -eq "ARCHITECT_RECOVERY_INCONCLUSI
     exit 4
 }
 
-if ($Report.recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION" -and -not $AuthorizeRetry) {
-    Write-Host "HUMAN_REQUIRED: use -AuthorizeRetry <current taskId> only after human review."
+if ($Report.recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION" -and -not $AuthorizeRetry -and -not $AuthorizeRolloverDiagnosticRetry) {
+    Write-Host "HUMAN_REQUIRED: no automatic action. -AuthorizeRetry is only for eligible Executor retries; the separate -AuthorizeRolloverDiagnosticRetry applies only to the exact preserved legacy incident."
     exit 5
 }
 
@@ -108,12 +124,17 @@ if ($answer -ne "START") { Write-Host "No action taken."; exit 0 }
 
 Write-Host "Starting resident watcher visibly in this terminal."
 $oldAuth = $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY
+$oldRolloverAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY
 try {
     if ($AuthorizeRetry) { $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY = $AuthorizeRetry }
     else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY -ErrorAction SilentlyContinue }
+    if ($AuthorizeRolloverDiagnosticRetry) { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY = "7fdbd798659f42295a18dd2d" }
+    else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY -ErrorAction SilentlyContinue }
     & $Python (Join-Path $Repository "local_orchestrator_watcher.py")
     exit $LASTEXITCODE
 } finally {
     if ($null -eq $oldAuth) { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY -ErrorAction SilentlyContinue }
     else { $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY = $oldAuth }
+    if ($null -eq $oldRolloverAuth) { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY -ErrorAction SilentlyContinue }
+    else { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY = $oldRolloverAuth }
 }

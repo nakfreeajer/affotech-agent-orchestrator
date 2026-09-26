@@ -6647,15 +6647,18 @@ class LocalFirstOrchestrator:
                     return True
         return False
 
-    def _exact_staged_prompt_recovery_task(self) -> str | None:
+    def _exact_staged_prompt_recovery_task(self, allow_human_required: bool = False) -> str | None:
         """Return the pending task only when its staged prompt identity is exact."""
         state = self.state
         task_id = str(state.get("nextTaskId") or "").strip()
         transaction_task = str(state.get("rolloverTransactionTaskId") or "").strip()
         prompt_value = state.get("nextPromptPath")
         if not (
-            state.get("state") in {"NEXT_PROMPT_READY", "ARCHITECT_RUNNING"}
-            and (state.get("state") == "NEXT_PROMPT_READY" or state.get("postDiscussionEnvelopeRepairAwaiting") is True)
+            (state.get("state") in {"NEXT_PROMPT_READY", "ARCHITECT_RUNNING"}
+             or (allow_human_required and state.get("state") == "HUMAN_REQUIRED"
+                 and state.get("humanRequiredReason") == "LEGACY_HANDOVER_REEMISSION_INVALID"))
+            and (state.get("state") == "NEXT_PROMPT_READY" or state.get("postDiscussionEnvelopeRepairAwaiting") is True
+                 or (allow_human_required and state.get("state") == "HUMAN_REQUIRED"))
             and state.get("rolloverDue") is True
             and state.get("rolloverPending") is True
             and state.get("handoverRequested") is True
@@ -6679,6 +6682,139 @@ class LocalFirstOrchestrator:
         except (OSError, RuntimeError, TypeError):
             return None
         return task_id
+
+    def consume_rollover_diagnostic_retry_authorization(self) -> bool:
+        """Consume the wrapper's explicit one-use authorization for the exact legacy incident."""
+        from crash_recovery_bootstrap import (
+            LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256,
+            LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+            _default_process_records,
+            _pid_alive,
+            _session_exists,
+            _session_writer_records,
+            validate_rollover_diagnostic_retry,
+        )
+
+        supplied = os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY")
+        if supplied != LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID:
+            return False
+        records = _default_process_records()
+        watcher_running = any(
+            "local_orchestrator_watcher.py" in str(row.get("CommandLine") or "")
+            and str(row.get("ProcessId")) != str(os.getpid())
+            for row in records
+        )
+        session_id = str(self.state.get("executorSessionId") or "")
+        discovery = {
+            "state": self.state,
+            "stateDir": str(self.state_dir),
+            "watcherRunning": watcher_running,
+            "executorSessionExists": _session_exists(session_id),
+            "activeWriterPresent": bool(_session_writer_records(session_id, records)),
+            "executorPidAlive": _pid_alive(self.state.get("codexPid") or self.state.get("active_codex_pid"), records),
+            "executorPidAliveByField": {
+                "codexPid": _pid_alive(self.state.get("codexPid"), records),
+                "active_codex_pid": _pid_alive(self.state.get("active_codex_pid"), records),
+            },
+        }
+        eligible, reason = validate_rollover_diagnostic_retry(discovery)
+        if not eligible or self._exact_staged_prompt_recovery_task(allow_human_required=True) != "000103":
+            runtime_log(
+                getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                "ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_REJECTED", self.state,
+                reason=reason if not eligible else "STAGED_PROMPT_RUNTIME_EVIDENCE_MISMATCH",
+                stateMutation=False,
+            )
+            return False
+
+        with self._state_lock:
+            state = self.state
+            if self.discussion_pause_active() or state.get("discussionPauseActive") is True:
+                runtime_log(
+                    getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                    "ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_REJECTED", state,
+                    reason="DISCUSSION_PAUSE_ACTIVE", stateMutation=False,
+                )
+                return False
+            try:
+                prompt_bytes = Path(str(state.get("nextPromptPath") or "")).read_bytes()
+                prompt_identity_valid = (
+                    hashlib.sha256(prompt_bytes).hexdigest().upper()
+                    == LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256
+                )
+            except OSError:
+                prompt_identity_valid = False
+            # Recheck identity at the mutation boundary so stale preflight evidence
+            # cannot authorize a changed task/transaction.
+            if (state.get("state") != "HUMAN_REQUIRED"
+                    or state.get("humanRequiredReason") != "LEGACY_HANDOVER_REEMISSION_INVALID"
+                    or state.get("rolloverTransactionId") != LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID
+                    or state.get("rolloverTransactionTaskId") != "000103"
+                    or state.get("nextTaskId") != "000103"
+                    or not prompt_identity_valid
+                    or state.get("rolloverDiagnosticRetryAuthorizationConsumedTransactionId") == LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID):
+                runtime_log(
+                    getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                    "ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_REJECTED", state,
+                    reason="AUTHORITY_CHANGED_AFTER_PREFLIGHT", stateMutation=False,
+                )
+                return False
+            previous_epoch = int(state.get("rolloverRecoveryEpoch") or state.get("rolloverAutomaticRecoveryEpochCount"))
+            next_epoch = previous_epoch + 1
+            next_epoch_count = int(state["rolloverAutomaticRecoveryEpochCount"]) + 1
+            now = time.time()
+            prior_recovery_evidence = {
+                key: state.get(key) for key in (
+                    "rolloverRecoveryAttemptCount", "rolloverRecoveryStartedAt", "rolloverRecoveryLastAttemptAt",
+                    "rolloverRecoveryRetryAfter", "rolloverRecoveryTerminalReason", "rolloverAutomaticRecoveryNextEligibleAt",
+                    "rolloverHandoverRecoveryDisposition", "rolloverHandoverRecoveryReason",
+                    "rolloverHandoverRecoveryRetryAfter", "rolloverLastFailureReason", "rolloverDeferredForTaskId",
+                    "rolloverAutoAttemptCount", "rolloverLegacyHandoverReemissionState",
+                    "rolloverLegacyHandoverReemissionAttemptedEpoch",
+                )
+            }
+            state.update({
+                "rolloverDiagnosticRetryAuthorizationConsumedTransactionId": LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+                "rolloverDiagnosticRetryAuthorization": {
+                    "transactionId": LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+                    "taskId": "000103",
+                    "authorizedAt": now,
+                    "previousEpoch": previous_epoch,
+                    "newEpoch": next_epoch,
+                    "previousEvidence": prior_recovery_evidence,
+                },
+                "state": "NEXT_PROMPT_READY",
+                "humanRequiredReason": None,
+                "rolloverRecoveryEpoch": next_epoch,
+                "rolloverAutomaticRecoveryEpochCount": next_epoch_count,
+                "rolloverRecoveryState": "RECOVERING",
+                "rolloverRecoveryAttemptCount": 0,
+                "rolloverRecoveryStartedAt": now,
+                "rolloverRecoveryLastAttemptAt": None,
+                "rolloverRecoveryRetryAfter": None,
+                "rolloverAutomaticRecoveryNextEligibleAt": None,
+                "rolloverMaintenanceState": "IN_PROGRESS",
+                "rolloverInProgress": True,
+                "rolloverDue": True,
+                "rolloverPending": True,
+                "handoverRequested": True,
+                "handoverReady": False,
+            })
+            for key in (
+                "rolloverRecoveryTerminalReason", "rolloverHandoverRecoveryDisposition",
+                "rolloverHandoverRecoveryReason", "rolloverHandoverRecoveryRetryAfter",
+                "rolloverLastFailureReason", "rolloverDeferredForTaskId", "rolloverAutoAttemptCount",
+            ):
+                state.pop(key, None)
+            self.save()
+        runtime_log(
+            getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+            "ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_CONSUMED", state,
+            transactionId=LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID, taskId="000103",
+            previousEpoch=previous_epoch, recoveryEpoch=next_epoch, epochCount=next_epoch_count,
+            executorLaunchAuthorized=False,
+        )
+        return True
 
     def _post_discussion_staged_prompt_evidence_valid(self, task_id: str) -> bool:
         transaction_id = self.state.get("postDiscussionProtocolTransactionId")
@@ -8377,6 +8513,11 @@ def main() -> None:
             _ACTIVE_DIAGNOSTIC_TRACE = None
         instance_lock.release()
         return
+    if os.environ.get("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY"):
+        if watcher.consume_rollover_diagnostic_retry_authorization():
+            print("ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_CONSUMED; Executor launch remains blocked pending normal rollover recovery.")
+        else:
+            print("ROLLOVER_DIAGNOSTIC_RETRY_AUTHORIZATION_REJECTED; workflow remains fail-closed.")
     discussion_paused = getattr(watcher, "discussion_pause_active", lambda: bool(watcher.state.get("discussionPauseActive")))
     if discussion_paused():
         print(f"ORCHESTRATOR PAUSED BY HUMAN state={watcher.state.get('state')} taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId') or 'NONE'}")

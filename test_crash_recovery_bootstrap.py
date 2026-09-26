@@ -204,3 +204,135 @@ def test_repository_identity_is_exactly_governed_remote_and_branch():
     assert bootstrap.repository_identity("https://github.com/nakfreeajer/affotech-agent-orchestrator.git") == bootstrap.EXPECTED_REPOSITORY_IDENTITY
     assert bootstrap.repository_identity("git@github.com:nakfreeajer/affotech-agent-orchestrator.git") == bootstrap.EXPECTED_REPOSITORY_IDENTITY
     assert bootstrap.repository_identity("https://github.com/other/repo.git") != bootstrap.EXPECTED_REPOSITORY_IDENTITY
+
+
+def _rollover_retry_fixture(tmp_path, monkeypatch):
+    state_dir = tmp_path / "orchestrator"
+    prompt = state_dir / "prompts" / "000103.txt"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_bytes(b"synthetic immutable task prompt\n")
+    worktree = tmp_path / "worktree-000103"
+    worktree.mkdir()
+    session_id = bootstrap.LEGACY_DIAGNOSTIC_RETRY_EXECUTOR_SESSION_ID
+    state = {
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "nextTaskId": "000103",
+        "nextPromptPath": str(prompt),
+        "discussionPauseActive": False,
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": False,
+        "handoverRequested": True, "handoverReady": False,
+        "rolloverHandoverProtocolVersion": None,
+        "rolloverTransactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+        "rolloverTransactionTaskId": "000103",
+        "rolloverRecoveryEpoch": 2,
+        "rolloverAutomaticRecoveryEpochCount": 1,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverLegacyHandoverReemissionTransactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 2,
+        "rolloverLegacyHandoverReemissionState": "INVALID_RESPONSE",
+        "executorSessionId": session_id, "executorSessionMode": "PERSISTENT",
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+        "taskWorktrees": {"000103": {"taskId": "000103", "worktreePath": str(worktree)}},
+    }
+    digest = __import__("hashlib").sha256(prompt.read_bytes()).hexdigest().upper()
+    monkeypatch.setattr(bootstrap, "LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256", digest)
+    discovery_record = {
+        "state": state, "stateDir": str(state_dir), "watcherRunning": False,
+        "executorSessionExists": True, "activeWriterPresent": False,
+        "executorPidAlive": False,
+        "executorPidAliveByField": {"codexPid": False, "active_codex_pid": False},
+    }
+    return discovery_record, prompt
+
+
+def test_exact_legacy_rollover_diagnostic_retry_preflight_and_fail_closed_cases(tmp_path, monkeypatch):
+    d, prompt = _rollover_retry_fixture(tmp_path, monkeypatch)
+    assert bootstrap.validate_rollover_diagnostic_retry(d) == (True, "SAFE_TO_AUTHORIZE_ONE_ROLLOVER_DIAGNOSTIC_RETRY")
+
+    mutations = [
+        ("humanRequiredReason", "OTHER", "HUMAN_REQUIRED_REASON_MISMATCH"),
+        ("rolloverTransactionId", "wrong", "TRANSACTION_IDENTITY_MISMATCH"),
+        ("rolloverTransactionTaskId", "000104", "TRANSACTION_IDENTITY_MISMATCH"),
+        ("nextTaskId", "000104", "NEXT_TASK_MISMATCH"),
+        ("executorSessionId", "other-session", "PERSISTENT_EXECUTOR_SESSION_MISMATCH"),
+    ]
+    for field, value, reason in mutations:
+        d["state"][field] = value
+        assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == reason
+        d["state"][field] = {
+            "humanRequiredReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+            "rolloverTransactionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID,
+            "rolloverTransactionTaskId": "000103", "nextTaskId": "000103",
+            "executorSessionId": bootstrap.LEGACY_DIAGNOSTIC_RETRY_EXECUTOR_SESSION_ID,
+        }[field]
+
+    d["state"]["discussionPauseActive"] = True
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "DISCUSSION_PAUSE_ACTIVE"
+    d["state"]["discussionPauseActive"] = False
+    d["activeWriterPresent"] = True
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "EXECUTOR_PROCESS_OR_WRITER_ACTIVE"
+    d["activeWriterPresent"] = False
+    d["watcherRunning"] = True
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "WATCHER_ALREADY_RUNNING"
+    d["watcherRunning"] = False
+    d["state"]["rolloverDiagnosticRetryAuthorizationConsumedTransactionId"] = bootstrap.LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "ROLLOVER_DIAGNOSTIC_AUTHORIZATION_ALREADY_CONSUMED"
+    d["state"].pop("rolloverDiagnosticRetryAuthorizationConsumedTransactionId")
+    d["state"]["rolloverFreshCandidateConversationId"] = "candidate-already-created"
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "ROLLOVER_ALREADY_ADVANCED"
+    d["state"].pop("rolloverFreshCandidateConversationId")
+
+    original_path = d["state"]["nextPromptPath"]
+    d["state"]["nextPromptPath"] = str(prompt.parent / "wrong.txt")
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "STAGED_PROMPT_IDENTITY_MISMATCH"
+    d["state"]["nextPromptPath"] = original_path
+    d["executorSessionExists"] = False
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "PERSISTENT_EXECUTOR_SESSION_MISMATCH"
+    d["executorSessionExists"] = True
+    d["executorPidAliveByField"]["codexPid"] = True
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "EXECUTOR_PROCESS_OR_WRITER_ACTIVE"
+    d["executorPidAliveByField"]["codexPid"] = False
+
+    prompt.write_bytes(b"modified prompt")
+    assert bootstrap.validate_rollover_diagnostic_retry(d)[1] == "STAGED_PROMPT_IDENTITY_MISMATCH"
+
+
+def test_validated_durable_handover_blocks_unnecessary_diagnostic_retry(tmp_path, monkeypatch):
+    d, _prompt = _rollover_retry_fixture(tmp_path, monkeypatch)
+    d["state"]["pending_handover"] = (
+        "Rollover transaction ID: 7fdbd798659f42295a18dd2d\n"
+        "taskId=000103\nARCHITECT_HANDOVER_READY"
+    )
+    assert bootstrap.validate_rollover_diagnostic_retry(d) == (False, "VALIDATED_DURABLE_HANDOVER_ALREADY_EXISTS")
+    d["state"].pop("pending_handover")
+    d["state"]["rolloverHandoverResponseIdentity"] = "persisted-but-payload-missing"
+    assert bootstrap.validate_rollover_diagnostic_retry(d) == (False, "DURABLE_HANDOVER_EVIDENCE_INCOMPLETE")
+
+
+def test_rollover_retry_cli_status_is_read_only_and_wrapper_authority_is_separate(tmp_path, monkeypatch, capsys):
+    d, _prompt = _rollover_retry_fixture(tmp_path, monkeypatch)
+    state_dir = Path(d["stateDir"])
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps(d["state"]), encoding="utf-8")
+    before = (state_dir / "state.json").read_bytes()
+    monkeypatch.setattr(bootstrap, "_default_process_records", lambda: [])
+    monkeypatch.setattr(bootstrap, "_session_exists", lambda _session, _home=None: True)
+    assert bootstrap.main([
+        "--repository", str(Path(__file__).resolve().parent), "--state-dir", str(state_dir),
+        "--validate-rollover-diagnostic-retry",
+    ]) == 0
+    assert (state_dir / "state.json").read_bytes() == before
+    output = json.loads(capsys.readouterr().out)
+    assert output["rolloverDiagnosticRetryEligible"] is True
+    assert bootstrap.classify_workflow({"state": d["state"], "resultNonEmpty": False}) == "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"
+    script = Path(__file__).with_name("AFFOTECH-START.ps1").read_text(encoding="utf-8")
+    assert "AuthorizeRolloverDiagnosticRetry" in script
+    assert "ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY" in script
+    assert "ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY" in script
+    assert script.index("if ($StatusOnly)") < script.index("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY =")
+    assert script.index('Read-Host "Type START') < script.index('ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY = "7fdbd798659f42295a18dd2d"')
+    import inspect
+    import local_orchestrator_watcher as watcher_module
+    main_source = inspect.getsource(watcher_module.main)
+    assert main_source.index("hotkeys.start") < main_source.index("consume_rollover_diagnostic_retry_authorization") < main_source.index("while True")

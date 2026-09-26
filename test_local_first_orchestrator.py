@@ -8100,3 +8100,84 @@ def test_all_production_documentation_schema_prompts_advertise_all_values(tmp_pa
     assert len(captured) == 3
     for message in captured:
         assert "documentation=NOT_REQUIRED|REQUIRED|COMPLETE" in message
+
+
+def test_explicit_rollover_diagnostic_authorization_consumes_one_epoch_without_launch(tmp_path, monkeypatch):
+    import crash_recovery_bootstrap as bootstrap
+
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+        "discussionPauseActive": False,
+        "rolloverInProgress": False,
+        "rolloverRecoveryEpoch": 2,
+        "rolloverAutomaticRecoveryEpochCount": 1,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverLegacyHandoverReemissionTransactionId": "7fdbd798659f42295a18dd2d",
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 2,
+        "rolloverLegacyHandoverReemissionState": "INVALID_RESPONSE",
+        "executorSessionId": "019f842e-98bc-7672-a619-51441d91be00",
+        "executorSessionMode": "PERSISTENT",
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+        "rolloverHandoverProtocolVersion": None,
+    })
+    watcher._write_discussion_pause_marker(False)
+    diagnostic = watcher.state_dir / "diagnostics" / "prior-observation.txt"
+    diagnostic.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic.write_bytes(b"previous evidence remains untouched")
+    prompt_before = prompt.read_bytes()
+    digest_before = hashlib.sha256(prompt_before).hexdigest().upper()
+
+    monkeypatch.setattr(bootstrap, "_default_process_records", lambda: [])
+    monkeypatch.setattr(bootstrap, "_session_exists", lambda _session: True)
+    monkeypatch.setattr(bootstrap, "_session_writer_records", lambda _session, _records: [])
+    monkeypatch.setattr(bootstrap, "_pid_alive", lambda _pid, _records: False)
+    monkeypatch.setattr(bootstrap, "LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256", digest_before)
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY", "7fdbd798659f42295a18dd2d")
+
+    launches = []
+    assert watcher.consume_rollover_diagnostic_retry_authorization() is True
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["rolloverRecoveryEpoch"] == 3
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 2
+    assert watcher.state["rolloverRecoveryState"] == "RECOVERING"
+    assert watcher.state["rolloverInProgress"] is True
+    assert watcher.state["rolloverDue"] is True and watcher.state["rolloverPending"] is True
+    assert watcher.state["rolloverTransactionId"] == "7fdbd798659f42295a18dd2d"
+    assert watcher.state["rolloverTransactionTaskId"] == watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert watcher.state["rolloverDiagnosticRetryAuthorizationConsumedTransactionId"] == "7fdbd798659f42295a18dd2d"
+    assert watcher.state["rolloverDiagnosticRetryAuthorization"]["newEpoch"] == 3
+    assert prompt.read_bytes() == prompt_before
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest().upper() == digest_before
+    assert diagnostic.read_bytes() == b"previous evidence remains untouched"
+    assert launches == []
+
+    class RecoveryBridge:
+        def __init__(self):
+            self.sent = []
+        def assistant_baseline(self):
+            return {"count": 7, "text_hash": "baseline"}
+        def submit_result_bounded(self, message):
+            self.sent.append(message)
+        def wait_for_new_response(self, _baseline, poll_interval):
+            assert poll_interval == 0.5
+            return {"state": "COMPLETED", "text": (
+                "Existing exact legacy handover for 000103\n"
+                "Rollover transaction ID: 7fdbd798659f42295a18dd2d\nARCHITECT_HANDOVER_READY"
+            )}
+
+    bridge = RecoveryBridge()
+    status, _response = watcher.session_rollover._request_legacy_handover_reemission_once(bridge, "000103")
+    assert status == "VALIDATED"
+    assert len(bridge.sent) == 1
+    assert watcher.state["pending_handover"].endswith("ARCHITECT_HANDOVER_READY")
+    repeated_status, _ = watcher.session_rollover._request_legacy_handover_reemission_once(bridge, "000103")
+    assert repeated_status == "ALREADY_ATTEMPTED"
+    assert len(bridge.sent) == 1
+
+    epoch_after_first = watcher.state["rolloverRecoveryEpoch"]
+    assert watcher.consume_rollover_diagnostic_retry_authorization() is False
+    assert watcher.state["rolloverRecoveryEpoch"] == epoch_after_first
+    assert prompt.read_text(encoding="utf-8") == prompt_text
