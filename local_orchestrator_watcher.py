@@ -7375,6 +7375,10 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
         if tracer:
             tracer.record("EXECUTOR", "dispatch_next_prompt_once", "EXECUTOR_DISPATCH_GATE", "DECISION", watcher.state, decision="BLOCK", reason="NOT_NEXT_PROMPT_READY", rolloverServiceCalled=False)
         return None
+    if watcher.state.get("postDiscussionEnvelopeRequired") is True:
+        disposition = service_post_discussion_protocol_gate_once(watcher, endpoint, paused, logger, run_id)
+        _wait_after_post_discussion_protocol_gate(watcher, disposition)
+        return None
     decision = _evaluate_public_rollover_boundary(watcher, paused)
     if decision.action in {
         RolloverAction.WAIT_DISCUSSION,
@@ -7629,6 +7633,62 @@ def _fail_closed_public_rollover(watcher: LocalFirstOrchestrator, decision: Roll
     runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "HUMAN_REQUIRED", watcher.state, reason=f"ROLLOVER_EVALUATOR_{decision.reason}")
 
 
+def service_post_discussion_protocol_gate_once(
+    watcher: LocalFirstOrchestrator,
+    endpoint: str,
+    paused: Callable[[], bool],
+    logger: logging.Logger | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Service one existing post-discussion protocol observation before scheduling."""
+    if watcher.state.get("postDiscussionEnvelopeRequired") is not True:
+        return "CLEAR"
+    task_id = watcher.state.get("postDiscussionProtocolTaskId") or watcher.state.get("nextTaskId")
+    runtime_log(logger, run_id, "POST_DISCUSSION_PROTOCOL_GATE", watcher.state, taskId=task_id, decision="BLOCK_SCHEDULING")
+    if paused():
+        runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="DISCUSSION_PAUSED")
+        return "WAIT"
+    bridge = None
+    try:
+        conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+        bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+        if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
+            runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="ARCHITECT_GENERATING")
+            return "GENERATING"
+        latest = None
+        latest_reader = getattr(bridge, "latest_assistant_entry", None)
+        if callable(latest_reader):
+            latest = latest_reader()
+        elif isinstance(getattr(bridge, "entries", None), list) and bridge.entries:
+            latest = bridge.entries[-1]
+        response = str((latest or {}).get("text") or "") if isinstance(latest, dict) else ""
+        if not response.strip():
+            runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="NO_COMPLETED_RESPONSE")
+            return "WAIT"
+        disposition = watcher.reconcile_post_discussion_response(bridge, response, completed=True)
+        if disposition in {"WAIT", "GENERATING"}:
+            runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason=disposition)
+        elif disposition == "FAILED":
+            runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_FAILED", watcher.state, taskId=task_id)
+        return disposition
+    except Exception as error:
+        runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="OBSERVATION_UNAVAILABLE", errorClass=type(error).__name__)
+        return "WAIT"
+    finally:
+        if bridge is not None:
+            try:
+                bridge.close()
+            except Exception:
+                pass
+
+
+def _wait_after_post_discussion_protocol_gate(watcher: LocalFirstOrchestrator, disposition: str) -> None:
+    if disposition not in {"WAIT", "GENERATING"}:
+        return
+    time.sleep(max(0.25, float(os.environ.get("ORCHESTRATOR_POLL_INTERVAL", "2.0"))))
+    watcher.state = watcher._load_state()
+
+
 def run_next_prompt_ready_once(
     watcher: LocalFirstOrchestrator,
     launch: Callable[[str, Path], Any],
@@ -7638,6 +7698,10 @@ def run_next_prompt_ready_once(
     run_id: str | None = None,
 ) -> Any:
     """Run one NEXT_PROMPT_READY iteration through the canonical evaluator."""
+    if watcher.state.get("postDiscussionEnvelopeRequired") is True:
+        disposition = service_post_discussion_protocol_gate_once(watcher, endpoint, paused, logger, run_id)
+        _wait_after_post_discussion_protocol_gate(watcher, disposition)
+        return None
     decision = _evaluate_public_rollover_boundary(watcher, paused)
     if decision.action in {
         RolloverAction.WAIT_DISCUSSION,

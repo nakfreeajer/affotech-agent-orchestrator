@@ -6729,8 +6729,14 @@ class _PostDiscussionBridge:
         snapshot = json.dumps(self.entries, separators=(",", ":"), ensure_ascii=False)
         return {"count": len(self.entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": list(self.entries)}
 
+    def latest_assistant_entry(self):
+        return self.entries[-1] if self.entries else None
+
     def submit_result_bounded(self, message):
         self.sent.append(message)
+
+    def close(self):
+        return None
 
 
 def _discussion_bridge_response(text, identifier):
@@ -6878,6 +6884,70 @@ def test_missing_envelope_reproduction_at_accepted_head_was_not_required_path(tm
     bridge = _PostDiscussionBridge([])
     assert watcher.reconcile_post_discussion_response(bridge, "complete prose without envelope") == "NOT_REQUIRED"
     assert bridge.sent == []
+
+
+def test_public_next_prompt_path_gates_rollover_until_exact_staged_envelope_is_repaired(tmp_path, monkeypatch):
+    watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
+    watcher.state["architectDiscussionBaseline"] = bridge.assistant_baseline()
+    watcher.save()
+    watcher.request_discussion_resume()
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+    before = prompt.read_bytes()
+    rollover_calls = []
+    launches = []
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: rollover_calls.append("rollover") or False)
+
+    # No newer response: the protocol waits and rollover remains untouched.
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: launches.append(1), "endpoint", lambda: False) is None
+    assert rollover_calls == [] and launches == []
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 2
+
+    # A completed response without an envelope requests exactly one repair.
+    bridge.entries.append(_discussion_bridge_response("already prepared task, missing envelope", "missing"))
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: launches.append(1), "endpoint", lambda: False) is None
+    assert len(bridge.sent) == 1
+    assert watcher.state["state"] == "ARCHITECT_RUNNING"
+    assert rollover_calls == [] and launches == []
+
+    # The exact corrected envelope clears only the protocol gate and preserves bytes.
+    corrected = envelope("000103", prompt=prompt_text)
+    bridge.entries.append(_discussion_bridge_response(corrected, "corrected"))
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: launches.append(1), "endpoint", lambda: False) is None
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert prompt.read_bytes() == before
+    assert rollover_calls == [] and launches == []
+
+    # Only the following public iteration may reach ordinary rollover service.
+    monkeypatch.setattr(
+        watcher_module,
+        "_evaluate_public_rollover_boundary",
+        lambda *_args, **_kwargs: watcher_module.RolloverDecision(watcher_module.RolloverAction.NO_ROLLOVER, "TEST"),
+    )
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: launches.append(1), "endpoint", lambda: False) is None
+    assert rollover_calls == ["rollover"]
+    assert launches == []
+
+
+def test_public_protocol_gate_waits_while_architect_generates(tmp_path, monkeypatch):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
+    watcher.state["architectDiscussionBaseline"] = bridge.assistant_baseline()
+    watcher.save()
+    watcher.request_discussion_resume()
+    bridge.generating = True
+    rollover_calls = []
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: rollover_calls.append(1) or False)
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: (_ for _ in ()).throw(AssertionError("must not launch")), "endpoint", lambda: False) is None
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert bridge.sent == []
+    assert rollover_calls == []
 
 
 def test_post_discussion_repair_failure_is_durable_and_prevents_second_repair(tmp_path):
