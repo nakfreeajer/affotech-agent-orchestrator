@@ -1662,53 +1662,40 @@ class ArchitectSessionRollover:
         self.watcher.save()
 
     def _automatic_recovery_epoch_eligible(self, task_id: str) -> bool:
-        """Return whether one durable automatic recovery epoch may begin."""
+        """Compatibility adapter for the canonical epoch decision."""
         state = self.watcher.state
-        if not (
-            state.get("state") == "NEXT_PROMPT_READY"
-            and state.get("rolloverDue") is True
-            and state.get("rolloverPending") is True
-            and str(state.get("nextTaskId") or "") == str(task_id)
-            and state.get("rolloverMaintenanceState") == "DEFERRED"
-            and state.get("rolloverRecoveryState") in {None, "DEFERRED"}
-            and (
-                state.get("rolloverDeferredForTaskId") == task_id
-                or state.get("rolloverTransactionTaskId") == task_id
-                or state.get("rolloverAttemptedForTaskId") == task_id
-            )
-        ):
+        if str(state.get("nextTaskId") or "") != str(task_id):
             return False
-        max_epochs = int(state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0)
-        epochs = int(state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0)
-        eligible_at = float(state.get("rolloverAutomaticRecoveryNextEligibleAt", 0.0) or 0.0)
-        deferred_owner = str(state.get("rolloverDeferredForTaskId") or "")
-        if deferred_owner and deferred_owner != str(task_id):
-            return False
-        if epochs >= max_epochs or time.time() < eligible_at:
-            return False
-        active_pid = state.get("codexPid") or state.get("active_codex_pid")
-        if state.get("executorProcessState") == "RUNNING" and active_pid:
-            try:
-                if LocalWatcher.process_alive(int(active_pid)):
-                    return False
-            except (TypeError, ValueError):
-                return False
-        if state.get("executorActiveWriter") is True or state.get("governedExecutorActiveWriter") is True:
-            return False
-        return bool(state.get("rolloverTransactionId") or state.get("rolloverHandoverSendState") in {"UNSENT", "PENDING", "ACKNOWLEDGED", "AMBIGUOUS"})
+        decision = _evaluate_public_rollover_boundary(
+            self.watcher,
+            lambda: bool(state.get("discussionPauseActive")),
+        )
+        return decision.action is RolloverAction.START_RECOVERY_EPOCH
 
-    def _begin_automatic_recovery_epoch(self, task_id: str) -> bool:
-        """Start one finite automatic epoch without discarding transaction evidence."""
+    def _begin_automatic_recovery_epoch(self, task_id: str, decision: RolloverDecision | None = None) -> bool:
+        """Execute a canonical START_RECOVERY_EPOCH decision."""
         state = self.watcher.state
+        if decision is None:
+            decision = _evaluate_public_rollover_boundary(
+                self.watcher,
+                lambda: bool(state.get("discussionPauseActive")),
+            )
+        if decision.action is RolloverAction.HUMAN_REQUIRED:
+            terminal_reason = (
+                "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+                if decision.reason == "AUTOMATIC_RECOVERY_EXHAUSTED"
+                else f"ROLLOVER_EVALUATOR_{decision.reason}"
+            )
+            state["state"] = "HUMAN_REQUIRED"
+            state["humanRequiredReason"] = terminal_reason
+            state["rolloverRecoveryTerminalReason"] = terminal_reason
+            self.watcher.save()
+            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "HUMAN_REQUIRED", state, reason=terminal_reason)
+            return False
+        if decision.action is not RolloverAction.START_RECOVERY_EPOCH:
+            return False
         max_epochs = int(state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0)
         epochs = int(state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0)
-        if epochs >= max_epochs:
-            state["state"] = "HUMAN_REQUIRED"
-            state["humanRequiredReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
-            state["rolloverRecoveryTerminalReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
-            self.watcher.save()
-            runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_EXHAUSTED", state, taskId=task_id, epochs=epochs, maxEpochs=max_epochs)
-            return False
         now = time.time()
         state.update({
             "rolloverRecoveryEpoch": int(state.get("rolloverRecoveryEpoch", 0) or 0) + 1,
@@ -6841,7 +6828,8 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
         })
         watcher.save()
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_DEFERRED", watcher.state, reason="LEGACY_DEFERRED_STATE_MIGRATED", nextEligibleAt=watcher.state["rolloverAutomaticRecoveryNextEligibleAt"])
-    automatic_epoch_eligible = watcher.session_rollover._automatic_recovery_epoch_eligible(next_task_id)
+    rollover_decision = _evaluate_public_rollover_boundary(watcher, paused)
+    automatic_epoch_eligible = rollover_decision.action is RolloverAction.START_RECOVERY_EPOCH
     terminal_candidate = watcher.session_rollover._terminal_same_task_transaction_eligible(
         next_task_id, restart_recovery_available or automatic_epoch_eligible
     )
@@ -6937,6 +6925,26 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 })
                 watcher.save()
                 runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None), "ROLLOVER_AUTO_RECOVERY_ELIGIBLE", watcher.state, taskId=next_task_id, epoch=watcher.state.get("rolloverRecoveryEpoch"), sameEpoch=True)
+        elif rollover_decision.action in {
+            RolloverAction.WAIT_DISCUSSION,
+            RolloverAction.WAIT_EXECUTOR,
+            RolloverAction.WAIT_ACTIVE_WRITER,
+            RolloverAction.WAIT_ARCHITECT,
+            RolloverAction.WAIT_COOLDOWN,
+            RolloverAction.WAIT_RECONCILIATION,
+            RolloverAction.BLOCK_EXECUTOR_LAUNCH,
+        } and not restart_recovery_available:
+            _trace_rollover_gate(
+                watcher,
+                boundary_state,
+                "DEFER",
+                rollover_decision.reason,
+                function="service_deferred_rollover_once",
+            )
+            return False
+        elif rollover_decision.action is RolloverAction.HUMAN_REQUIRED:
+            _fail_closed_public_rollover(watcher, rollover_decision)
+            return False
         elif restart_recovery_available:
             consume_operator_restart_recovery()
         else:
@@ -7000,6 +7008,28 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
                 return False
             finally:
                 close_bridge()
+        if (
+            rollover_decision.action is RolloverAction.WAIT_RECONCILIATION
+            and watcher.state.get("rolloverMaintenanceState") == "RECONCILE_PENDING"
+            and watcher.state.get("rolloverHandoverRecoveryDisposition") == "RETRYABLE"
+            and int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0) < ROLLOVER_RECOVERY_MAX_ATTEMPTS
+        ):
+            retry_after = float(watcher.state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
+            remaining = max(0.0, retry_after - time.time())
+            runtime_log(
+                getattr(watcher, "runtime_logger", None),
+                getattr(watcher, "runtime_run_id", None),
+                "HANDOVER_RECONCILIATION_WAIT",
+                watcher.state,
+                recoveryDisposition=ROLLOVER_RECOVERY_WAIT_BACKOFF,
+                attempts=int(watcher.state.get("rolloverRecoveryAttemptCount", 0) or 0),
+                retryAfter=retry_after,
+                remainingBackoffSeconds=remaining,
+                handoverResent=False,
+            )
+            _trace_rollover_gate(watcher, boundary_state, "DEFER", rollover_decision.reason, function="service_deferred_rollover_once")
+            close_bridge()
+            return False
     reconciliation_live_before_recovery = rollover.handover_reconciliation_pending()
     recovery_disposition = rollover._begin_bounded_recovery()
     if recovery_disposition == ROLLOVER_RECOVERY_WAIT_BACKOFF:
@@ -7310,38 +7340,15 @@ def dispatch_next_prompt_once(watcher: LocalFirstOrchestrator, launch: Callable[
 
 
 def deferred_rollover_passive_wait_required(watcher: LocalFirstOrchestrator) -> bool:
-    """Return whether a failed rollover must remain passive for this task boundary."""
-    state = watcher.state
-    next_task_id = state.get("nextTaskId")
-    return bool(
-        state.get("state") == "NEXT_PROMPT_READY"
-        and state.get("rolloverDue")
-        and state.get("rolloverMaintenanceState") == "DEFERRED"
-        and next_task_id
-        and state.get("rolloverDeferredForTaskId") == next_task_id
-        and not (
-            getattr(watcher, "_operator_restart_rollover_recovery_available", False)
-            and "rolloverAutomaticRecoveryEpochCount" not in watcher.state
-        )
-        and int(watcher.state.get("rolloverAutomaticRecoveryEpochCount", 0) or 0) < int(watcher.state.get("rolloverAutomaticRecoveryMaxEpochs", ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS) or 0)
-    )
+    """Compatibility predicate backed by the canonical evaluator."""
+    decision = _evaluate_public_rollover_boundary(watcher, lambda: bool(watcher.state.get("discussionPauseActive")))
+    return decision.action is RolloverAction.WAIT_COOLDOWN
 
 
 def reconciliation_backoff_wait_required(watcher: LocalFirstOrchestrator) -> bool:
-    """Return whether a live reconciliation is waiting for its retry deadline."""
-    state = watcher.state
-    retry_after = float(state.get("rolloverRecoveryRetryAfter", 0.0) or 0.0)
-    return bool(
-        state.get("state") == "NEXT_PROMPT_READY"
-        and state.get("rolloverDue")
-        and state.get("rolloverPending")
-        and state.get("rolloverInProgress")
-        and state.get("handoverRequested")
-        and state.get("rolloverHandoverSendState") == "AMBIGUOUS"
-        and state.get("rolloverMaintenanceState") == "RECONCILE_PENDING"
-        and state.get("rolloverHandoverRecoveryDisposition") == "RETRYABLE"
-        and retry_after > time.time()
-    )
+    """Compatibility predicate backed by the canonical evaluator."""
+    decision = _evaluate_public_rollover_boundary(watcher, lambda: bool(watcher.state.get("discussionPauseActive")))
+    return decision.action is RolloverAction.WAIT_RECONCILIATION
 
 
 def passive_deferred_rollover_wait(

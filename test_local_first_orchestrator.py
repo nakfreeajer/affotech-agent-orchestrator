@@ -6007,8 +6007,10 @@ def test_deferred_wait_never_uses_zero_delay_and_does_not_inflate_budget(tmp_pat
     watcher.save()
     waits = []
     monkeypatch.setattr(watcher_module.time, "sleep", waits.append)
-    assert watcher_module.passive_deferred_rollover_wait(watcher, poll_interval=0) is True
-    assert waits and waits[0] > 0
+    # An expired cooldown is no longer a passive wait decision; the canonical
+    # evaluator makes it eligible for recovery service instead.
+    assert watcher_module.passive_deferred_rollover_wait(watcher, poll_interval=0) is False
+    assert waits == []
     assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 1
 
 

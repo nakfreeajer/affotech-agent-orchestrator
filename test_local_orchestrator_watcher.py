@@ -904,12 +904,12 @@ def test_due_rollover_recovery_is_bounded_and_enters_safety_cutout(tmp_path, mon
     for _ in range(2):
         assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
         now[0] += 6.0
-    assert watcher.state["rolloverRecoveryAttemptCount"] == 1
+    assert watcher.state["rolloverRecoveryAttemptCount"] == 2
     assert watcher_module.service_deferred_rollover_once(watcher, "endpoint", lambda: False, "NEXT_PROMPT_READY") is False
-    assert watcher.state["state"] == "NEXT_PROMPT_READY"
-    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state.get("humanRequiredReason")
     assert watcher.state["rolloverRecoveryState"] == "DEFERRED"
-    assert len(attaches) == 1
+    assert len(attaches) == 2
     assert watcher.state["rolloverDue"] is True
     assert watcher.state["nextTaskId"] == "000054"
     assert watcher.state["nextPromptPath"] == str(prompt)
@@ -917,7 +917,7 @@ def test_due_rollover_recovery_is_bounded_and_enters_safety_cutout(tmp_path, mon
     class Process:
         pid = 9001
     assert watcher_module.dispatch_next_prompt_once(watcher, lambda *_args: (launches.append(1) or Process()), "endpoint", lambda: False) is None
-    assert attaches == [1]
+    assert attaches == [1, 1]
     assert launches == []
 
 
