@@ -1493,6 +1493,65 @@ def test_wait_for_new_response_recognizes_terminal_handover_marker_without_gener
     baseline = bridge.assistant_baseline()
     observed = bridge.wait_for_new_response(baseline, poll_interval=0)
     assert observed == {"state": "COMPLETED", "text": handover}
+    assert bridge.last_wait_diagnostics["completionReason"] == "HANDOVER_READY_MARKER"
+    assert bridge.last_wait_diagnostics["baselineAssistantCount"] == 1
+    assert bridge.last_wait_diagnostics["candidateLatestAssistantIdentity"] == "new"
+    assert bridge.last_wait_diagnostics["candidateTextSha256"] == hashlib.sha256(handover.encode("utf-8")).hexdigest()
+    assert bridge.last_wait_diagnostics["returnedTextReReadAtReturn"] is False
+    assert bridge.last_wait_diagnostics["generationVisibleLastSample"] is False
+
+
+def test_waiter_diagnostics_identify_stable_partial_response_without_changing_result():
+    from local_orchestrator_watcher import ArchitectPlaywright
+    partial = "partial handover body; still no terminal marker"
+
+    class Page:
+        def __init__(self):
+            self.snapshots = iter([
+                [{"id": "old", "text": "old"}],
+                [{"id": "new", "text": partial}],
+                [{"id": "new", "text": partial}],
+            ])
+        def evaluate(self, script):
+            if 'data-message-author-role="assistant"' in script:
+                return next(self.snapshots)
+            return False
+
+    bridge = ArchitectPlaywright(Page())
+    baseline = bridge.assistant_baseline()
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0)
+    assert observed == {"state": "BLOCKED", "text": partial}
+    diagnostics = bridge.last_wait_diagnostics
+    assert diagnostics["completionReason"] == "STABLE_TWO_POLL_NO_COMPLETION_MARKER"
+    assert diagnostics["candidateTextSha256"] == hashlib.sha256(partial.encode("utf-8")).hexdigest()
+    assert diagnostics["stabilityPollCount"] == 2
+    assert diagnostics["generationCheckSkippedForPendingStabilityPoll"] is True
+    assert diagnostics["returnWhileGenerationVisible"] == "NOT_SAMPLED"
+
+
+def test_waiter_diagnostics_identify_different_unrelated_candidate():
+    from local_orchestrator_watcher import ArchitectPlaywright
+    unrelated = "unrelated old answer\nARCHITECT_HANDOVER_READY"
+
+    class Page:
+        def __init__(self):
+            self.snapshots = iter([
+                [{"id": "baseline", "text": "previous"}],
+                [{"id": "different-candidate", "text": unrelated}],
+            ])
+        def evaluate(self, script):
+            if 'data-message-author-role="assistant"' in script:
+                return next(self.snapshots)
+            return False
+
+    bridge = ArchitectPlaywright(Page())
+    observed = bridge.wait_for_new_response(bridge.assistant_baseline(), poll_interval=0)
+    assert observed == {"state": "COMPLETED", "text": unrelated}
+    diagnostics = bridge.last_wait_diagnostics
+    assert diagnostics["candidateLatestAssistantIdentity"] == "different-candidate"
+    assert diagnostics["candidateTextSha256"] == hashlib.sha256(unrelated.encode("utf-8")).hexdigest()
+    assert diagnostics["causalRequestCorrelationAvailable"] is False
+    assert diagnostics["completionReason"] == "HANDOVER_READY_MARKER"
 
 
 def test_healthy_large_history_polling_uses_no_full_history_scan(monkeypatch):

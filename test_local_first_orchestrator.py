@@ -4592,6 +4592,7 @@ def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", IdleWatcher)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_args, **_kwargs: True)
     watcher_module.main()
     assert "STATE=STOPPED" in capsys.readouterr().out
 
@@ -5660,6 +5661,7 @@ def test_main_reuses_idle_playwright_bridge_until_state_changes(monkeypatch, tmp
         return bridge
 
     monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", Watcher)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
     monkeypatch.setenv("ORCHESTRATOR_POLL_INTERVAL", "0")
     monkeypatch.setattr(watcher_module, "visible_executor_launcher", lambda *_: None)
@@ -6839,6 +6841,82 @@ def _staged_prompt_missing_envelope_fixture(tmp_path):
     return watcher, prompt, prompt_text
 
 
+@pytest.mark.parametrize("kind", ["valid", "partial", "different"], ids=["valid-final", "partial", "stale-different"])
+def test_legacy_reemission_observation_artifact_preserves_exact_payload(tmp_path, kind):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state["rolloverHandoverProtocolVersion"] = None
+    response = (
+        "Authoritative legacy handover for task 000103\nRollover transaction ID: 7fdbd798659f42295a18dd2d\n"
+        "ARCHITECT_HANDOVER_READY"
+    )
+    if kind == "partial":
+        response = "partial legacy handover \N{SNOWMAN}\n"
+    elif kind == "different":
+        response = "stale response for unrelated transaction\nARCHITECT_HANDOVER_READY"
+    rollover = watcher_module.ArchitectSessionRollover(watcher)
+
+    class Bridge:
+        last_wait_diagnostics = {
+            "baselineAssistantCount": 4,
+            "candidateLatestAssistantIdentity": "assistant-5",
+            "completionReason": "HANDOVER_READY_MARKER" if kind == "valid" else "STABLE_TWO_POLL_NO_COMPLETION_MARKER",
+        }
+
+    metadata = rollover._capture_legacy_handover_reemission_observation(
+        Bridge(), {"state": "COMPLETED" if kind != "partial" else "BLOCKED", "text": response},
+        watcher_module.LEGACY_COMPAT_TRANSACTION_ID, "000103", 2,
+    )
+    artifact = Path(metadata["artifactPath"])
+    saved = json.loads(artifact.read_text(encoding="utf-8"))
+    exact_bytes = response.encode("utf-8")
+    assert metadata["artifactWritten"] is True
+    assert saved["observedText"] == response
+    assert saved["textUtf8Bytes"] == len(exact_bytes)
+    assert saved["textLengthChars"] == len(response)
+    assert saved["textSha256"] == hashlib.sha256(exact_bytes).hexdigest()
+    assert saved["textPrefix"] == response[:200]
+    assert saved["textSuffix"] == response[-500:]
+    assert saved["waiterDiagnostics"]["candidateLatestAssistantIdentity"] == "assistant-5"
+    assert saved["architectHandoverReady"] is (kind != "partial")
+    assert saved["transactionMatches"] is (kind == "valid")
+    assert saved["handoverResponseValid"] is (kind == "valid")
+    assert saved["rejectionReason"] == (None if kind == "valid" else "OBSERVED_STATE_BLOCKED" if kind == "partial" else "TRANSACTION_MISMATCH")
+    assert artifact.parent == watcher.state_dir / "logs" / "diagnostic" / "legacy-handover-reemission"
+
+
+def test_invalid_legacy_reemission_artifact_is_durable_before_rejection_save(tmp_path, monkeypatch):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({"discussionPauseActive": False, "rolloverRecoveryEpoch": 2,
+                          "rolloverHandoverProtocolVersion": None})
+    watcher.save()
+    rollover = watcher_module.ArchitectSessionRollover(watcher)
+    returned = "different response without the authorized transaction"
+    artifact_paths = []
+    original_save = watcher.save
+
+    def check_artifact_before_rejection_save(*args, **kwargs):
+        if watcher.state.get("rolloverLegacyHandoverReemissionState") == "INVALID_RESPONSE":
+            artifact_paths.extend((watcher.state_dir / "logs" / "diagnostic" / "legacy-handover-reemission").glob("*.json"))
+            assert artifact_paths, "waiter payload must be durable before invalid-response state is saved"
+            saved = json.loads(artifact_paths[0].read_text(encoding="utf-8"))
+            assert saved["observedText"] == returned
+            assert saved["textSha256"] == hashlib.sha256(returned.encode("utf-8")).hexdigest()
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(watcher, "save", check_artifact_before_rejection_save)
+
+    class Bridge:
+        def assistant_baseline(self): return {"count": 1, "text_hash": "baseline", "entries": []}
+        def submit_result_bounded(self, _message): pass
+        def wait_for_new_response(self, _baseline, poll_interval=0.5):
+            assert poll_interval == 0.5
+            return {"state": "COMPLETED", "text": returned}
+
+    status, response = rollover._request_legacy_handover_reemission_once(Bridge(), "000103")
+    assert status == "INVALID" and response is None
+    assert artifact_paths
+
+
 def test_missing_envelope_exact_staged_prompt_repairs_without_regeneration(tmp_path):
     watcher, prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
     bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
@@ -7192,6 +7270,12 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
         assert legacy_handover not in [entry.get("text") for entry in old_bridge._assistant_entries()]
         assert service_trace == [(1, True, False, None)]
         assert len(old_bridge.recovery_requests) == 1
+        artifacts = list((watcher.state_dir / "logs" / "diagnostic" / "legacy-handover-reemission").glob("*.json"))
+        assert len(artifacts) == 1
+        observed_artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        assert observed_artifact["observedText"] == legacy_handover
+        assert observed_artifact["textSha256"] == hashlib.sha256(legacy_handover.encode("utf-8")).hexdigest()
+        assert observed_artifact["handoverResponseValid"] is True
         assert ordered_trace == [
             (1, "public_iteration_started"),
             (1, "legacy_handover_reemission_requested"),

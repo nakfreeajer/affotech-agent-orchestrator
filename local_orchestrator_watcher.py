@@ -14,6 +14,7 @@ import threading
 import tempfile
 import time
 import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -2232,6 +2233,84 @@ class ArchitectSessionRollover:
                 return value
         return None
 
+    def _capture_legacy_handover_reemission_observation(
+        self, bridge: "ArchitectPlaywright", observed: Any, transaction_id: str, task_id: str, epoch: int,
+    ) -> dict[str, Any]:
+        """Persist bounded metadata and the exact waiter text before validation."""
+        is_dict = isinstance(observed, dict)
+        text = observed.get("text") if is_dict else None
+        is_text = isinstance(text, str)
+        encoded = text.encode("utf-8") if is_text else None
+        ready = architect_handover_ready(text) if is_text else False
+        transaction_matches = handover_transaction_matches(text, transaction_id) if is_text else False
+        task_matches = task_id in text if is_text else False
+        validation = self._handover_response_valid(text, transaction_id) if is_text else False
+        state = observed.get("state") if is_dict else None
+        rejection_reason = None
+        if state != "COMPLETED":
+            rejection_reason = f"OBSERVED_STATE_{state or 'MISSING'}"
+        elif not is_text:
+            rejection_reason = "OBSERVED_TEXT_MISSING_OR_NOT_STRING"
+        elif not ready:
+            rejection_reason = "ARCHITECT_HANDOVER_READY_FALSE"
+        elif not transaction_matches:
+            rejection_reason = "TRANSACTION_MISMATCH"
+        elif not task_matches:
+            rejection_reason = "TASK_ID_NOT_PRESENT"
+        elif not validation:
+            rejection_reason = "HANDOVER_VALIDATION_FALSE"
+
+        waiter_diagnostics = getattr(bridge, "last_wait_diagnostics", None)
+        if not isinstance(waiter_diagnostics, dict):
+            waiter_diagnostics = None
+        metadata: dict[str, Any] = {
+            "transactionId": transaction_id,
+            "taskId": task_id,
+            "recoveryEpoch": epoch,
+            "observedState": state,
+            "observedIsDict": is_dict,
+            "observedTextIsString": is_text,
+            "textLengthChars": len(text) if is_text else None,
+            "textUtf8Bytes": len(encoded) if encoded is not None else None,
+            "textSha256": hashlib.sha256(encoded).hexdigest() if encoded is not None else None,
+            "textPrefix": text[:200] if is_text else None,
+            "textSuffix": text[-500:] if is_text else None,
+            "containsArchitectHandoverReady": "ARCHITECT_HANDOVER_READY" in text if is_text else False,
+            "containsTransactionId": transaction_id in text if is_text else False,
+            "containsTaskId": task_id in text if is_text else False,
+            "architectHandoverReady": ready,
+            "transactionMatches": transaction_matches,
+            "taskMatches": task_matches,
+            "handoverResponseValid": validation,
+            "rejectionReason": rejection_reason,
+            "waiterDiagnostics": waiter_diagnostics,
+            # This field is the exact UTF-8-decoded waiter string; no trimming or normalization.
+            "observedText": text if is_text else None,
+        }
+        artifact = (Path(self.watcher.state_dir) / "logs" / "diagnostic" / "legacy-handover-reemission"
+                    / f"{transaction_id}-epoch-{epoch}-observation-{uuid.uuid4().hex}.json")
+        metadata["artifactPath"] = str(artifact)
+        metadata["artifactWritten"] = True
+        try:
+            atomic_write(artifact, json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        except Exception as error:
+            metadata["artifactWritten"] = False
+            metadata["artifactWriteError"] = f"{type(error).__name__}: {str(error)[:300]}"
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+            "LEGACY_HANDOVER_REEMISSION_OBSERVATION", self.watcher.state,
+            transactionId=transaction_id, taskId=task_id, recoveryEpoch=epoch,
+            observedState=state, observedIsDict=is_dict, observedTextIsString=is_text,
+            textLengthChars=metadata["textLengthChars"], textUtf8Bytes=metadata["textUtf8Bytes"],
+            textSha256=metadata["textSha256"], containsReady=metadata["containsArchitectHandoverReady"],
+            containsTransaction=metadata["containsTransactionId"], containsTask=metadata["containsTaskId"],
+            readyPredicate=ready, transactionPredicate=transaction_matches, taskPredicate=task_matches,
+            validationPredicate=validation, rejectionReason=rejection_reason,
+            diagnosticArtifactWritten=metadata["artifactWritten"], diagnosticArtifactPath=str(artifact),
+            diagnosticArtifactWriteError=metadata.get("artifactWriteError"),
+        )
+        return metadata
+
     def _request_legacy_handover_reemission_once(self, bridge: "ArchitectPlaywright", task_id: str) -> tuple[str, str | None]:
         """Re-emit only the exact in-flight legacy handover, once per durable epoch."""
         state = self.watcher.state
@@ -2303,6 +2382,17 @@ class ArchitectSessionRollover:
                 reason=type(error).__name__,
             )
             return "WAIT", None
+        try:
+            self._capture_legacy_handover_reemission_observation(
+                bridge, observed, transaction_id, task_id, epoch,
+            )
+        except Exception as error:
+            runtime_log(
+                getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+                "LEGACY_HANDOVER_REEMISSION_DIAGNOSTIC_WRITE_FAILED", state,
+                transactionId=transaction_id, taskId=task_id, recoveryEpoch=epoch,
+                reason=type(error).__name__, detail=str(error)[:300],
+            )
         response = observed.get("text") if isinstance(observed, dict) and observed.get("state") == "COMPLETED" else None
         if not isinstance(response, str) or not self._handover_response_valid(response, transaction_id):
             state["rolloverLegacyHandoverReemissionState"] = "INVALID_RESPONSE"
@@ -3691,6 +3781,47 @@ class ArchitectPlaywright:
         stable_hash = None
         stable_polls = 0
         poll_count = 0
+        baseline_entries: list[Any] = []
+        baseline_latest_id = None
+        baseline_latest_hash = None
+        baseline_full_history_hash = None
+        last_generation_visible: bool | None = None
+
+        def finish(result: dict[str, Any], completion_reason: str, current: dict[str, Any] | None = None,
+                   selected_text: str | None = None, generation_check_skipped: bool = False) -> dict[str, Any]:
+            exact_text = selected_text if isinstance(selected_text, str) else ""
+            digest = hashlib.sha256(exact_text.encode("utf-8")).hexdigest()
+            diagnostics = {
+                "baselineAssistantCount": baseline.get("count"),
+                "baselineLatestAssistantIdentity": baseline_latest_id,
+                "baselineLatestAssistantSignature": baseline_latest_hash,
+                "baselineFullHistoryHash": baseline_full_history_hash,
+                "candidateAssistantCount": current.get("count") if current else None,
+                "candidateLatestAssistantIdentity": current.get("latestMessageId") if current else None,
+                "candidateLatestAssistantSignature": current.get("latestTextHash") if current else None,
+                "candidateTextSha256": digest if selected_text is not None else None,
+                "generationVisibleLastSample": last_generation_visible,
+                "generationCheckSkippedForPendingStabilityPoll": generation_check_skipped,
+                "stabilityPollCount": stable_polls,
+                "pollCount": poll_count,
+                "completionReason": completion_reason,
+                "returnWhileGenerationVisible": (
+                    "NOT_SAMPLED" if generation_check_skipped else last_generation_visible is True
+                ),
+                "returnedTextReReadAtReturn": False,
+                "causalRequestCorrelationAvailable": False,
+                "resultState": result.get("state"),
+            }
+            self.last_wait_diagnostics = diagnostics
+            runtime_log(
+                getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                "ARCHITECT_WAIT_RETURN_DIAGNOSTICS",
+                getattr(getattr(self, "runtime_watcher", None), "state", None),
+                **diagnostics,
+            )
+            self._trace_operation("wait_for_new_response", "END", resultState=result.get("state"), completionReason=completion_reason)
+            return result
+
         self._observation_recovery_attempted = False
         self._history_recovery_attempted = False
         stability_poll_pending = False
@@ -3703,12 +3834,15 @@ class ArchitectPlaywright:
                         conversationId=wait_conversation_id,
                         pollCount=poll_count, pollIntervalSeconds=poll_interval, generationVisible="NOT_SAMPLED_AT_LOG_POINT",
                         waitReason="NEW_RESPONSE", completionState=getattr(self, "last_state", "NOT_SAMPLED_AT_LOG_POINT"))
-            if not stability_poll_pending and self.generation_visible():
-                stable_hash = None
-                stable_polls = 0
-                self.last_state = "RUNNING"
-                time.sleep(poll_interval)
-                continue
+            generation_check_skipped = stability_poll_pending
+            if not stability_poll_pending:
+                last_generation_visible = self.generation_visible()
+                if last_generation_visible:
+                    stable_hash = None
+                    stable_polls = 0
+                    self.last_state = "RUNNING"
+                    time.sleep(poll_interval)
+                    continue
             stability_poll_pending = False
             current = self.assistant_fast_snapshot()
             baseline_entries = baseline.get("entries", [])
@@ -3717,6 +3851,7 @@ class ArchitectPlaywright:
             baseline_latest_hash = baseline.get("latestTextHash")
             if baseline_latest_hash is None and baseline_latest:
                 baseline_latest_hash = hashlib.sha256(str(baseline_latest.get("text") or "").encode()).hexdigest()
+            baseline_full_history_hash = baseline.get("text_hash")
             identity_changed = (
                 current.get("count", 0) != baseline.get("count", 0)
                 or current.get("latestMessageId") != baseline_latest_id
@@ -3764,13 +3899,13 @@ class ArchitectPlaywright:
                         time.sleep(poll_interval)
                         continue
                     self.last_state = "BLOCKED"
-                    return {"state": "BLOCKED", "text": ""}
+                    return finish({"state": "BLOCKED", "text": ""}, "EMPTY_CANDIDATE_AFTER_RECOVERY", current, "", generation_check_skipped)
             if identity_changed and text.strip():
                 if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text):
                     self.last_state = "COMPLETED"
                     result = {"state": "COMPLETED", "text": text}
-                    self._trace_operation("wait_for_new_response", "END", resultState=result["state"])
-                    return result
+                    reason = "TERMINAL_COMPLETE_MARKER" if text.rstrip().endswith(COMPLETE) else "HANDOVER_READY_MARKER"
+                    return finish(result, reason, current, text, generation_check_skipped)
                 current_hash = hashlib.sha256(text.encode()).hexdigest()
                 if current_hash == stable_hash:
                     stable_polls += 1
@@ -3785,17 +3920,21 @@ class ArchitectPlaywright:
                 if text.rstrip().endswith(COMPLETE) or architect_handover_ready(text) or extract_executor_prompt_envelope(text) is not None:
                     self.last_state = "COMPLETED"
                     result = {"state": "COMPLETED", "text": text}
-                    self._trace_operation("wait_for_new_response", "END", resultState=result["state"])
-                    return result
+                    if text.rstrip().endswith(COMPLETE):
+                        reason = "TERMINAL_COMPLETE_MARKER"
+                    elif architect_handover_ready(text):
+                        reason = "HANDOVER_READY_MARKER"
+                    else:
+                        reason = "EXECUTOR_ENVELOPE_MARKER"
+                    return finish(result, reason, current, text, generation_check_skipped)
                 self.last_state = "BLOCKED"
                 result = {"state": "BLOCKED", "text": text}
-                self._trace_operation("wait_for_new_response", "END", resultState=result["state"])
-                return result
+                return finish(result, "STABLE_TWO_POLL_NO_COMPLETION_MARKER", current, text, generation_check_skipped)
             stable_hash = None
             stable_polls = 0
             if identity_changed:
                 self.last_state = "BLOCKED"
-                return {"state": "BLOCKED", "text": text}
+                return finish({"state": "BLOCKED", "text": text}, "IDENTITY_CHANGED_WITH_EMPTY_TEXT", current, text, generation_check_skipped)
             self.last_state = "NOT_YET"
             time.sleep(poll_interval)
 
