@@ -6356,6 +6356,14 @@ class LocalFirstOrchestrator:
             return None
         return task_id
 
+    def _post_discussion_staged_prompt_evidence_valid(self, task_id: str) -> bool:
+        transaction_id = self.state.get("postDiscussionProtocolTransactionId")
+        return bool(
+            transaction_id
+            and self._exact_staged_prompt_recovery_task() == str(task_id or "")
+            and str(transaction_id) == str(self.state.get("rolloverTransactionId") or "")
+        )
+
     def _accept_exact_staged_prompt_envelope(self, response: str, task_id: str) -> dict[str, str]:
         """Accept only a wrapper around the already-persisted staged prompt."""
         if (
@@ -6443,6 +6451,16 @@ class LocalFirstOrchestrator:
         if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
             return "GENERATING"
         baseline = self.state.get("postDiscussionProtocolBaseline") or self.state.get("architectDiscussionBaseline")
+        task_id = str(self.state.get("postDiscussionProtocolTaskId") or self.state.get("taskId") or "")
+        if self.state.get("postDiscussionProtocolTransactionId") and not self._post_discussion_staged_prompt_evidence_valid(task_id):
+            self.state.update({
+                "state": "HUMAN_REQUIRED",
+                "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+                "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID",
+            })
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="STAGED_PROMPT_EVIDENCE_INVALID")
+            return "FAILED"
         if isinstance(response, str) and response.strip() and not (
             isinstance(baseline, dict)
             and isinstance(baseline.get("count"), int) and baseline.get("count") >= 0
@@ -7648,6 +7666,15 @@ def service_post_discussion_protocol_gate_once(
     if paused():
         runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="DISCUSSION_PAUSED")
         return "WAIT"
+    if watcher.state.get("postDiscussionProtocolTransactionId") and not watcher._post_discussion_staged_prompt_evidence_valid(str(task_id or "")):
+        watcher.state.update({
+            "state": "HUMAN_REQUIRED",
+            "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+            "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID",
+        })
+        watcher.save()
+        runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_FAILED", watcher.state, taskId=task_id, reason="STAGED_PROMPT_EVIDENCE_INVALID")
+        return "FAILED"
     bridge = None
     try:
         conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
@@ -7655,17 +7682,19 @@ def service_post_discussion_protocol_gate_once(
         if callable(getattr(bridge, "generation_visible", None)) and bridge.generation_visible():
             runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="ARCHITECT_GENERATING")
             return "GENERATING"
-        latest = None
-        latest_reader = getattr(bridge, "latest_assistant_entry", None)
-        if callable(latest_reader):
-            latest = latest_reader()
-        elif isinstance(getattr(bridge, "entries", None), list) and bridge.entries:
-            latest = bridge.entries[-1]
-        response = str((latest or {}).get("text") or "") if isinstance(latest, dict) else ""
-        if not response.strip():
+        baseline = watcher.state.get("postDiscussionProtocolBaseline") or watcher.state.get("architectDiscussionBaseline") or {}
+        waiter = getattr(bridge, "wait_for_new_response", None)
+        if not callable(waiter):
+            runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="STABLE_RESPONSE_OBSERVER_UNAVAILABLE")
+            return "WAIT"
+        observed = waiter(baseline, poll_interval=0.5)
+        if not isinstance(observed, dict) or observed.get("state") != "COMPLETED":
             runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="NO_COMPLETED_RESPONSE")
             return "WAIT"
-        disposition = watcher.reconcile_post_discussion_response(bridge, response, completed=True)
+        if paused():
+            runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason="DISCUSSION_PAUSED")
+            return "WAIT"
+        disposition = watcher.reconcile_post_discussion_response(bridge, str(observed.get("text") or ""), completed=True)
         if disposition in {"WAIT", "GENERATING"}:
             runtime_log(logger, run_id, "ARCHITECT_ENVELOPE_REPAIR_WAIT", watcher.state, taskId=task_id, reason=disposition)
         elif disposition == "FAILED":
@@ -8249,6 +8278,14 @@ def main() -> None:
                         continue
                     if observed.get("state") == "COMPLETED" and rollover is not None:
                         sample_completed_architect_response_memory(watcher, bridge)
+                    if watcher.state.get("postDiscussionEnvelopeRequired"):
+                        disposition = watcher.reconcile_post_discussion_response(
+                            bridge, observed["text"], completed=observed.get("state") == "COMPLETED"
+                        )
+                        baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
+                        if disposition in {"REPAIR_REQUESTED", "FAILED", "EXECUTE", "STOP", "HUMAN_REQUIRED"} and watcher.state.get("state") != "ARCHITECT_RUNNING":
+                            break
+                        continue
                     if watcher.state.get("handoverRequested") and watcher.state.get("rolloverInProgress") and rollover is not None:
                         if watcher.process_pending_handover_response(bridge, observed["text"]):
                             baseline = bridge.assistant_baseline()
@@ -8268,14 +8305,6 @@ def main() -> None:
                         watcher.reject_invalid_handover_response()
                         print("STATE=HUMAN_REQUIRED reason=ARCHITECT_HANDOVER_RESPONSE_INVALID")
                         break
-                    if watcher.state.get("postDiscussionEnvelopeRequired"):
-                        disposition = watcher.reconcile_post_discussion_response(
-                            bridge, observed["text"], completed=observed.get("state") == "COMPLETED"
-                        )
-                        baseline = watcher.state.get("architectBaseline") or bridge.assistant_baseline()
-                        if disposition in {"REPAIR_REQUESTED", "FAILED", "EXECUTE", "STOP", "HUMAN_REQUIRED"} and watcher.state.get("state") != "ARCHITECT_RUNNING":
-                            break
-                        continue
                     try:
                         if watcher.state.get("architectBootstrapAwaiting"):
                             decision = watcher.consume_idle_architect_response(observed["text"], launch)

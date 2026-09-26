@@ -6732,6 +6732,13 @@ class _PostDiscussionBridge:
     def latest_assistant_entry(self):
         return self.entries[-1] if self.entries else None
 
+    def wait_for_new_response(self, baseline, poll_interval=0.5):
+        if self.generating:
+            return {"state": "RUNNING", "text": ""}
+        if len(self.entries) > int(baseline.get("count", 0)):
+            return {"state": "COMPLETED", "text": str(self.entries[-1].get("text") or "")}
+        return {"state": "WAIT", "text": ""}
+
     def submit_result_bounded(self, message):
         self.sent.append(message)
 
@@ -6948,6 +6955,32 @@ def test_public_protocol_gate_waits_while_architect_generates(tmp_path, monkeypa
     assert watcher.state["postDiscussionEnvelopeRequired"] is True
     assert bridge.sent == []
     assert rollover_calls == []
+
+
+def test_public_protocol_gate_fails_closed_on_staged_prompt_mismatch(tmp_path, monkeypatch):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("old", "old")])
+    watcher.state["architectDiscussionBaseline"] = bridge.assistant_baseline()
+    watcher.save()
+    watcher.request_discussion_resume()
+    watcher.state["nextPromptPath"] = str(tmp_path / "wrong-prompt.txt")
+    watcher.save()
+    rollover_calls = []
+    monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(lambda *_args: bridge))
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(watcher_module, "service_deferred_rollover_once", lambda *_args, **_kwargs: rollover_calls.append(1) or False)
+    assert watcher_module.run_next_prompt_ready_once(watcher, lambda *_args: (_ for _ in ()).throw(AssertionError("must not launch")), "endpoint", lambda: False) is None
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["postDiscussionProtocolFailure"] == "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"
+    assert bridge.sent == []
+    assert rollover_calls == []
+
+
+def test_architect_running_main_path_prioritizes_post_discussion_protocol_over_handover():
+    source = inspect.getsource(watcher_module.main)
+    protocol_branch = source.index('if watcher.state.get("postDiscussionEnvelopeRequired"):')
+    handover_branch = source.index('if watcher.state.get("handoverRequested") and watcher.state.get("rolloverInProgress")')
+    assert protocol_branch < handover_branch
 
 
 def test_post_discussion_repair_failure_is_durable_and_prevents_second_repair(tmp_path):
