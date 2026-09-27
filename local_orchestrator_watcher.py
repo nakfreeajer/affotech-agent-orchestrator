@@ -481,10 +481,18 @@ class WindowsSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
             self._warn_deferred(error)
 
 
-def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | None = None) -> tuple[logging.Logger, str, str]:
-    """Initialize the one durable, privacy-safe watcher log before workflow work."""
+def initialize_runtime_logging(
+    state_dir: str | os.PathLike[str],
+    run_id: str | None = None,
+    runtime_context: str = "DIAGNOSTIC",
+) -> tuple[logging.Logger, str, str]:
+    """Initialize a privacy-safe log, isolating diagnostics from production history."""
     state_path = Path(state_dir)
-    log_path = state_path / "logs" / "orchestrator.log"
+    context = str(runtime_context or "DIAGNOSTIC").strip().upper()
+    if context not in {"PRODUCTION", "DIAGNOSTIC"}:
+        raise ValueError("RUNTIME_LOG_CONTEXT_INVALID")
+    log_path = (state_path / "logs" / "orchestrator.log" if context == "PRODUCTION"
+                else state_path / "logs" / "diagnostic" / "orchestrator-diagnostic.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     logger = logging.getLogger(RUNTIME_LOGGER_NAME)
@@ -497,8 +505,9 @@ def initialize_runtime_logging(state_dir: str | os.PathLike[str], run_id: str | 
                    if logging.handlers.RotatingFileHandler is _ORIGINAL_ROTATING_FILE_HANDLER
                    else logging.handlers.RotatingFileHandler)
     handler = handler_type(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s level=%(levelname)s runId=%(runId)s state=%(state)s taskId=%(taskId)s event=%(event)s %(message)s"))
+    handler.setFormatter(logging.Formatter("%(asctime)s level=%(levelname)s runtimeContext=%(runtimeContext)s runId=%(runId)s state=%(state)s taskId=%(taskId)s event=%(event)s %(message)s"))
     logger.addHandler(handler)
+    logger.runtime_context = context
     return logger, run_id, str(log_path)
 
 
@@ -506,7 +515,7 @@ def runtime_log(logger: logging.Logger | None, run_id: str | None, event: str, s
     if logger is None:
         return
     current = state or {}
-    safe = {"runId": run_id or "UNKNOWN", "state": current.get("state", "UNKNOWN"), "taskId": current.get("taskId") or current.get("nextTaskId") or "NONE", "event": event}
+    safe = {"runtimeContext": getattr(logger, "runtime_context", "UNKNOWN"), "runId": run_id or "UNKNOWN", "state": current.get("state", "UNKNOWN"), "taskId": current.get("taskId") or current.get("nextTaskId") or "NONE", "event": event}
     safe.update({key: str(value).replace("\n", " ") for key, value in fields.items() if value is not None})
     logger.log(level, " ".join(f"{key}={value}" for key, value in fields.items() if value is not None), extra=safe)
 
@@ -9479,7 +9488,8 @@ def main() -> None:
     logger = None
     run_id = None
     try:
-        logger, run_id, log_path = initialize_runtime_logging(state_dir)
+        runtime_context = "DIAGNOSTIC" if rollover_diagnostic_only_enabled() else os.environ.get("AFFOTECH_RUNTIME_CONTEXT", "PRODUCTION")
+        logger, run_id, log_path = initialize_runtime_logging(state_dir, runtime_context=runtime_context)
     except Exception as error:
         print(f"ORCHESTRATOR_LOGGING_INIT_FAILED error={type(error).__name__}:{error}")
         instance_lock.release()

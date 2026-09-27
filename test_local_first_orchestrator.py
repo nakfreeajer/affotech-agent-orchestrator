@@ -27,6 +27,10 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
 import local_orchestrator_watcher as watcher_module
 import crash_recovery_bootstrap as bootstrap_module
 
+# Direct main() invocations in this deterministic suite must never target the
+# production orchestrator log, even if a test supplies the real repository path.
+os.environ["AFFOTECH_RUNTIME_CONTEXT"] = "DIAGNOSTIC"
+
 
 def envelope(task, action="EXECUTE", prompt="next task", documentation=None):
     body = prompt if action == "EXECUTE" else ""
@@ -5203,7 +5207,7 @@ def test_idle_does_not_resurrect_superseded_task(tmp_path, monkeypatch):
     assert watcher.state["supersededTaskIds"] == ["000001"]
 
 
-def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys):
+def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys, tmp_path):
     class IdleWatcher:
         def __init__(self, *_args, **_kwargs):
             self.state = {"state": "IDLE"}
@@ -5213,6 +5217,9 @@ def test_main_handles_ctrl_c_from_idle_cleanly(monkeypatch, capsys):
 
     monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", IdleWatcher)
     monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_args, **_kwargs: True)
+    monkeypatch.setenv("AFFOTECH_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("AFFOTECH_ORCHESTRATOR_STATE_DIR", str(tmp_path / "orchestrator"))
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "DIAGNOSTIC")
     watcher_module.main()
     assert "STATE=STOPPED" in capsys.readouterr().out
 
@@ -6284,6 +6291,9 @@ def test_main_reuses_idle_playwright_bridge_until_state_changes(monkeypatch, tmp
     monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(watcher_module.ArchitectPlaywright, "attach", staticmethod(attach))
     monkeypatch.setenv("ORCHESTRATOR_POLL_INTERVAL", "0")
+    monkeypatch.setenv("AFFOTECH_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("AFFOTECH_ORCHESTRATOR_STATE_DIR", str(tmp_path / "orchestrator"))
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "DIAGNOSTIC")
     monkeypatch.setattr(watcher_module, "visible_executor_launcher", lambda *_: None)
     watcher_module.main()
     assert calls == {"attach": 1, "close": 1, "inspect": 3}
@@ -6531,11 +6541,30 @@ def test_runtime_logging_is_durable_rotating_contextual_and_private(tmp_path):
     watcher_module.runtime_log(logger, run_id, "STATE_TRANSITION", state, **{"from": "IDLE", "to": "RESULT_READY", "reason": "result", "hash": "abc"})
     logger.handlers[0].flush()
     text = Path(log_path).read_text(encoding="utf-8")
-    assert Path(log_path) == tmp_path / "logs" / "orchestrator.log"
-    assert run_id in text and "WATCHER_STARTED" in text and "from=IDLE" in text
+    assert Path(log_path) == tmp_path / "logs" / "diagnostic" / "orchestrator-diagnostic.log"
+    assert run_id in text and "runtimeContext=DIAGNOSTIC" in text and "WATCHER_STARTED" in text and "from=IDLE" in text
     assert "private prompt body" not in text
     handler = logger.handlers[0]
     assert handler.maxBytes == 5 * 1024 * 1024 and handler.backupCount == 5
+
+
+def test_runtime_logging_production_destination_is_explicit_and_separate(tmp_path):
+    diagnostic, diagnostic_run, diagnostic_path = watcher_module.initialize_runtime_logging(tmp_path)
+    watcher_module.runtime_log(diagnostic, diagnostic_run, "DIAGNOSTIC_CHECK", {"state": "IDLE"})
+    for handler in diagnostic.handlers:
+        handler.flush()
+    assert Path(diagnostic_path) == tmp_path / "logs" / "diagnostic" / "orchestrator-diagnostic.log"
+    assert "runtimeContext=DIAGNOSTIC" in Path(diagnostic_path).read_text(encoding="utf-8")
+
+    production, production_run, production_path = watcher_module.initialize_runtime_logging(
+        tmp_path, runtime_context="PRODUCTION"
+    )
+    watcher_module.runtime_log(production, production_run, "WATCHER_STARTED", {"state": "IDLE"})
+    for handler in production.handlers:
+        handler.flush()
+    assert Path(production_path) == tmp_path / "logs" / "orchestrator.log"
+    assert "runtimeContext=PRODUCTION" in Path(production_path).read_text(encoding="utf-8")
+    assert "DIAGNOSTIC_CHECK" not in Path(production_path).read_text(encoding="utf-8")
 
 
 def test_runtime_logging_initialization_fails_closed(tmp_path, monkeypatch):
@@ -9339,6 +9368,24 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
         original.state.pop(key, None)
     original.save()
 
+    # Exercise the same read-only classification consumed by AFFOTECH-START
+    # before it presents the operator's ordinary START confirmation.
+    state_bytes_before_classification = original.state_path.read_bytes()
+    discovery = {
+        "repository": str(original.project_dir), "stateDir": str(original.state_dir),
+        "state": original.state, "watcherRunning": False,
+        "activeWriterPresent": False, "executorPidAlive": False,
+        "executorSessionExists": True,
+    }
+    assert bootstrap_module.classify_workflow(discovery) == "SAFE_EXISTING_HANDOVER_RELAY"
+    assert original.state_path.read_bytes() == state_bytes_before_classification
+    wrapper = (Path(__file__).with_name("AFFOTECH-START.ps1")).read_text(encoding="utf-8")
+    assert "SAFE_EXISTING_HANDOVER_RELAY" in wrapper
+    assert wrapper.index("if ($StatusOnly)") < wrapper.index('Read-Host "Type START')
+    assert 'recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"' in wrapper
+    assert "SAFE_EXISTING_HANDOVER_RELAY" in wrapper[wrapper.index('recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"'):]
+    assert "new authorization" in wrapper.lower() or "no authorization" in wrapper.lower()
+
     events = []
     old_page = _ArchitectDomPage("OLD-ARCHITECT")
     old_page.events = events
@@ -9412,10 +9459,54 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
     assert launches == [prompt_bytes.decode("utf-8")]
     assert old_page.sent_payloads == []
     assert len(fresh_pages) == 1
-    assert sum("Fresh Architect session bootstrap protocol" in payload for payload in fresh.sent_payloads) == 1
+    assert sum("Fresh Architect session bootstrap protocol" in payload for payload in fresh_pages[0].sent_payloads) == 1
     assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
     assert prompt.read_bytes() == prompt_bytes
     assert attach_calls[0] == "OLD-ARCHITECT"
+
+
+@pytest.mark.parametrize("mutation", ["reason", "transaction", "task", "writer", "watcher"])
+def test_bootstrap_existing_relay_classification_is_exact_and_unrelated_human_required_stays_blocked(tmp_path, mutation):
+    watcher, prompt, _prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    authorization = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4, "qualificationEpoch": 5,
+        "requestSha256": "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0",
+        "promptSha256": "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85",
+        "automaticRecoveryEpochCount": 3, "automaticRecoveryMaxEpochs": 3,
+        "executorLaunchAuthorized": False, "requiresNormalRolloverCompletion": True,
+    }
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "nextTaskId": "000103",
+        "rolloverRecoveryEpoch": 5, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3, "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": True, "handoverRequested": True,
+        "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "RECONCILE_PENDING",
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5,
+        "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverSentResponseRetryAuthorization": authorization,
+        "rolloverSentResponseRetryAuthorizations": [authorization],
+        "postDiscussionEnvelopeRequired": True, "postDiscussionProtocolTaskId": "000103",
+        "postDiscussionProtocolTransactionId": tx,
+        "postDiscussionProtocolRolloverCommittedTransactionId": None,
+        "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorSessionMode": "PERSISTENT", "executorProcessState": "STOPPED",
+        "discussionPauseActive": False,
+    })
+    discovery = {
+        "repository": str(watcher.project_dir), "stateDir": str(watcher.state_dir),
+        "state": watcher.state, "watcherRunning": False, "activeWriterPresent": False,
+        "executorPidAlive": False, "executorSessionExists": True,
+    }
+    if mutation == "reason": watcher.state["humanRequiredReason"] = "OTHER_HUMAN_REQUIRED"
+    elif mutation == "transaction": watcher.state["rolloverTransactionId"] = "other"
+    elif mutation == "task": watcher.state["nextTaskId"] = "000104"
+    elif mutation == "writer": discovery["activeWriterPresent"] = True
+    elif mutation == "watcher": discovery["watcherRunning"] = True
+    assert bootstrap_module.classify_workflow(discovery) == "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"
+    assert prompt.is_file()
 
 
 @pytest.mark.parametrize("mismatch", [

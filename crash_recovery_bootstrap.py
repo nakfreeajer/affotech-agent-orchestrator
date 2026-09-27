@@ -263,8 +263,26 @@ def classify_workflow(discovery: dict[str, Any], architect_observation: dict[str
             return "RECOVER_EXISTING_EXECUTOR_RESULT"
         return "EXECUTOR_INTERRUPTED_NO_RESULT"
     if workflow == "HUMAN_REQUIRED":
+        if _existing_handover_relay_preflight_eligible(discovery):
+            return "SAFE_EXISTING_HANDOVER_RELAY"
         return "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"
     return "BLOCK_INCONSISTENT_STATE"
+
+
+def _existing_handover_relay_preflight_eligible(discovery: dict[str, Any]) -> bool:
+    """Reuse the runtime's exact 1R predicate for read-only startup classification."""
+    if (discovery.get("watcherRunning") is not False
+            or discovery.get("activeWriterPresent") is not False
+            or discovery.get("executorPidAlive") is not False
+            or discovery.get("executorSessionExists") is not True):
+        return False
+    try:
+        from local_orchestrator_watcher import LocalFirstOrchestrator, _legacy_sent_response_relay_eligible
+        watcher = LocalFirstOrchestrator(discovery["repository"], discovery["stateDir"])
+        watcher.state = discovery["state"]
+        return bool(_legacy_sent_response_relay_eligible(watcher))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def validate_retry(discovery: dict[str, Any], task_id: str) -> tuple[bool, str]:

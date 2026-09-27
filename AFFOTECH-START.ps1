@@ -118,6 +118,9 @@ if ($Report.recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION" -and
     Write-Host "HUMAN_REQUIRED: no automatic action. Executor retry and each rollover recovery qualification require separate explicit authorizations."
     exit 5
 }
+if ($Report.recoveryClassification -eq "SAFE_EXISTING_HANDOVER_RELAY") {
+    Write-Host "SAFE_EXISTING_HANDOVER_RELAY: exact persisted epoch-5 relay is eligible; no authorization or resend will occur. Type START only to begin the normal watcher."
+}
 
 if ($Probe -eq $null -or -not $Probe.architectObservation) {
     if ($CdpReason -eq "ARCHITECT_CDP_ABSENT") {
@@ -151,7 +154,9 @@ $oldAuth = $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY
 $oldRolloverAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY
 $oldPostfixQualificationAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION
 $oldSentResponseRetryAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY
+$oldRuntimeContext = $env:AFFOTECH_RUNTIME_CONTEXT
 try {
+    $env:AFFOTECH_RUNTIME_CONTEXT = "PRODUCTION"
     if ($AuthorizeRetry) { $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY = $AuthorizeRetry }
     else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY -ErrorAction SilentlyContinue }
     if ($AuthorizeRolloverDiagnosticRetry) { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY = "7fdbd798659f42295a18dd2d" }
@@ -171,4 +176,6 @@ try {
     else { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION = $oldPostfixQualificationAuth }
     if ($null -eq $oldSentResponseRetryAuth) { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY -ErrorAction SilentlyContinue }
     else { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY = $oldSentResponseRetryAuth }
+    if ($null -eq $oldRuntimeContext) { Remove-Item Env:AFFOTECH_RUNTIME_CONTEXT -ErrorAction SilentlyContinue }
+    else { $env:AFFOTECH_RUNTIME_CONTEXT = $oldRuntimeContext }
 }
