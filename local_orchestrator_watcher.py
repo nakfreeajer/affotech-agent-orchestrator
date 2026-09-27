@@ -2801,17 +2801,76 @@ class ArchitectSessionRollover:
             tracer.record("ROLLOVER", "ArchitectSessionRollover._record_fresh_candidate", "FUNCTION", "END", self.watcher.state, conversationId=conversation_id, candidateState=status)
         return conversation_id
 
+    def _fresh_page_exact_bootstrap_visible(self, page: Any, bootstrap: str) -> tuple[bool, str]:
+        """Observe the exact fresh-session user payload, preferring semantic history."""
+        candidate = ArchitectPlaywright(page)
+        try:
+            semantic = candidate.user_message_texts()
+        except Exception:
+            semantic = []
+        expected = normalize_prompt(bootstrap)
+        if semantic:
+            return any(isinstance(text, str) and normalize_prompt(text) == expected for text in semantic), "SEMANTIC_HISTORY"
+        visible = candidate.current_visible_user_message_texts()
+        return any(isinstance(text, str) and normalize_prompt(text) == expected for text in visible), "VISIBLE_USER_DOM"
+
+    def _fresh_page_ready_visible(self, page: Any) -> tuple[bool, str]:
+        """Observe READY semantically first, then from the currently rendered DOM."""
+        candidate = ArchitectPlaywright(page)
+        try:
+            entries = candidate._assistant_entries()
+        except Exception:
+            entries = []
+        if entries:
+            latest = entries[-1].get("text", "") if isinstance(entries[-1], dict) else ""
+            return architect_session_ready(latest), "SEMANTIC_HISTORY"
+        visible = candidate.current_visible_assistant_texts()
+        return any(architect_session_ready(text) for text in visible), "VISIBLE_ASSISTANT_DOM"
+
+    def _fresh_candidate_proven(self, page: Any, bootstrap: str, expected_id: str | None = None) -> bool:
+        """Require stable, exact bootstrap+READY evidence on the same conversation."""
+        observations = []
+        for _ in range(2):
+            try:
+                url = getattr(page, "url", "")
+                url = url() if callable(url) else url
+                actual_id = architect_conversation_id_from_url(url)
+            except (RuntimeError, StopIteration, TypeError):
+                return False
+            if expected_id and not architect_conversation_ids_equivalent(expected_id, actual_id):
+                return False
+            user_ok, user_source = self._fresh_page_exact_bootstrap_visible(page, bootstrap)
+            ready_ok, ready_source = self._fresh_page_ready_visible(page)
+            observations.append((actual_id, user_ok, ready_ok, user_source, ready_source))
+            if not user_ok or not ready_ok:
+                return False
+            if len(observations) == 1:
+                time.sleep(0.1)
+        proven = observations[0] == observations[1]
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+            "FRESH_ARCHITECT_CANDIDATE_CONTENT_PROOF", self.watcher.state,
+            candidateConversationId=observations[-1][0] if observations else None,
+            bootstrapSha256=hashlib.sha256(bootstrap.encode("utf-8")).hexdigest(),
+            userObserver=observations[-1][3] if observations else None,
+            readyObserver=observations[-1][4] if observations else None,
+            stableObservations=len(observations) if proven else 0,
+            decision="ACCEPT" if proven else "BLOCK",
+            exactBootstrapAndReady=proven,
+        )
+        return proven
+
     def _existing_fresh_candidate_page(self, bridge: "ArchitectPlaywright", handover: str | None = None) -> Any | None:
         tracer = diagnostic_trace_for(self.watcher)
         if tracer:
             tracer.record("ROLLOVER", "ArchitectSessionRollover._existing_fresh_candidate_page", "FUNCTION", "BEGIN", self.watcher.state, persistedCandidateId=self.watcher.state.get("rolloverFreshCandidateConversationId"))
         candidate_id = self.watcher.state.get("rolloverFreshCandidateConversationId")
         owned_page = getattr(bridge, "_fresh_candidate_page", None)
-        if owned_page is not None and not getattr(owned_page, "closed", False):
-            return owned_page
         stale_candidate_id = None
         context = getattr(getattr(bridge, "page", None), "context", None)
         pages = getattr(context, "pages", []) if context is not None else []
+        if owned_page is not None and not getattr(owned_page, "closed", False) and owned_page not in pages:
+            pages = [*pages, owned_page]
         if tracer:
             tracer.record("ROLLOVER", "_existing_fresh_candidate_page", "TARGET_INVENTORY", "BEGIN", self.watcher.state, pageCount=len(pages), inventory=[{"index": index, "url": getattr(page, "url", "")} for index, page in enumerate(pages)])
         matches = []
@@ -2830,9 +2889,23 @@ class ArchitectSessionRollover:
                 except (RuntimeError, StopIteration, TypeError):
                     continue
                 if architect_conversation_ids_equivalent(str(candidate_id), actual_id):
+                    if not isinstance(handover, str) or not self._handover_response_valid(handover):
+                        return None
+                    bootstrap = fresh_architect_bootstrap_payload(handover)
+                    bootstrap_hash = hashlib.sha256(bootstrap.encode("utf-8")).hexdigest()
+                    stored_hash = self.watcher.state.get("rolloverFreshBootstrapPayloadHash")
+                    if stored_hash and stored_hash != bootstrap_hash:
+                        return None
+                    if not stored_hash:
+                        self.watcher.state["rolloverFreshBootstrapPayloadHash"] = bootstrap_hash
+                        self.watcher.save()
+                    if self._fresh_candidate_proven(page, bootstrap, actual_id):
+                        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
+                                    oldConversationId=old_id, candidateConversationId=actual_id, candidateCount=1, decision="USE_PERSISTED", reason="STABLE_EXACT_BOOTSTRAP_AND_READY")
+                        return page
                     runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_CANDIDATE_DECISION", self.watcher.state,
-                                oldConversationId=old_id, candidateConversationId=actual_id, candidateCount=1, decision="USE_PERSISTED", reason="PERSISTED_ID_MATCH")
-                    return page
+                                oldConversationId=old_id, candidateConversationId=actual_id, candidateCount=1, decision="BLOCK", reason="PERSISTED_CANDIDATE_CONTENT_UNPROVEN")
+                    return None
             stale_candidate_id = str(candidate_id)
         if (not self.watcher.state.get("rolloverDue") or not self.watcher.state.get("rolloverPending")
                 or not self.watcher.state.get("handoverRequested")
@@ -2858,16 +2931,7 @@ class ArchitectSessionRollover:
                 continue
             if old_id and architect_conversation_ids_equivalent(old_id, actual_id):
                 continue
-            candidate_bridge = ArchitectPlaywright(page)
-            try:
-                user_messages = candidate_bridge.user_message_texts()
-                entries = candidate_bridge._assistant_entries()
-            except Exception:
-                continue
-            if not any(isinstance(text, str) and normalize_prompt(text) == normalize_prompt(bootstrap) for text in user_messages):
-                continue
-            completed = [entry.get("text", "") for entry in entries if isinstance(entry, dict) and isinstance(entry.get("text"), str)]
-            if not completed or not architect_session_ready(completed[-1]):
+            if not self._fresh_candidate_proven(page, bootstrap):
                 continue
             proven.append(page)
         if len(proven) > 1:
@@ -2982,6 +3046,7 @@ class ArchitectSessionRollover:
             new_bridge.runtime_watcher = self.watcher
             new_bridge.liveness_watchdog = getattr(self.watcher, "liveness_watchdog", None)
             new_bridge.runtime_conversation_id = conversation_id
+            ready_streak = 0
             while time.monotonic() < ack_deadline:
                 mark_watcher_liveness(self.watcher, "FRESH_READY_OBSERVATION_BEGIN")
                 generation_is_visible = new_bridge.generation_visible()
@@ -2994,18 +3059,21 @@ class ArchitectSessionRollover:
                         tracer.record("ROLLOVER", "complete_from_response", "WAIT_END", "END", self.watcher.state, reason="fresh session generation")
                     continue
                 mark_watcher_liveness(self.watcher, "FRESH_READY_HISTORY_READ_BEGIN")
-                entries = new_bridge._assistant_entries()
+                ready, ready_source = self._fresh_page_ready_visible(new_page)
                 mark_watcher_liveness(self.watcher, "FRESH_READY_HISTORY_READ_COMPLETE")
-                if entries:
-                    latest = entries[-1].get("text", "") if isinstance(entries[-1], dict) else ""
-                    if architect_session_ready(latest):
-                        mark_watcher_liveness(self.watcher, "ARCHITECT_SESSION_READY_OBSERVED")
-                        runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_ACK_DECISION", self.watcher.state,
-                                    oldConversationId=self.watcher.state.get("architectConversationId"), candidateConversationId=conversation_id,
-                                    sessionReadyObserved=True, candidateState="ACK_PENDING", decision="ACCEPT", reason="ARCHITECT_SESSION_READY")
-                        if tracer:
-                            tracer.record("ROLLOVER", "complete_from_response", "FRESH_READY_WAIT_COMPLETE", "END", self.watcher.state, conversationId=conversation_id, assistantSha256=hashlib.sha256(latest.encode()).hexdigest())
-                        break
+                ready_streak = ready_streak + 1 if ready else 0
+                if ready_streak >= 2:
+                    mark_watcher_liveness(self.watcher, "ARCHITECT_SESSION_READY_OBSERVED")
+                    runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "FRESH_ARCHITECT_ACK_DECISION", self.watcher.state,
+                                oldConversationId=self.watcher.state.get("architectConversationId"), candidateConversationId=conversation_id,
+                                sessionReadyObserved=True, candidateState="ACK_PENDING", observer=ready_source, stableObservations=ready_streak,
+                                decision="ACCEPT", reason="ARCHITECT_SESSION_READY")
+                    if tracer:
+                        tracer.record("ROLLOVER", "complete_from_response", "FRESH_READY_WAIT_COMPLETE", "END", self.watcher.state, conversationId=conversation_id)
+                    break
+                if not ready and ready_source == "SEMANTIC_HISTORY":
+                    entries = new_bridge._assistant_entries()
+                    latest = entries[-1].get("text", "") if entries and isinstance(entries[-1], dict) else ""
                     if latest.strip():
                         raise RuntimeError("ARCHITECT_NEW_CONVERSATION_ACK_INVALID")
                 time.sleep(0.25)
@@ -3924,6 +3992,52 @@ class ArchitectPlaywright:
         messages = self.page.locator('[data-message-author-role="user"]')
         return [messages.nth(index).inner_text() for index in range(messages.count())]
 
+    def current_visible_user_message_texts(self) -> list[str]:
+        """Read only currently rendered user-message nodes when semantic selectors miss."""
+        evaluate = getattr(getattr(self, "page", None), "evaluate", None)
+        if not callable(evaluate):
+            return []
+        result = evaluate(r"""
+        () => {
+          /* fresh-user-dom-fallback */
+          const main = document.querySelector('main');
+          if (!main) return [];
+          const nodes = [...main.querySelectorAll('[class*="bg-user-message"]')];
+          return nodes.map(node => {
+            const clone = node.cloneNode(true);
+            clone.querySelectorAll('button,[role="button"]').forEach(control => control.remove());
+            return clone.innerText || clone.textContent || '';
+          });
+        }
+        """)
+        return [text for text in result if isinstance(text, str)] if isinstance(result, list) else []
+
+    def current_visible_assistant_texts(self) -> list[str]:
+        """Read exact READY text nodes outside user turns from the rendered transcript."""
+        evaluate = getattr(getattr(self, "page", None), "evaluate", None)
+        if not callable(evaluate):
+            return []
+        result = evaluate(r"""
+        () => {
+          /* fresh-assistant-ready-dom-fallback */
+          const main = document.querySelector('main');
+          if (!main) return [];
+          const normalize = value => (value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+          const output = [];
+          const walker = document.createTreeWalker(main, NodeFilter.SHOW_ELEMENT);
+          let node;
+          while ((node = walker.nextNode())) {
+            if (normalize(node.innerText || node.textContent) !== 'ARCHITECT_SESSION_READY') continue;
+            if (node.closest('[data-message-author-role="user"],[class*="bg-user-message"]')) continue;
+            const rect = node.getBoundingClientRect();
+            if (!rect.width || !rect.height) continue;
+            output.push('ARCHITECT_SESSION_READY');
+          }
+          return output;
+        }
+        """)
+        return [text for text in result if isinstance(text, str)] if isinstance(result, list) else []
+
     def exact_user_message_payload_observed(self, payload: str, history: bool = False) -> bool:
         target = normalize_prompt(payload)
         latest = self.latest_user_message()
@@ -3989,6 +4103,39 @@ class ArchitectPlaywright:
         except Exception:
             return "AMBIGUOUS"
         return "SEND_FAILED" if isinstance(still_present, str) and normalize_prompt(still_present) == normalize_prompt(payload) else "AMBIGUOUS"
+
+    def reconcile_fresh_bootstrap_delivery(self, payload: str, timeout: float = 2.0) -> str:
+        """Observe an ambiguous fresh bootstrap without ever submitting it again."""
+        deadline = time.monotonic() + max(0.0, min(float(timeout), 5.0))
+        target = normalize_prompt(payload)
+        prior_identity = None
+        stable = 0
+        while True:
+            try:
+                semantic = self.user_message_texts()
+            except Exception:
+                semantic = []
+            if semantic:
+                observed = any(isinstance(text, str) and normalize_prompt(text) == target for text in semantic)
+                source = "SEMANTIC_HISTORY"
+            else:
+                visible = self.current_visible_user_message_texts()
+                observed = any(isinstance(text, str) and normalize_prompt(text) == target for text in visible)
+                source = "VISIBLE_USER_DOM"
+            signature = (source, target if observed else None)
+            stable = stable + 1 if observed and signature == prior_identity else (1 if observed else 0)
+            prior_identity = signature
+            if stable >= 2:
+                self.sendActionAcknowledged = True
+                runtime_log(getattr(self, "runtime_logger", None), getattr(getattr(self, "runtime_watcher", None), "runtime_run_id", None),
+                            "FRESH_BOOTSTRAP_DELIVERY_RECONCILED", getattr(getattr(self, "runtime_watcher", None), "state", None),
+                            observer=source, payloadSha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                            stableObservations=stable, resubmitted=False)
+                return "SENT"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "AMBIGUOUS"
+            time.sleep(min(0.1, remaining))
 
     def control_user_message_count(self) -> int:
         return self.page.locator('[data-message-author-role="user"]').count()
@@ -4577,26 +4724,29 @@ class ArchitectPlaywright:
                 if submission_error.code != "ARCHITECT_SUBMISSION_ACK_TIMEOUT":
                     raise
                 try:
-                    reconciliation = fresh_bridge.reconcile_unsent_submission(bootstrap)
+                    reconciliation = fresh_bridge.reconcile_fresh_bootstrap_delivery(bootstrap)
                 except Exception:
                     reconciliation = "AMBIGUOUS"
+                if reconciliation == "AMBIGUOUS":
+                    # A still-populated exact composer with no transcript evidence is
+                    # the established proof that the send did not leave the composer.
+                    # Reconcile that narrowly evidenced unsent draft on this same page.
+                    try:
+                        reconciliation = fresh_bridge.reconcile_unsent_submission(bootstrap)
+                    except Exception:
+                        reconciliation = "AMBIGUOUS"
                 if reconciliation != "SENT":
                     self._fresh_candidate_submission_ambiguous = True
                     raise ResultSubmissionError(
                         "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED" if reconciliation == "SEND_FAILED" else "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
                     ) from submission_error
             else:
-                exact_submitted = fresh_bridge.observe_exact_user_message(bootstrap)
+                exact_submitted = fresh_bridge.observe_exact_user_message(bootstrap, timeout=0.5)
                 if not exact_submitted:
-                    try:
-                        reconciliation = fresh_bridge.reconcile_unsent_submission(bootstrap)
-                    except Exception:
-                        reconciliation = "AMBIGUOUS"
-                    if reconciliation != "SENT":
-                        self._fresh_candidate_submission_ambiguous = True
-                        raise ResultSubmissionError(
-                            "ARCHITECT_FRESH_BOOTSTRAP_SEND_FAILED" if reconciliation == "SEND_FAILED" else "ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS"
-                        )
+                    exact_submitted = fresh_bridge.reconcile_fresh_bootstrap_delivery(bootstrap, timeout=0.5) == "SENT"
+                if not exact_submitted:
+                    self._fresh_candidate_submission_ambiguous = True
+                    raise ResultSubmissionError("ARCHITECT_FRESH_BOOTSTRAP_SEND_AMBIGUOUS")
             if self.diagnostic_trace:
                 self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_BOOTSTRAP_SEND_END", "END", {}, payloadLength=len(bootstrap), payloadSha256=hashlib.sha256(bootstrap.encode()).hexdigest())
             mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FRESH_BOOTSTRAP_SUBMISSION_COMPLETE")
@@ -9067,7 +9217,6 @@ def _legacy_sent_response_relay_eligible(watcher: LocalFirstOrchestrator) -> boo
         LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256,
         LEGACY_SENT_RESPONSE_RETRY_REQUEST_SHA256,
     )
-
     state = watcher.state
     authorization = state.get("rolloverSentResponseRetryAuthorization")
     if not isinstance(authorization, dict):
@@ -9137,6 +9286,149 @@ def _legacy_sent_response_relay_eligible(watcher: LocalFirstOrchestrator) -> boo
         and prompt_hash == LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256
         and watcher._exact_staged_prompt_recovery_task(allow_human_required=True) == task_id
     )
+
+
+def _ambiguous_fresh_candidate_recovery_eligible(watcher: LocalFirstOrchestrator) -> bool:
+    """Recognize only the persisted epoch-5 candidate whose send and READY were observed live."""
+    from crash_recovery_bootstrap import LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256
+
+    state = watcher.state
+    tx = LEGACY_COMPAT_TRANSACTION_ID
+    task_id = "000103"
+    handover = state.get("pending_handover")
+    authorization = state.get("rolloverSentResponseRetryAuthorization")
+    try:
+        prompt_path = Path(str(state.get("nextPromptPath") or ""))
+        prompt_hash = hashlib.sha256(prompt_path.read_bytes()).hexdigest().upper()
+        pids = [state.get(key) for key in ("codexPid", "active_codex_pid")]
+        pid_alive = any(pid and LocalWatcher.process_alive(int(pid)) for pid in pids)
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        handover_valid = isinstance(handover, str) and watcher.session_rollover._handover_response_valid(handover, tx)
+    except Exception:
+        handover_valid = False
+    bootstrap_hash = hashlib.sha256(fresh_architect_bootstrap_payload(handover).encode("utf-8")).hexdigest() if handover_valid else None
+    auth_recorded = isinstance(authorization, dict) and any(
+        isinstance(row, dict)
+        and row.get("transactionId") == tx
+        and row.get("taskId") == task_id
+        and row.get("priorEpoch") == 4
+        and row.get("qualificationEpoch") == 5
+        and row.get("executorLaunchAuthorized") is False
+        and row.get("requiresNormalRolloverCompletion") is True
+        for row in state.get("rolloverSentResponseRetryAuthorizations", [])
+    )
+    expected_prompt = watcher.prompts_dir / (task_id + ".txt")
+    worktree = state.get("taskWorktrees", {}).get(task_id)
+    try:
+        staged_prompt_bound = bool(
+            prompt_path.resolve() == expected_prompt.resolve()
+            and expected_prompt.is_file()
+            and expected_prompt.stat().st_size > 0
+            and isinstance(worktree, dict)
+            and str(worktree.get("taskId") or "") == task_id
+            and worktree.get("worktreePath")
+            and Path(str(worktree["worktreePath"])).is_dir()
+        )
+    except (OSError, RuntimeError, TypeError):
+        staged_prompt_bound = False
+    return bool(
+        state.get("state") == "HUMAN_REQUIRED"
+        and state.get("humanRequiredReason") == "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"
+        and state.get("postDiscussionProtocolFailure") == "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"
+        and state.get("taskId") == "000102"
+        and state.get("lastCompletedTaskId") == "000102"
+        and state.get("nextTaskId") == task_id
+        and state.get("rolloverTransactionId") == tx
+        and state.get("rolloverTransactionTaskId") == task_id
+        and state.get("rolloverRecoveryEpoch") == 5
+        and state.get("rolloverAutomaticRecoveryEpochCount") == 3
+        and state.get("rolloverAutomaticRecoveryMaxEpochs") == 3
+        and state.get("rolloverLegacyHandoverReemissionTransactionId") == tx
+        and state.get("rolloverLegacyHandoverReemissionAttemptedEpoch") == 5
+        and state.get("rolloverLegacyHandoverReemissionState") == "WAIT_TIMEOUT"
+        and state.get("rolloverDue") is True
+        and state.get("rolloverPending") is True
+        and state.get("rolloverInProgress") is False
+        and state.get("handoverRequested") is False
+        and state.get("rolloverHandoverSendState") == "AMBIGUOUS"
+        and state.get("rolloverMaintenanceState") == "DEFERRED"
+        and state.get("postDiscussionEnvelopeRequired") is True
+        and state.get("postDiscussionProtocolTaskId") == task_id
+        and state.get("postDiscussionProtocolTransactionId") == tx
+        and state.get("postDiscussionProtocolRolloverCommittedTransactionId") != tx
+        and state.get("executorSessionId") == AFFOTECH_EXECUTOR_SESSION_ID
+        and state.get("executorSessionMode") == "PERSISTENT"
+        and state.get("executorProcessState") != "RUNNING"
+        and state.get("executorActiveWriter") is not True
+        and state.get("governedExecutorActiveWriter") is not True
+        and not pid_alive
+        and state.get("rolloverFreshPageCreated") is True
+        and state.get("rolloverFreshCandidateState") == "SUBMISSION_AMBIGUOUS"
+        and isinstance(state.get("rolloverFreshCandidateConversationId"), str)
+        and state.get("rolloverFreshCandidateConversationId")
+        and state.get("rolloverFreshBootstrapPayloadHash") == bootstrap_hash
+        and state.get("rolloverHandoverResponseIdentity") == hashlib.sha256(handover.encode("utf-8")).hexdigest()
+        and handover_valid
+        and auth_recorded
+        and staged_prompt_bound
+        and prompt_hash == LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256
+    )
+
+
+def _recover_ambiguous_fresh_candidate_once(watcher: LocalFirstOrchestrator, endpoint: str) -> str:
+    """Reconcile the exact existing candidate; never create a page or resubmit its bootstrap."""
+    if watcher.discussion_pause_active() or not _ambiguous_fresh_candidate_recovery_eligible(watcher):
+        return "HUMAN_REQUIRED"
+    candidate_id = str(watcher.state["rolloverFreshCandidateConversationId"])
+    handover = str(watcher.state["pending_handover"])
+    bridge = None
+    try:
+        bridge = ArchitectPlaywright.attach(endpoint, watcher.state.get("architectConversationId"))
+        pages = getattr(getattr(getattr(bridge, "page", None), "context", None), "pages", [])
+        candidate_page = None
+        for page in pages:
+            try:
+                page_id = architect_conversation_id_from_url(getattr(page, "url", ""))
+            except (RuntimeError, StopIteration, TypeError):
+                continue
+            if architect_conversation_ids_equivalent(candidate_id, page_id):
+                candidate_page = page
+                break
+        bootstrap = fresh_architect_bootstrap_payload(handover)
+        if candidate_page is None or not watcher.session_rollover._fresh_candidate_proven(candidate_page, bootstrap, candidate_id):
+            runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                        "EXISTING_FRESH_CANDIDATE_RECOVERY_BLOCKED", watcher.state,
+                        candidateConversationId=candidate_id, reason="EXACT_BOOTSTRAP_AND_READY_NOT_PROVEN", resubmitted=False)
+            return "HUMAN_REQUIRED"
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                    "EXISTING_FRESH_CANDIDATE_RECOVERY_BEGIN", watcher.state,
+                    candidateConversationId=candidate_id, transactionId=LEGACY_COMPAT_TRANSACTION_ID,
+                    taskId="000103", bootstrapResubmitted=False)
+        if not watcher.session_rollover.reconcile_pending_handover(bridge, existing_handover=handover):
+            return watcher.state.get("state", "HUMAN_REQUIRED")
+        # The coordinator durably committed the candidate and the protocol's
+        # committed-transaction evidence. Only then may the old HREQ state clear.
+        if (watcher.state.get("architectConversationId") != candidate_id
+                or watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId") != LEGACY_COMPAT_TRANSACTION_ID):
+            return "HUMAN_REQUIRED"
+        watcher.state.update({"state": "NEXT_PROMPT_READY", "humanRequiredReason": None})
+        watcher.save()
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                    "EXISTING_FRESH_CANDIDATE_RECOVERY_COMMITTED", watcher.state,
+                    candidateConversationId=candidate_id, transactionId=LEGACY_COMPAT_TRANSACTION_ID,
+                    taskId="000103", bootstrapResubmitted=False)
+        return "NEXT_PROMPT_READY"
+    except Exception as error:
+        runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                    "EXISTING_FRESH_CANDIDATE_RECOVERY_FAILED", watcher.state,
+                    candidateConversationId=candidate_id, errorClass=type(error).__name__, reason=str(error)[:200],
+                    bootstrapResubmitted=False)
+        return watcher.state.get("state", "HUMAN_REQUIRED")
+    finally:
+        if bridge is not None:
+            _disconnect_architect_bridge_read_only(bridge, diagnostic_trace_for(watcher), watcher.state)
 
 
 def _relay_existing_epoch5_handover_once(
@@ -9335,6 +9627,11 @@ def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -
 
 def run_human_required_startup_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any]) -> str:
     """Run the production HUMAN_REQUIRED entry, including stale-format recovery."""
+    if _ambiguous_fresh_candidate_recovery_eligible(watcher):
+        if watcher.discussion_pause_active():
+            return "HUMAN_REQUIRED"
+        endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
+        return _recover_ambiguous_fresh_candidate_once(watcher, endpoint)
     if _legacy_sent_response_relay_eligible(watcher):
         if watcher.discussion_pause_active():
             return "HUMAN_REQUIRED"
@@ -9692,19 +9989,21 @@ def main() -> None:
             if state == "HUMAN_REQUIRED":
                 reason = str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED")
                 exact_relay_due = _legacy_sent_response_relay_eligible(watcher)
+                exact_candidate_due = _ambiguous_fresh_candidate_recovery_eligible(watcher)
+                exact_continuation_due = (exact_relay_due or exact_candidate_due) and not watcher.discussion_pause_active()
                 log_main_loop_decision(
                     watcher,
-                    "HUMAN_REQUIRED_EXISTING_HANDOVER_RELAY" if exact_relay_due else "HUMAN_REQUIRED_WAIT",
-                    "exact_legacy_sent_handover_relay" if exact_relay_due else reason,
-                    exact_relay_due,
-                    not exact_relay_due,
+                    "HUMAN_REQUIRED_EXISTING_HANDOVER_RELAY" if exact_relay_due else "HUMAN_REQUIRED_EXISTING_FRESH_CANDIDATE" if exact_candidate_due else "HUMAN_REQUIRED_WAIT",
+                    "exact_legacy_sent_handover_relay" if exact_relay_due else "exact_ambiguous_fresh_candidate" if exact_candidate_due else reason,
+                    exact_continuation_due,
+                    not exact_continuation_due,
                 )
                 if diagnostic_trace:
                     diagnostic_trace.record(
                         "MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state,
-                        decision="HUMAN_REQUIRED_EXISTING_HANDOVER_RELAY" if exact_relay_due else "HUMAN_REQUIRED_PASSIVE_WAIT",
+                        decision="HUMAN_REQUIRED_EXISTING_HANDOVER_RELAY" if exact_relay_due else "HUMAN_REQUIRED_EXISTING_FRESH_CANDIDATE" if exact_candidate_due else "HUMAN_REQUIRED_PASSIVE_WAIT",
                     )
-                if not exact_relay_due and watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
+                if not exact_relay_due and not exact_candidate_due and watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     if human_wait_bridge is None:
                         try:
@@ -9764,10 +10063,13 @@ def main() -> None:
                 # of existing evidence, not a new generic recovery attempt.
                 # It therefore takes precedence over the per-reason suppression
                 # marker without clearing or rewriting that marker.
-                recovery_attempt_due = exact_relay_due or human_required_startup_recovery_due(
+                recovery_attempt_due = exact_continuation_due or human_required_startup_recovery_due(
                     watcher, reason, attempted_reason
                 )
-                if exact_relay_due:
+                if exact_relay_due or exact_candidate_due:
+                    if not exact_continuation_due:
+                        passive_human_required_wait(watcher)
+                        continue
                     state = run_human_required_startup_once(watcher, launch)
                     if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY"}:
                         continue

@@ -3840,6 +3840,13 @@ def test_ambiguous_fresh_candidate_is_reused_before_new_tab_creation(tmp_path):
     watcher.state.update({"rolloverFreshCandidateConversationId": "NEW",
                           "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
                           "pending_handover": canonical_handover(watcher, "complete old handover", task_id="000050")})
+    watcher.state.update({"rolloverTransactionId": "test-rollover-transaction", "rolloverTransactionTaskId": "000050"})
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(watcher.state["pending_handover"])
+    new_page.evaluate = lambda script: (
+        False if "stop-button" in script else
+        [bootstrap] if "data-message-author-role=\"user\"" in script else
+        [{"id": "ack", "text": "ARCHITECT_SESSION_READY"}] if "data-message-author-role=\"assistant\"" in script else []
+    )
     watcher.save()
     restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     assert restarted.session_rollover.complete_from_response(bridge, restarted.state["pending_handover"]) is True
@@ -9577,6 +9584,295 @@ def test_main_unrelated_human_required_same_attempted_reason_remains_passive(tmp
     assert passive_calls == [True]
     assert watcher.state["humanRequiredReason"] == "UNRELATED_HUMAN_REQUIRED"
     assert watcher.state["humanRequiredRecoveryAttemptedReason"] == "UNRELATED_HUMAN_REQUIRED"
+
+
+def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_path, monkeypatch, capsys):
+    watcher, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    old_id = "6ab532e4-d274-83ec-b684-5dc204d84661"
+    fresh_id = "6ab8b6d4-1628-83ec-9079-670b78f653f2"
+    handover = (
+        "AFFOTECH ARCHITECT SESSION HANDOVER\n"
+        "Preserved existing transaction for the exact staged task.\n"
+        f"Rollover transaction ID: {tx}\nTarget task 000103.\nARCHITECT_HANDOVER_READY"
+    )
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+    auth = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4,
+        "qualificationEpoch": 5, "executorLaunchAuthorized": False,
+        "requiresNormalRolloverCompletion": True,
+    }
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+        "humanRequiredRecoveryAttemptedReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+        "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "nextTaskId": "000103",
+        "rolloverTransactionId": tx, "rolloverTransactionTaskId": "000103",
+        "rolloverRecoveryEpoch": 5, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3, "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5, "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": False,
+        "handoverRequested": False, "handoverReady": False, "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "DEFERRED", "rolloverRecoveryState": "RECOVERING",
+        "rolloverFreshPageCreated": True, "rolloverFreshCandidateConversationId": fresh_id,
+        "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+        "rolloverFreshBootstrapPayloadHash": hashlib.sha256(bootstrap.encode()).hexdigest(),
+        "rolloverHandoverResponseIdentity": hashlib.sha256(handover.encode()).hexdigest(),
+        "pending_handover": handover, "rolloverSentResponseRetryAuthorization": auth,
+        "rolloverSentResponseRetryAuthorizations": [auth],
+        "postDiscussionEnvelopeRequired": True, "postDiscussionResumeEpoch": 7,
+        "postDiscussionProtocolTaskId": "000103", "postDiscussionProtocolTransactionId": tx,
+        "postDiscussionProtocolRolloverCommittedTransactionId": None,
+        "postDiscussionEnvelopeRepairAttempted": False, "postDiscussionEnvelopeRepairAwaiting": False,
+        "postDiscussionEnvelopeRepairTaskId": "000103", "postDiscussionEnvelopeRepairEpoch": 7,
+        "discussionPauseActive": False, "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorSessionMode": "PERSISTENT", "executorProcessState": "COMPLETED_WITH_RESULT",
+        "executorLaunchState": "LAUNCHED", "executorActiveWriter": False,
+        "governedExecutorActiveWriter": False, "architectConversationId": old_id,
+    })
+    watcher.save()
+    assert prompt.read_bytes() == prompt_bytes
+    assert watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher)
+    eligible_state = dict(watcher.state)
+    for field, value in (
+        ("humanRequiredReason", "UNRELATED_FAILURE"),
+        ("rolloverTransactionId", "wrong-transaction"),
+        ("nextTaskId", "000104"),
+        ("rolloverFreshCandidateConversationId", ""),
+        ("rolloverFreshCandidateState", "FAILED"),
+        ("executorSessionId", "replacement-session"),
+        ("executorActiveWriter", True),
+        ("executorProcessState", "RUNNING"),
+        ("postDiscussionProtocolRolloverCommittedTransactionId", tx),
+    ):
+        watcher.state = dict(eligible_state)
+        watcher.state[field] = value
+        assert not watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher), field
+    watcher.state = eligible_state
+
+    events = []
+    class CandidatePage:
+        def __init__(self, conversation_id, user_text=None, ready=False):
+            self.url = f"https://chatgpt.com/c/{conversation_id}"
+            self.closed = False
+            self.context = None
+            self.user_text = user_text
+            self.ready = ready
+            self.send_count = 0
+            self.dom_observers = []
+        def evaluate(self, script):
+            if "stop-button" in script: return False
+            if "fresh-user-dom-fallback" in script:
+                self.dom_observers.append("visible-user")
+                return [self.user_text] if self.user_text else []
+            if "fresh-assistant-ready-dom-fallback" in script:
+                self.dom_observers.append("visible-assistant-ready")
+                return ["ARCHITECT_SESSION_READY"] if self.ready else []
+            if 'data-message-author-role="user"' in script:
+                self.dom_observers.append("semantic-user")
+                return []
+            if 'data-message-author-role="assistant"' in script:
+                self.dom_observers.append("semantic-assistant")
+                return []
+            return False
+        def close(self):
+            self.closed = True
+            events.append("old_architect_retired")
+
+    old_page = CandidatePage(old_id)
+    fresh_page = CandidatePage(fresh_id, bootstrap, True)
+    context = type("Context", (), {"pages": [old_page, fresh_page], "new_page": lambda _self: (_ for _ in ()).throw(AssertionError("must not create a second tab"))})()
+    old_page.context = fresh_page.context = context
+
+    class ProtocolBridge(_PostDiscussionBridge):
+        def __init__(self):
+            super().__init__([_discussion_bridge_response("pre-resume history", "prior")])
+            self.response = envelope("000103", prompt=prompt_bytes.decode("utf-8"))
+            self.delivered = False
+        def submit_result_bounded(self, message):
+            self.sent.append(message)
+            events.append("formatting_repair_submitted")
+        def wait_for_new_response(self, baseline, poll_interval=0.5):
+            assert poll_interval == 5.0 or poll_interval == 0.5
+            if not self.delivered:
+                self.entries.append(_discussion_bridge_response(self.response, "exact-envelope"))
+                self.delivered = True
+                return {"state": "COMPLETED", "text": self.response}
+            return super().wait_for_new_response(baseline, poll_interval)
+        def close(self): return None
+
+    protocol_bridge = ProtocolBridge()
+    watcher.state["postDiscussionProtocolBaseline"] = protocol_bridge.assistant_baseline()
+    watcher.state["architectDiscussionBaseline"] = protocol_bridge.assistant_baseline()
+    # Model the required human F10 after the production F9 pause; recovery is
+    # intentionally unavailable while the durable pause marker remains active.
+    watcher.request_discussion_resume()
+    watcher.save()
+    assert watcher.discussion_pause_active() is False
+    assert watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher)
+    attaches = []
+    def attach(_endpoint, conversation_id=None):
+        attaches.append(conversation_id)
+        if conversation_id == old_id:
+            return ArchitectPlaywright(old_page)
+        if conversation_id == fresh_id:
+            return protocol_bridge
+        raise AssertionError(f"unexpected Architect identity {conversation_id}")
+
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", lambda *_args, **_kwargs: watcher)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_a, **_k: True)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "stop", lambda *_a, **_k: None)
+    monkeypatch.setattr(watcher_module.WatcherLivenessWatchdog, "start", lambda *_a, **_k: None)
+    monkeypatch.setattr(watcher_module.WatcherLivenessWatchdog, "stop", lambda *_a, **_k: None)
+    monkeypatch.setattr(watcher_module.RemoteDiscussionControlMonitor, "start", lambda *_a, **_k: False)
+    monkeypatch.setattr(watcher_module.RemoteDiscussionControlMonitor, "stop", lambda *_a, **_k: None)
+    monkeypatch.setenv("AFFOTECH_PROJECT_DIR", str(watcher.project_dir))
+    monkeypatch.setenv("AFFOTECH_ORCHESTRATOR_STATE_DIR", str(watcher.state_dir))
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "DIAGNOSTIC")
+    monkeypatch.setenv("ORCHESTRATOR_POLL_INTERVAL", "0")
+    launches = []
+    def launch(body, _result_path):
+        launches.append(body)
+        events.append("executor_launch_spy")
+        raise KeyboardInterrupt
+    monkeypatch.setattr(watcher_module, "visible_executor_launcher", lambda *_a, **_k: launch)
+    def unexpected_passive_wait(_watcher, *_args, **_kwargs):
+        raise AssertionError("exact existing candidate did not complete: " + repr({
+            key: watcher.state.get(key) for key in (
+                "state", "humanRequiredReason", "postDiscussionProtocolFailure",
+                "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState",
+                "rolloverFreshCandidateDiscoveryState", "rolloverHandoverRecoveryReason",
+                "handoverRequested", "rolloverInProgress", "architectConversationId",
+                "postDiscussionProtocolRolloverCommittedTransactionId",
+            )
+        }))
+    monkeypatch.setattr(watcher_module, "passive_human_required_wait", unexpected_passive_wait)
+    original_save = watcher.save
+    commits = []
+    def track_save():
+        try:
+            persisted_before = json.loads(watcher.state_path.read_text(encoding="utf-8")).get("postDiscussionProtocolRolloverCommittedTransactionId")
+        except (OSError, ValueError):
+            persisted_before = None
+        original_save()
+        if persisted_before != tx and watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId") == tx:
+            commits.append(1)
+            events.append("authority_committed")
+    watcher.save = track_save
+
+    watcher_module.main()
+    output = capsys.readouterr().out
+    assert "STATE=STOPPED" in output
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state["executorLaunchState"] == "LAUNCH_CLAIMED"
+    assert watcher.state["architectConversationId"] == fresh_id
+    assert watcher.state["postDiscussionEnvelopeRepairAttempted"] is True
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert "postDiscussionProtocolRolloverCommittedTransactionId" not in watcher.state
+    assert commits == [1]
+    assert old_page.closed is True and fresh_page.closed is False
+    assert fresh_page.send_count == 0
+    assert fresh_page.dom_observers.index("semantic-user") < fresh_page.dom_observers.index("visible-user")
+    assert fresh_page.dom_observers.index("semantic-assistant") < fresh_page.dom_observers.index("visible-assistant-ready")
+    assert len(context.pages) == 2
+    assert len(protocol_bridge.sent) == 1
+    assert len(launches) == 1 and launches[0].encode("utf-8") == prompt_bytes
+    assert watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["rolloverRecoveryEpoch"] == 5
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
+    assert prompt.read_bytes() == prompt_bytes
+    assert events.index("authority_committed") < events.index("old_architect_retired")
+    assert events.count("old_architect_retired") == 1
+    assert events.index("old_architect_retired") < events.index("formatting_repair_submitted")
+    assert events.index("formatting_repair_submitted") < events.index("executor_launch_spy")
+    assert attaches.count(old_id) == 1
+    assert attaches.count(fresh_id) >= 1
+
+
+def test_keyboard_interrupt_during_fresh_bootstrap_is_not_swallowed(tmp_path, monkeypatch):
+    sent = []
+
+    class Page:
+        def __init__(self, url):
+            self.url, self.closed, self.context = url, False, None
+        def goto(self, _url):
+            return None
+        def close(self):
+            self.closed = True
+
+    old = Page("https://chatgpt.com/c/OLD")
+    fresh = Page("https://chatgpt.com/")
+    class Context:
+        pages = [old, fresh]
+        def new_page(self):
+            return fresh
+    context = Context()
+    old.context = fresh.context = context
+    bridge = ArchitectPlaywright(old)
+
+    def interrupt_on_submit(_self, payload):
+        sent.append(payload)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ArchitectPlaywright, "submit_result_bounded", interrupt_on_submit)
+    with pytest.raises(KeyboardInterrupt):
+        bridge.open_fresh_with_handover("validated handover")
+    assert len(sent) == 1
+    assert bridge._fresh_candidate_page is fresh
+    assert fresh.closed is False
+
+
+def test_keyboard_interrupt_during_fresh_ready_observation_preserves_old_authority(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({
+        "handoverRequested": True, "rolloverPending": True, "rolloverDue": True,
+        "architectConversationId": "OLD", "rolloverTransactionId": "test-rollover-transaction",
+        "rolloverTransactionTaskId": "test-task",
+    })
+    watcher.save()
+
+    class Page:
+        def __init__(self, url):
+            self.url, self.closed, self.context = url, False, None
+        def close(self):
+            self.closed = True
+    old = Page("https://chatgpt.com/c/OLD")
+    fresh = Page("https://chatgpt.com/c/FRESH")
+    class Context:
+        pages = [old]
+    context = Context()
+    old.context = fresh.context = context
+
+    class Bridge:
+        page = old
+        def open_fresh_with_handover(self, _handover):
+            return fresh
+    def interrupt_on_ready(_self):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(ArchitectPlaywright, "generation_visible", interrupt_on_ready)
+    with pytest.raises(KeyboardInterrupt):
+        watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher))
+    assert watcher.state["architectConversationId"] == "OLD"
+    assert watcher.state["rolloverFreshPageCreated"] is True
+    assert old.closed is False
+    assert fresh.closed is False
+
+
+def test_keyboard_interrupt_during_human_required_passive_wait_is_not_mutating(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "UNRELATED", "discussionPauseActive": True})
+    watcher.save()
+    before = watcher.state_path.read_bytes()
+    def interrupt_on_sleep(_delay):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(watcher_module.time, "sleep", interrupt_on_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        watcher_module.passive_human_required_wait(watcher)
+    assert watcher.state_path.read_bytes() == before
+    assert watcher.state["discussionPauseActive"] is True
 
 
 @pytest.mark.parametrize("mutation", ["reason", "transaction", "task", "writer", "watcher"])
