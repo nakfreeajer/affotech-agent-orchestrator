@@ -1,6 +1,7 @@
 param(
     [switch]$StatusOnly,
     [switch]$Qualification,
+    [switch]$RealBrowser,
     [string]$AuthorizeRetry,
     [switch]$AuthorizeRolloverDiagnosticRetry,
     [switch]$AuthorizeRolloverPostfixQualification,
@@ -26,12 +27,18 @@ if ((@([bool]$AuthorizeRetry, [bool]$AuthorizeRolloverDiagnosticRetry, [bool]$Au
 
 if ($Qualification) {
     if ($StatusOnly -or $AuthorizeRetry -or $AuthorizeRolloverDiagnosticRetry -or $AuthorizeRolloverPostfixQualification -or $AuthorizeRolloverSentResponseRetry) {
-        throw "-Qualification is an isolated synthetic harness and cannot be combined with StatusOnly or any production authorization."
+        throw "-Qualification is isolated and cannot be combined with StatusOnly or any production authorization."
     }
-    Write-Host "QUALIFICATION: synthetic isolated state and test DOM only; no production state/CDP/browser or Executor access."
-    & $Python (Join-Path $Repository "orchestrator_qualification.py") --run $Repository
+    if ($RealBrowser) {
+        Write-Host "QUALIFICATION: disposable real-browser pages, isolated synthetic state, protected production targets, fake Executor only."
+        & $Python (Join-Path $Repository "orchestrator_real_browser_qualification.py") --run $Repository $Endpoint
+    } else {
+        Write-Host "QUALIFICATION: synthetic isolated state and test DOM only; no production state/CDP/browser or Executor access."
+        & $Python (Join-Path $Repository "orchestrator_qualification.py") --run $Repository
+    }
     exit $LASTEXITCODE
 }
+if ($RealBrowser) { throw "-RealBrowser is qualification-only; use -Qualification -RealBrowser." }
 
 function Invoke-Recovery([string[]]$Extra) {
     $raw = & $Python $Bootstrap --repository $Repository --state-dir $StateDir @Extra

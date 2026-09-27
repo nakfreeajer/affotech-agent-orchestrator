@@ -27,6 +27,7 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
 import local_orchestrator_watcher as watcher_module
 import crash_recovery_bootstrap as bootstrap_module
 import orchestrator_qualification as qualification_module
+import orchestrator_real_browser_qualification as real_qualification_module
 
 # Direct main() invocations in this deterministic suite must never target the
 # production orchestrator log, even if a test supplies the real repository path.
@@ -10135,6 +10136,66 @@ def test_qualification_is_fake_executor_only_and_wrapper_preserves_status_pause(
     assert '[switch]$Qualification' in wrapper
     assert 'Discussion pause:' in wrapper
     assert '$Qualification' in wrapper and 'orchestrator_qualification.py' in wrapper
+
+
+def test_real_browser_qualification_context_exposes_only_run_owned_pages_and_defers_close():
+    events = []
+    class RawPage:
+        url = "about:blank"
+        def is_closed(self): return False
+        def goto(self, *_args, **_kwargs): self.url = "https://chatgpt.com/"
+        def close(self, **_kwargs): self.closed = True
+    class RawContext:
+        pages = [type("PreExisting", (), {"url": "https://chatgpt.com/c/preexisting"})()]
+        def new_page(self): return RawPage()
+    context = real_qualification_module._OwnedContext(RawContext(), [], lambda *args: events.append(args))
+    with pytest.raises(RuntimeError, match="QUALIFICATION_CDP_INVENTORY_REQUIRED"):
+        context.new_page()
+    context.inventory_complete = True
+    page = context.new_page()
+    assert context.pages == [page]
+    page.goto("https://chatgpt.com/")
+    page.close()
+    assert context.pages == [page]
+    assert events[0][0] == "QUALIFICATION_OWNED_PAGE_CREATED"
+    assert context.new_page().url == "about:blank"
+    with pytest.raises(RuntimeError, match="QUALIFICATION_OWNED_PAGE_LIMIT_EXCEEDED"):
+        context.new_page()
+
+
+@pytest.mark.parametrize("conversation_id", sorted(watcher_module.QUALIFICATION_PROTECTED_CONVERSATION_IDS) + ["preexisting-unowned"])
+def test_real_qualification_page_guard_refuses_protected_or_preexisting_unowned(monkeypatch, conversation_id):
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "QUALIFICATION")
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_OWNED_IDS", "")
+    page = type("Page", (), {"url": f"https://chatgpt.com/c/{conversation_id}"})()
+    with pytest.raises(RuntimeError, match="QUALIFICATION_(PROTECTED_CONVERSATION_BLOCKED|PAGE_IDENTITY_UNPROVEN):send"):
+        watcher_module._qualification_assert_page_allowed(page, "send")
+
+
+def test_real_browser_operator_surface_is_additive_and_explicit():
+    wrapper = (Path(__file__).parent / "AFFOTECH-START.ps1").read_text(encoding="utf-8")
+    source = (Path(__file__).parent / "orchestrator_real_browser_qualification.py").read_text(encoding="utf-8")
+    assert '[switch]$RealBrowser' in wrapper
+    assert 'orchestrator_real_browser_qualification.py' in wrapper
+    assert 'if ($RealBrowser) { throw "-RealBrowser is qualification-only; use -Qualification -RealBrowser." }' in wrapper
+    assert 'runtimeContext=QUALIFICATION realBrowser=true fakeExecutor=true' in source
+    assert 'pages(self)' in source and 'preExistingPageGuids' in source
+
+
+def test_qualification_logger_accepts_only_run_scoped_qualification_destination(monkeypatch, tmp_path):
+    run_root = tmp_path / ".agent-work" / "orchestrator" / "qualification" / "run-a"
+    canonical_parent = tmp_path / ".agent-work" / "orchestrator" / "logs" / "qualification" / "run-a"
+    canonical_parent.mkdir(parents=True)
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_RUN_ID", "run-a")
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_LOG_ROOT", str(canonical_parent))
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_LOG_PATH", str(canonical_parent / "qualification.log"))
+    logger, _, path = watcher_module.initialize_runtime_logging(run_root / "state", "run-a", "QUALIFICATION")
+    assert Path(path) == canonical_parent / "qualification.log"
+    assert not (tmp_path / ".agent-work" / "orchestrator" / "logs" / "orchestrator.log").exists()
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
 
 
 def test_qualification_mode_does_not_change_nonqualification_guard_behavior(monkeypatch):

@@ -548,8 +548,12 @@ def initialize_runtime_logging(
             raise ValueError("QUALIFICATION_LOG_PATH_REQUIRED")
         log_path = Path(configured)
         required_parent = Path(required_parent_value).resolve()
-        expected_parent = (Path(run_root_value).resolve() / "logs").resolve()
-        if (log_path.resolve().parent != required_parent or required_parent != expected_parent
+        run_root = Path(run_root_value).resolve()
+        allowed_parents = {
+            (run_root / "logs").resolve(),
+            (run_root.parent.parent / "logs" / "qualification" / run_id_value).resolve(),
+        }
+        if (log_path.resolve().parent != required_parent or required_parent not in allowed_parents
                 or log_path.name != "qualification.log"):
             raise ValueError("QUALIFICATION_LOG_PATH_OUTSIDE_ISOLATED_ROOT")
     else:
