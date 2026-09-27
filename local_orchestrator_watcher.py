@@ -9690,10 +9690,21 @@ def main() -> None:
                 process = run_next_prompt_ready_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
                 continue
             if state == "HUMAN_REQUIRED":
-                log_main_loop_decision(watcher, "HUMAN_REQUIRED_WAIT", str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED"), False, True)
+                reason = str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED")
+                exact_relay_due = _legacy_sent_response_relay_eligible(watcher)
+                log_main_loop_decision(
+                    watcher,
+                    "HUMAN_REQUIRED_EXISTING_HANDOVER_RELAY" if exact_relay_due else "HUMAN_REQUIRED_WAIT",
+                    "exact_legacy_sent_handover_relay" if exact_relay_due else reason,
+                    exact_relay_due,
+                    not exact_relay_due,
+                )
                 if diagnostic_trace:
-                    diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="HUMAN_REQUIRED_PASSIVE_WAIT")
-                if watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
+                    diagnostic_trace.record(
+                        "MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state,
+                        decision="HUMAN_REQUIRED_EXISTING_HANDOVER_RELAY" if exact_relay_due else "HUMAN_REQUIRED_PASSIVE_WAIT",
+                    )
+                if not exact_relay_due and watcher.state.get("humanRequiredReason") == "ARCHITECT_DECISION_HUMAN_REQUIRED":
                     conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
                     if human_wait_bridge is None:
                         try:
@@ -9748,9 +9759,20 @@ def main() -> None:
                             pass
                         human_wait_bridge = None
                     continue
-                reason = str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED")
                 attempted_reason = watcher.state.get("humanRequiredRecoveryAttemptedReason")
-                recovery_attempt_due = human_required_startup_recovery_due(watcher, reason, attempted_reason)
+                # The exact, already-authorized epoch-5 relay is a continuation
+                # of existing evidence, not a new generic recovery attempt.
+                # It therefore takes precedence over the per-reason suppression
+                # marker without clearing or rewriting that marker.
+                recovery_attempt_due = exact_relay_due or human_required_startup_recovery_due(
+                    watcher, reason, attempted_reason
+                )
+                if exact_relay_due:
+                    state = run_human_required_startup_once(watcher, launch)
+                    if state in {"EXECUTOR_RUNNING", "RESULT_READY", "ARCHITECT_RUNNING", "NEXT_PROMPT_READY"}:
+                        continue
+                    passive_human_required_wait(watcher)
+                    continue
                 if recovery_attempt_due:
                     if watcher.recover_legacy_rollover_cutout():
                         continue
@@ -9828,6 +9850,11 @@ def main() -> None:
                     bridge.close()
                 runtime_log(logger, run_id, "ARCHITECT_ATTACH_FAILED", watcher.state, errorClass=type(error).__name__, errorMessage=str(error), conversationId=conversation_id)
                 raise
+            bridge.runtime_watcher = watcher
+            bridge.runtime_logger = logger
+            bridge.runtime_run_id = run_id
+            bridge.runtime_conversation_id = conversation_id
+            bridge.liveness_watchdog = liveness_watchdog
             runtime_log(logger, run_id, "ARCHITECT_ATTACH_SUCCESS", watcher.state, conversationId=conversation_id)
             if rollover is not None:
                 reader = getattr(bridge, "current_session_memory_bytes", None)

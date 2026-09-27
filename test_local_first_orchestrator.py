@@ -4840,6 +4840,7 @@ class _ArchitectDomPage:
         self.staged_prompt = ""
         self.events = []
         self.pending_assistant = None
+        self.defer_pending_materialization_once = False
         self.visible_handover_candidates = []
         self.keyboard = _ArchitectDomKeyboard(self)
 
@@ -4861,17 +4862,23 @@ class _ArchitectDomPage:
     def evaluate(self, script):
         if script == watcher_module.assistant_fast_snapshot_script():
             if self.pending_assistant is not None:
-                self.assistants.append({"id": f"assistant-{len(self.assistants) + 1}", "text": self.pending_assistant})
-                self.pending_assistant = None
-                self.events.append("exact_envelope_materialized")
+                if self.defer_pending_materialization_once:
+                    self.defer_pending_materialization_once = False
+                else:
+                    self.assistants.append({"id": f"assistant-{len(self.assistants) + 1}", "text": self.pending_assistant})
+                    self.pending_assistant = None
+                    self.events.append("exact_envelope_materialized")
             latest = self.assistants[-1] if self.assistants else {}
             return {"count": len(self.assistants), "latestMessageId": latest.get("id"),
                     "latestText": latest.get("text", ""), "latestTextLength": len(latest.get("text", ""))}
         if script == watcher_module.assistant_entries_script():
+            self.events.append("assistant_history_scan")
             return list(self.assistants)
         if script == watcher_module.assistant_latest_entry_script():
+            self.events.append("latest_assistant_entry_scan")
             return self.assistants[-1] if self.assistants else None
         if "const marker = 'ARCHITECT_HANDOVER_READY'" in script and "document.querySelector('main')" in script:
+            self.events.append("visible_assistant_dom_scan")
             return list(self.visible_handover_candidates)
         if "window.scrollTo" in script:
             return False
@@ -4895,10 +4902,13 @@ class _ArchitectDomPage:
             )
             self.events.append("legacy_response_materialized")
         elif "Fresh Architect session bootstrap protocol" in payload:
+            self.events.append("fresh_bootstrap_submitted")
             response = "ARCHITECT_SESSION_READY"
             self.events.append("fresh_ready_materialized")
         elif "previous completed response did not contain" in payload:
+            self.events.append("exact_task_envelope_repair_submitted")
             self.pending_assistant = envelope("000103", prompt=self.staged_prompt)
+            self.defer_pending_materialization_once = True
             return
         else:
             response = "UNEXPECTED_CONTROLLED_PAGE_SUBMISSION"
@@ -9347,6 +9357,7 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
     }
     original.state.update({
         "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "humanRequiredRecoveryAttemptedReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
         "rolloverRecoveryEpoch": 5, "rolloverRecoveryState": "RECOVERING",
         "rolloverAutomaticRecoveryEpochCount": 3, "rolloverAutomaticRecoveryMaxEpochs": 3,
         "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverInProgress": True,
@@ -9417,21 +9428,78 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
 
     monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach))
     monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
-    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: 1.0)
-    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    virtual_time = [0.0]
+    real_wait_for_new_response = ArchitectPlaywright.wait_for_new_response
+    waiter_results = []
+    def recorded_wait_for_new_response(bridge, *args, **kwargs):
+        result = real_wait_for_new_response(bridge, *args, **kwargs)
+        waiter_results.append((result.get("state"), getattr(bridge, "last_wait_diagnostics", None)))
+        if result.get("state") != "COMPLETED":
+            raise KeyboardInterrupt
+        return result
+    monkeypatch.setattr(ArchitectPlaywright, "wait_for_new_response", recorded_wait_for_new_response)
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: virtual_time[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: virtual_time.__setitem__(0, virtual_time[0] + max(float(delay), 0.01)))
     watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
     saved = []
     persist = watcher.session_rollover.persist_validated_handover
 
     def capture_persist(response):
         saved.append(response)
-        return persist(response)
+        persisted = persist(response)
+        if persisted:
+            events.append("handover_persisted")
+        return persisted
 
     watcher.session_rollover.persist_validated_handover = capture_persist
-    launch = lambda received, _path: launches.append(received) or type("Process", (), {"pid": 91003})()
+    saved_states = []
+    original_save = watcher.save
+    def capture_state_save():
+        prior_state = saved_states[-1] if saved_states else {}
+        original_save()
+        saved_states.append(dict(watcher.state))
+        if prior_state.get("postDiscussionProtocolRolloverCommittedTransactionId") != tx and watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId") == tx:
+            events.append("authority_committed")
+        if prior_state.get("postDiscussionEnvelopeRequired") is True and watcher.state.get("postDiscussionEnvelopeRequired") is False:
+            events.append("exact_task_envelope_accepted")
+    watcher.save = capture_state_save
+    # Exercise the actual operator-started main loop. The launch spy stops the
+    # isolated process immediately after the authorized dispatch boundary.
+    def launch(received, _path):
+        launches.append(received)
+        events.append("executor_launch_authorized")
+        raise KeyboardInterrupt
 
-    # Public startup path; no retry authorization is consumed and no request is sent.
-    assert watcher_module.run_human_required_startup_once(watcher, launch) == "NEXT_PROMPT_READY"
+    monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", lambda *_args, **_kwargs: watcher)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "stop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module.WatcherLivenessWatchdog, "start", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module.WatcherLivenessWatchdog, "stop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module.RemoteDiscussionControlMonitor, "start", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(watcher_module.RemoteDiscussionControlMonitor, "stop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module, "visible_executor_launcher", lambda *_args, **_kwargs: launch)
+    monkeypatch.setattr(
+        watcher_module, "passive_human_required_wait",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("eligible relay fell back to passive wait")),
+    )
+    original_dispatch_iteration = watcher_module.run_next_prompt_ready_once
+    dispatch_iterations = []
+    def bounded_dispatch_iteration(*args, **kwargs):
+        dispatch_iterations.append(dict(watcher.state))
+        if len(dispatch_iterations) > 12:
+            raise RuntimeError("isolated main loop did not reach launch: " + repr({key: watcher.state.get(key) for key in ("state", "humanRequiredReason", "postDiscussionEnvelopeRequired", "postDiscussionEnvelopeRepairAttempted", "executorLaunchState", "rolloverDue", "rolloverPending", "rolloverInProgress")}))
+        return original_dispatch_iteration(*args, **kwargs)
+    monkeypatch.setattr(watcher_module, "run_next_prompt_ready_once", bounded_dispatch_iteration)
+    monkeypatch.setenv("AFFOTECH_PROJECT_DIR", str(watcher.project_dir))
+    monkeypatch.setenv("AFFOTECH_ORCHESTRATOR_STATE_DIR", str(watcher.state_dir))
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "DIAGNOSTIC")
+    monkeypatch.setenv("ORCHESTRATOR_POLL_INTERVAL", "0")
+    watcher_module.main()
+
+    assert waiter_results and all(result[0] == "COMPLETED" for result in waiter_results), (
+        [(state, {key: (diagnostics or {}).get(key) for key in ("completionReason", "baselineAssistantCount", "candidateAssistantCount", "baselineLatestAssistantIdentity", "candidateLatestAssistantIdentity", "candidateTextSha256", "resultState")}) for state, diagnostics in waiter_results],
+        fresh_pages[0].assistants if fresh_pages else None,
+    )
     assert watcher.state["architectConversationId"] == "NEW-ARCHITECT"
     assert watcher.state["rolloverDue"] is False
     assert saved == [handover]
@@ -9444,25 +9512,71 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
     assert watcher.state["rolloverRecoveryEpoch"] == 5
     assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
     assert watcher.state["rolloverSentResponseRetryAuthorization"] == authorization
+    assert watcher.state["humanRequiredRecoveryAttemptedReason"] == "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE"
     assert prompt.read_bytes() == prompt_bytes
-    assert watcher.state["postDiscussionProtocolRolloverCommittedTransactionId"] == tx
-
-    # The envelope gate is now bound to the committed new authority. Only after
-    # it accepts the exact existing prompt may the normal dispatch gate launch.
-    for _ in range(5):
-        if watcher.state.get("postDiscussionEnvelopeRequired") is False:
-            break
-        watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert sum(
+        state.get("postDiscussionProtocolRolloverCommittedTransactionId") == tx
+        and (index == 0 or saved_states[index - 1].get("postDiscussionProtocolRolloverCommittedTransactionId") != tx)
+        for index, state in enumerate(saved_states)
+    ) == 1
     assert watcher.state["postDiscussionEnvelopeRequired"] is False
-    assert prompt.read_bytes() == prompt_bytes
-    watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
-    assert launches == [prompt_bytes.decode("utf-8")]
     assert old_page.sent_payloads == []
     assert len(fresh_pages) == 1
     assert sum("Fresh Architect session bootstrap protocol" in payload for payload in fresh_pages[0].sent_payloads) == 1
     assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
     assert prompt.read_bytes() == prompt_bytes
     assert attach_calls[0] == "OLD-ARCHITECT"
+    assert launches == [prompt_bytes.decode("utf-8")]
+    assert events.index("assistant_history_scan") < events.index("visible_assistant_dom_scan")
+    assert events.index("handover_persisted") < events.index("fresh_architect_created")
+    assert events.index("fresh_bootstrap_submitted") < events.index("fresh_ready_materialized")
+    assert events.index("authority_committed") < events.index("page_closed")
+    assert events.index("exact_task_envelope_repair_submitted") < events.index("exact_task_envelope_accepted")
+    assert events.index("exact_task_envelope_accepted") < events.index("executor_launch_authorized")
+
+
+def test_main_unrelated_human_required_same_attempted_reason_remains_passive(tmp_path, monkeypatch):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "orchestrator")
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "UNRELATED_HUMAN_REQUIRED",
+        "humanRequiredRecoveryAttemptedReason": "UNRELATED_HUMAN_REQUIRED",
+        "rolloverDue": True,
+        "rolloverPending": True,
+        "rolloverTransactionId": "unrelated-transaction",
+        "nextTaskId": "task-unrelated",
+    })
+    watcher.save()
+    startup_calls = []
+    passive_calls = []
+
+    def unexpected_startup(*_args, **_kwargs):
+        startup_calls.append(True)
+        raise AssertionError("unrelated HUMAN_REQUIRED must not run startup recovery")
+
+    def stop_after_passive_wait(_watcher):
+        passive_calls.append(True)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(watcher_module, "LocalFirstOrchestrator", lambda *_args, **_kwargs: watcher)
+    monkeypatch.setattr(watcher_module, "run_human_required_startup_once", unexpected_startup)
+    monkeypatch.setattr(watcher_module, "passive_human_required_wait", stop_after_passive_wait)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "start", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(watcher_module.DiscussionHotkeyController, "stop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module.WatcherLivenessWatchdog, "start", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module.WatcherLivenessWatchdog, "stop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module.RemoteDiscussionControlMonitor, "start", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(watcher_module.RemoteDiscussionControlMonitor, "stop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(watcher_module, "visible_executor_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("AFFOTECH_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("AFFOTECH_ORCHESTRATOR_STATE_DIR", str(watcher.state_dir))
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "DIAGNOSTIC")
+    watcher_module.main()
+
+    assert startup_calls == []
+    assert passive_calls == [True]
+    assert watcher.state["humanRequiredReason"] == "UNRELATED_HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredRecoveryAttemptedReason"] == "UNRELATED_HUMAN_REQUIRED"
 
 
 @pytest.mark.parametrize("mutation", ["reason", "transaction", "task", "writer", "watcher"])
