@@ -34,6 +34,10 @@ LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256 = "70D6ECCAB4FED573CD03C4DDF3867073E087C47
 LEGACY_DIAGNOSTIC_RETRY_FAILED_EPOCH = 2
 LEGACY_POSTFIX_QUALIFICATION_FAILED_EPOCH = 3
 LEGACY_POSTFIX_QUALIFICATION_FIX_COMMIT = "2fe16f5e387f7dc97142b08ea38b4824e6dc44d3"
+LEGACY_SENT_RESPONSE_RETRY_PRIOR_EPOCH = 4
+LEGACY_SENT_RESPONSE_RETRY_RUN_ID = "20260927-005538-19332"
+LEGACY_SENT_RESPONSE_RETRY_REQUEST_SHA256 = "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0"
+LEGACY_SENT_RESPONSE_CUTOUT_RUN_ID = "20260927-090837-19732"
 MINIMUM_PYTHON_VERSION = (3, 10)
 
 
@@ -543,6 +547,153 @@ def validate_rollover_postfix_qualification(discovery: dict[str, Any]) -> tuple[
     return True, "SAFE_TO_AUTHORIZE_ONE_POSTFIX_QUALIFICATION"
 
 
+def _legacy_epoch4_request_log_proven(discovery: dict[str, Any]) -> bool:
+    """Require the unique exact production log record for the confirmed epoch-4 request."""
+    state = discovery.get("state")
+    state_dir = Path(str(discovery.get("stateDir") or ""))
+    if not isinstance(state, dict):
+        return False
+    log_dir = state_dir / "logs"
+    needle_parts = (
+        f"runId={LEGACY_SENT_RESPONSE_RETRY_RUN_ID}",
+        "event=LEGACY_HANDOVER_REEMISSION_REQUESTED",
+        f"transactionId={LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID}",
+        f"taskId={LEGACY_DIAGNOSTIC_RETRY_TASK_ID}",
+        f"recoveryEpoch={LEGACY_SENT_RESPONSE_RETRY_PRIOR_EPOCH}",
+        f"requestSha256={LEGACY_SENT_RESPONSE_RETRY_REQUEST_SHA256}",
+        f"conversationId={state.get('architectConversationId')}",
+    )
+    matches: list[str] = []
+    try:
+        for path in log_dir.glob("orchestrator*.log"):
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if all(part in line for part in needle_parts):
+                    matches.append(line)
+    except OSError:
+        return False
+    return len(matches) == 1
+
+
+def _legacy_epoch4_cutout_log_proven(discovery: dict[str, Any]) -> bool:
+    """Prove the exact pre-fix restart cutout for compatibility with current durable state."""
+    state_dir = Path(str(discovery.get("stateDir") or ""))
+    expected = (
+        ("event=HANDOVER_RECONCILIATION_PRE_BUDGET_PROBE", "transactionId=7fdbd798659f42295a18dd2d", "responseFound=False", "transactionMatched=False"),
+        ("event=ARCHITECT_ROLLOVER_MAINTENANCE_DEFERRED", "reason=ARCHITECT_ROLLOVER_SAFETY_CUTOUT"),
+        ("event=HANDOVER_RECONCILIATION_EXHAUSTED", "reason=ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"),
+    )
+    try:
+        for path in (state_dir / "logs").glob("orchestrator*.log"):
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            run_lines = [line for line in lines if f"runId={LEGACY_SENT_RESPONSE_CUTOUT_RUN_ID}" in line]
+            positions = []
+            start = 0
+            for markers in expected:
+                matches = [index for index in range(start, len(run_lines))
+                           if all(marker in run_lines[index] for marker in markers)]
+                if not matches:
+                    break
+                positions.append(matches[0])
+                start = matches[0] + 1
+            if len(positions) == len(expected):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def validate_rollover_sent_response_retry(discovery: dict[str, Any]) -> tuple[bool, str]:
+    """Read-only eligibility for one explicit retry of the confirmed epoch-4 send."""
+    state = discovery.get("state")
+    if not isinstance(state, dict):
+        return False, "STATE_INVALID"
+    if discovery.get("watcherRunning"):
+        return False, "WATCHER_ALREADY_RUNNING"
+    if state.get("state") != "HUMAN_REQUIRED":
+        return False, "STATE_NOT_HUMAN_REQUIRED"
+    human_reason = state.get("humanRequiredReason")
+    if human_reason not in {
+        "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED",
+    }:
+        return False, "HUMAN_REQUIRED_REASON_MISMATCH"
+    if (human_reason == "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+            and (state.get("rolloverRecoveryTerminalReason") != "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+                 or not _legacy_epoch4_cutout_log_proven(discovery))):
+        return False, "PRE_FIX_EPOCH4_CUTOUT_NOT_PROVEN"
+    if state.get("discussionPauseActive") is True:
+        return False, "DISCUSSION_PAUSE_ACTIVE"
+    if (state.get("taskId") != LEGACY_DIAGNOSTIC_RETRY_COMPLETED_TASK_ID
+            or state.get("lastCompletedTaskId") != LEGACY_DIAGNOSTIC_RETRY_COMPLETED_TASK_ID
+            or state.get("nextTaskId") != LEGACY_DIAGNOSTIC_RETRY_TASK_ID):
+        return False, "TASK_BOUNDARY_MISMATCH"
+    transaction_id = LEGACY_DIAGNOSTIC_RETRY_TRANSACTION_ID
+    task_id = LEGACY_DIAGNOSTIC_RETRY_TASK_ID
+    epoch = LEGACY_SENT_RESPONSE_RETRY_PRIOR_EPOCH
+    if (state.get("rolloverTransactionId") != transaction_id
+            or state.get("rolloverTransactionTaskId") != task_id):
+        return False, "TRANSACTION_IDENTITY_MISMATCH"
+    if (state.get("rolloverRecoveryEpoch") != epoch
+            or state.get("rolloverAutomaticRecoveryEpochCount") != 3
+            or state.get("rolloverAutomaticRecoveryMaxEpochs") != 3):
+        return False, "RECOVERY_EPOCH_BOUNDARY_MISMATCH"
+    if (state.get("rolloverDue") is not True or state.get("rolloverPending") is not True
+            or state.get("handoverRequested") is not True or state.get("handoverReady") is True):
+        return False, "ROLLOVER_AUTHORITY_MISMATCH"
+    if (state.get("rolloverLegacyHandoverReemissionTransactionId") != transaction_id
+            or state.get("rolloverLegacyHandoverReemissionAttemptedEpoch") != epoch
+            or state.get("rolloverLegacyHandoverReemissionState") != "SENT"
+            or state.get("rolloverHandoverSendState") != "AMBIGUOUS"):
+        return False, "SENT_EPOCH_EVIDENCE_MISMATCH"
+    prior = state.get("rolloverPostfixQualificationAuthorization")
+    if not (isinstance(prior, dict) and prior.get("transactionId") == transaction_id
+            and prior.get("taskId") == task_id and prior.get("failedEpoch") == 3
+            and prior.get("qualificationEpoch") == epoch
+            and prior.get("executorLaunchAuthorized") is False):
+        return False, "EPOCH4_HUMAN_QUALIFICATION_NOT_PROVEN"
+    ledger = state.get("rolloverSentResponseRetryAuthorizations", [])
+    if not isinstance(ledger, list):
+        return False, "RETRY_AUTHORIZATION_LEDGER_INVALID"
+    if any(isinstance(row, dict) and row.get("transactionId") == transaction_id
+           and row.get("priorEpoch") == epoch for row in ledger):
+        return False, "FAILED_EPOCH_AUTHORIZATION_ALREADY_CONSUMED"
+    if (state.get("rolloverFreshCandidateConversationId")
+            or state.get("rolloverFreshCandidateState") in {"ACK_PENDING", "SUBMISSION_AMBIGUOUS", "READY"}
+            or state.get("postDiscussionProtocolRolloverCommittedTransactionId") == transaction_id):
+        return False, "FRESH_AUTHORITY_ALREADY_ADVANCED"
+    if state.get("handoverReady") is True or _validated_pending_handover_exists(state):
+        return False, "VALIDATED_DURABLE_HANDOVER_ALREADY_EXISTS"
+    if state.get("rolloverHandoverResponseIdentity") or state.get("rolloverFreshBootstrapPayloadHash"):
+        return False, "DURABLE_HANDOVER_EVIDENCE_INCOMPLETE"
+    state_dir = Path(str(discovery.get("stateDir") or ""))
+    expected_prompt = state_dir / "prompts" / f"{task_id}.txt"
+    try:
+        if (state.get("nextPromptPath") is None
+                or Path(str(state.get("nextPromptPath"))).resolve() != expected_prompt.resolve()
+                or not expected_prompt.is_file()
+                or hashlib.sha256(expected_prompt.read_bytes()).hexdigest().upper() != LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256):
+            return False, "STAGED_PROMPT_IDENTITY_MISMATCH"
+        entry = state.get("taskWorktrees", {}).get(task_id) if isinstance(state.get("taskWorktrees"), dict) else None
+        if not (isinstance(entry, dict) and entry.get("taskId") == task_id
+                and entry.get("worktreePath") and Path(str(entry["worktreePath"])).is_dir()):
+            return False, "STAGED_WORKTREE_EVIDENCE_INVALID"
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False, "STAGED_PROMPT_IDENTITY_MISMATCH"
+    if (state.get("executorSessionId") != LEGACY_DIAGNOSTIC_RETRY_EXECUTOR_SESSION_ID
+            or state.get("executorSessionMode") != "PERSISTENT"
+            or not discovery.get("executorSessionExists")):
+        return False, "PERSISTENT_EXECUTOR_SESSION_MISMATCH"
+    alive_by_field = discovery.get("executorPidAliveByField") or {}
+    if (bool(state.get("executorActiveWriter")) or bool(state.get("governedExecutorActiveWriter"))
+            or discovery.get("activeWriterPresent") or discovery.get("executorPidAlive")
+            or alive_by_field.get("codexPid") or alive_by_field.get("active_codex_pid")
+            or str(state.get("executorProcessState") or "").upper() in {"RUNNING", "STARTING", "ACTIVE"}):
+        return False, "EXECUTOR_PROCESS_OR_WRITER_ACTIVE"
+    if not _legacy_epoch4_request_log_proven(discovery):
+        return False, "EPOCH4_REQUEST_IDENTITY_NOT_PROVEN"
+    return True, "SAFE_TO_AUTHORIZE_ONE_SENT_RESPONSE_RETRY"
+
+
 def architect_cdp_health(endpoint: str) -> tuple[bool, str]:
     try:
         with urllib.request.urlopen(endpoint.rstrip("/") + "/json/version", timeout=2) as response:
@@ -589,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate-retry")
     parser.add_argument("--validate-rollover-diagnostic-retry", action="store_true")
     parser.add_argument("--validate-rollover-postfix-qualification", action="store_true")
+    parser.add_argument("--validate-rollover-sent-response-retry", action="store_true")
     parser.add_argument("--probe-architect", action="store_true")
     parser.add_argument("--endpoint", default="http://127.0.0.1:9333")
     args = parser.parse_args(argv)
@@ -610,6 +762,8 @@ def main(argv: list[str] | None = None) -> int:
             result["rolloverDiagnosticRetryEligible"], result["rolloverDiagnosticRetryReason"] = validate_rollover_diagnostic_retry(discovery)
         if args.validate_rollover_postfix_qualification:
             result["rolloverPostfixQualificationEligible"], result["rolloverPostfixQualificationReason"] = validate_rollover_postfix_qualification(discovery)
+        if args.validate_rollover_sent_response_retry:
+            result["rolloverSentResponseRetryEligible"], result["rolloverSentResponseRetryReason"] = validate_rollover_sent_response_retry(discovery)
         print(json.dumps(result, ensure_ascii=True, default=str))
         return 0
     except Exception as error:

@@ -2,7 +2,8 @@ param(
     [switch]$StatusOnly,
     [string]$AuthorizeRetry,
     [switch]$AuthorizeRolloverDiagnosticRetry,
-    [switch]$AuthorizeRolloverPostfixQualification
+    [switch]$AuthorizeRolloverPostfixQualification,
+    [switch]$AuthorizeRolloverSentResponseRetry
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,8 +19,8 @@ $Endpoint = "http://127.0.0.1:9333"
 $ArchitectProfile = "C:\BraveDebug\Architect"
 $ArchitectPort = 9333
 
-if ((@([bool]$AuthorizeRetry, [bool]$AuthorizeRolloverDiagnosticRetry, [bool]$AuthorizeRolloverPostfixQualification) | Where-Object { $_ }).Count -gt 1) {
-    throw "Choose only one authorization surface; Executor retry, diagnostic retry, and post-fix qualification are separate."
+if ((@([bool]$AuthorizeRetry, [bool]$AuthorizeRolloverDiagnosticRetry, [bool]$AuthorizeRolloverPostfixQualification, [bool]$AuthorizeRolloverSentResponseRetry) | Where-Object { $_ }).Count -gt 1) {
+    throw "Choose only one authorization surface; Executor retry, diagnostic retry, post-fix qualification, and sent-response retry are separate."
 }
 
 function Invoke-Recovery([string[]]$Extra) {
@@ -50,7 +51,7 @@ function Show-Summary($Report, [string]$AuthorizationMode) {
 }
 
 $Report = Invoke-Recovery @()
-$AuthorizationMode = if ($AuthorizeRetry) { "AUTHORIZE_EXECUTOR_RETRY_$AuthorizeRetry" } elseif ($AuthorizeRolloverDiagnosticRetry) { "AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY" } elseif ($AuthorizeRolloverPostfixQualification) { "AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION" } else { "NONE" }
+$AuthorizationMode = if ($AuthorizeRetry) { "AUTHORIZE_EXECUTOR_RETRY_$AuthorizeRetry" } elseif ($AuthorizeRolloverDiagnosticRetry) { "AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY" } elseif ($AuthorizeRolloverPostfixQualification) { "AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION" } elseif ($AuthorizeRolloverSentResponseRetry) { "AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY" } else { "NONE" }
 Show-Summary $Report $AuthorizationMode
 
 if ($Report.discovery.watcherRunning) {
@@ -68,6 +69,11 @@ if ($AuthorizeRolloverPostfixQualification) {
     $PostfixQualificationReport = Invoke-Recovery @("--validate-rollover-postfix-qualification")
     Write-Host "Rollover post-fix qualification eligible: $($PostfixQualificationReport.rolloverPostfixQualificationEligible) reason=$($PostfixQualificationReport.rolloverPostfixQualificationReason)"
 }
+$SentResponseRetryReport = $null
+if ($AuthorizeRolloverSentResponseRetry) {
+    $SentResponseRetryReport = Invoke-Recovery @("--validate-rollover-sent-response-retry")
+    Write-Host "Rollover sent-response retry eligible: $($SentResponseRetryReport.rolloverSentResponseRetryEligible) reason=$($SentResponseRetryReport.rolloverSentResponseRetryReason)"
+}
 
 if ($StatusOnly) {
     Write-Host "STATUS_ONLY: no browser, watcher, authorization, or state mutation performed."
@@ -80,6 +86,10 @@ if ($AuthorizeRolloverDiagnosticRetry -and -not $RolloverRetryReport.rolloverDia
 }
 if ($AuthorizeRolloverPostfixQualification -and -not $PostfixQualificationReport.rolloverPostfixQualificationEligible) {
     Write-Host "BLOCKED: $($PostfixQualificationReport.rolloverPostfixQualificationReason)"
+    exit 3
+}
+if ($AuthorizeRolloverSentResponseRetry -and -not $SentResponseRetryReport.rolloverSentResponseRetryEligible) {
+    Write-Host "BLOCKED: $($SentResponseRetryReport.rolloverSentResponseRetryReason)"
     exit 3
 }
 
@@ -104,8 +114,8 @@ if ($Probe -and $Probe.recoveryClassification -eq "ARCHITECT_RECOVERY_INCONCLUSI
     exit 4
 }
 
-if ($Report.recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION" -and -not $AuthorizeRetry -and -not $AuthorizeRolloverDiagnosticRetry -and -not $AuthorizeRolloverPostfixQualification) {
-    Write-Host "HUMAN_REQUIRED: no automatic action. Executor retry, legacy diagnostic retry, and post-fix qualification require their separate explicit authorizations."
+if ($Report.recoveryClassification -eq "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION" -and -not $AuthorizeRetry -and -not $AuthorizeRolloverDiagnosticRetry -and -not $AuthorizeRolloverPostfixQualification -and -not $AuthorizeRolloverSentResponseRetry) {
+    Write-Host "HUMAN_REQUIRED: no automatic action. Executor retry and each rollover recovery qualification require separate explicit authorizations."
     exit 5
 }
 
@@ -140,6 +150,7 @@ Write-Host "Starting resident watcher visibly in this terminal."
 $oldAuth = $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY
 $oldRolloverAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY
 $oldPostfixQualificationAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION
+$oldSentResponseRetryAuth = $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY
 try {
     if ($AuthorizeRetry) { $env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY = $AuthorizeRetry }
     else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_POSTLAUNCH_RETRY -ErrorAction SilentlyContinue }
@@ -147,6 +158,8 @@ try {
     else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY -ErrorAction SilentlyContinue }
     if ($AuthorizeRolloverPostfixQualification) { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION = "7fdbd798659f42295a18dd2d:3" }
     else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION -ErrorAction SilentlyContinue }
+    if ($AuthorizeRolloverSentResponseRetry) { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY = "7fdbd798659f42295a18dd2d:4:41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0:70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85" }
+    else { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY -ErrorAction SilentlyContinue }
     & $Python (Join-Path $Repository "local_orchestrator_watcher.py")
     exit $LASTEXITCODE
 } finally {
@@ -156,4 +169,6 @@ try {
     else { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_DIAGNOSTIC_RETRY = $oldRolloverAuth }
     if ($null -eq $oldPostfixQualificationAuth) { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION -ErrorAction SilentlyContinue }
     else { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION = $oldPostfixQualificationAuth }
+    if ($null -eq $oldSentResponseRetryAuth) { Remove-Item Env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY -ErrorAction SilentlyContinue }
+    else { $env:ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY = $oldSentResponseRetryAuth }
 }

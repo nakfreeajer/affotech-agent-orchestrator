@@ -8976,3 +8976,372 @@ def test_postfix_qualification_consumes_epoch_four_once_without_raising_auto_bud
     assert watcher.consume_rollover_postfix_qualification_authorization() is False
     assert watcher.state["rolloverRecoveryEpoch"] == 4
     assert prompt.read_text(encoding="utf-8") == prompt_text
+
+
+def _epoch4_sent_incident_fixture(tmp_path):
+    source_prompt = Path(__file__).parent / ".agent-work" / "orchestrator" / "prompts" / "000103.txt"
+    prompt_bytes = source_prompt.read_bytes()
+    assert hashlib.sha256(prompt_bytes).hexdigest().upper() == "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+    project = Path(__file__).resolve().parent
+    state_dir = tmp_path / "orchestrator"
+    watcher = LocalFirstOrchestrator(str(project), state_dir)
+    prompt = watcher.prompts_dir / "000103.txt"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_bytes(prompt_bytes)
+    worktree = tmp_path / "task-000103-worktree"
+    worktree.mkdir()
+    transaction = "7fdbd798659f42295a18dd2d"
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000102", "lastCompletedTaskId": "000102",
+        "nextTaskId": "000103", "nextPromptPath": str(prompt),
+        "executorSessionId": "019f842e-98bc-7672-a619-51441d91be00", "executorSessionMode": "PERSISTENT",
+        "executorProcessState": "COMPLETED_WITH_RESULT", "executorLaunchState": "LAUNCHED",
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": True,
+        "handoverRequested": True, "handoverReady": False, "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "IN_PROGRESS", "rolloverRecoveryState": "RECOVERING",
+        "rolloverRecoveryEpoch": 4, "rolloverRecoveryAttemptCount": 0,
+        "rolloverRecoveryStartedAt": 1_790_471_325.9053223 - 29581.0,
+        "rolloverAutomaticRecoveryEpochCount": 3, "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverTransactionId": transaction, "rolloverTransactionTaskId": "000103",
+        "rolloverAttemptedForTaskId": "000103", "rolloverDeferredForTaskId": "000103",
+        "rolloverLegacyHandoverReemissionTransactionId": transaction,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 4,
+        "rolloverLegacyHandoverReemissionState": "SENT",
+        "rolloverPostfixQualificationAuthorization": {
+            "transactionId": transaction, "taskId": "000103", "failedEpoch": 3,
+            "qualificationEpoch": 4, "automaticRecoveryEpochCount": 3,
+            "automaticRecoveryMaxEpochs": 3, "executorLaunchAuthorized": False,
+        },
+        "rolloverDiagnosticRetryAuthorizationConsumedTransactionId": transaction,
+        "rolloverDiagnosticRetryAuthorization": {
+            "transactionId": transaction, "taskId": "000103", "previousEpoch": 2, "newEpoch": 3,
+        },
+        "discussionPauseActive": False, "architectConversationId": "OLD-ARCHITECT",
+        "postDiscussionEnvelopeRequired": True, "postDiscussionResumeEpoch": 7,
+        "postDiscussionProtocolTaskId": "000103", "postDiscussionProtocolTransactionId": transaction,
+        "taskWorktrees": {"000103": {"taskId": "000103", "worktreePath": str(worktree)}},
+    })
+    watcher.save()
+    return watcher, prompt, prompt_bytes
+
+
+def _epoch4_request_log_line():
+    return (
+        "2026-09-27 00:55:54,235 level=INFO runId=20260927-005538-19332 "
+        "state=NEXT_PROMPT_READY taskId=000103 event=LEGACY_HANDOVER_REEMISSION_REQUESTED "
+        "transactionId=7fdbd798659f42295a18dd2d taskId=000103 recoveryEpoch=4 "
+        "requestSha256=41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0 "
+        "conversationId=OLD-ARCHITECT"
+    )
+
+
+def test_sent_retry_preflight_accepts_only_exact_historical_epoch4_cutout(tmp_path):
+    import crash_recovery_bootstrap as bootstrap
+
+    watcher, _prompt, _prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED",
+        "rolloverRecoveryTerminalReason": "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED",
+        "rolloverRecoveryState": "DEFERRED", "rolloverMaintenanceState": "DEFERRED",
+        "rolloverInProgress": False,
+    })
+    log_dir = watcher.state_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = "\n".join((
+        _epoch4_request_log_line(),
+        "runId=20260927-090837-19732 state=NEXT_PROMPT_READY taskId=000103 event=HANDOVER_RECONCILIATION_PRE_BUDGET_PROBE transactionId=7fdbd798659f42295a18dd2d responseFound=False transactionMatched=False",
+        "runId=20260927-090837-19732 state=HUMAN_REQUIRED taskId=000102 event=ARCHITECT_ROLLOVER_MAINTENANCE_DEFERRED reason=ARCHITECT_ROLLOVER_SAFETY_CUTOUT",
+        "runId=20260927-090837-19732 state=HUMAN_REQUIRED taskId=000102 event=HANDOVER_RECONCILIATION_EXHAUSTED reason=ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED",
+    ))
+    (log_dir / "orchestrator.log").write_text(log + "\n", encoding="utf-8")
+    discovery = {
+        "state": watcher.state, "stateDir": str(watcher.state_dir), "repository": str(watcher.project_dir),
+        "watcherRunning": False, "executorSessionExists": True, "activeWriterPresent": False,
+        "executorPidAlive": False, "executorPidAliveByField": {"codexPid": False, "active_codex_pid": False},
+    }
+    assert bootstrap.validate_rollover_sent_response_retry(discovery) == (
+        True, "SAFE_TO_AUTHORIZE_ONE_SENT_RESPONSE_RETRY",
+    )
+    before = json.loads(json.dumps(watcher.state))
+    assert bootstrap.validate_rollover_sent_response_retry(discovery)[0]
+    assert watcher.state == before
+    (log_dir / "orchestrator.log").write_text(_epoch4_request_log_line() + "\n", encoding="utf-8")
+    assert bootstrap.validate_rollover_sent_response_retry(discovery) == (
+        False, "PRE_FIX_EPOCH4_CUTOUT_NOT_PROVEN",
+    )
+
+
+def test_epoch4_sent_restart_public_path_and_one_shot_operator_continuation_e2e(tmp_path, monkeypatch):
+    import crash_recovery_bootstrap as bootstrap
+
+    original, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    stale_started_at = original.state["rolloverRecoveryStartedAt"]
+    state_dir = original.state_dir
+    log_dir = state_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "orchestrator.log").write_text(_epoch4_request_log_line() + "\n", encoding="utf-8")
+    events = []
+    old_page = _ArchitectDomPage("OLD-ARCHITECT")
+    pages = {"OLD-ARCHITECT": old_page}
+    attach_calls = []
+
+    def controlled_attach(_endpoint, conversation_id=None):
+        attach_calls.append(conversation_id)
+        assert conversation_id in pages, conversation_id
+        return ArchitectPlaywright(pages[conversation_id])
+
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(controlled_attach))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    now = 1_790_471_325.9053223 + 120
+    monotonic = [10.0]
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now)
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: monotonic[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: monotonic.__setitem__(0, monotonic[0] + delay))
+
+    # A new process object reloads the exact persisted pre-run state.
+    watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), state_dir)
+    launches = []
+    launch = lambda received, _result: launches.append(received) or type("Process", (), {"pid": 91003})()
+
+    # Branch B: no response is visible for the exact already-SENT epoch.
+    blocked_page = _ArchitectDomPage("OLD-ARCHITECT")
+    pages["OLD-ARCHITECT"] = blocked_page
+    assert watcher_module.run_next_prompt_ready_once(
+        watcher, launch, "isolated", watcher.discussion_pause_active,
+    ) is None
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE"
+    assert watcher.state["rolloverLegacyHandoverResponseDisposition"] == "SENT_EPOCH_RESPONSE_NOT_RECOVERABLE"
+    assert watcher.state["rolloverRecoveryStartedAt"] == stale_started_at
+    assert watcher.state["rolloverRecoveryEpoch"] == 4
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state["rolloverLegacyHandoverReemissionAttemptedEpoch"] == 4
+    assert watcher.state["rolloverLegacyHandoverReemissionState"] == "SENT"
+    assert watcher.state.get("rolloverRecoveryTerminalReason") != "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+    assert not blocked_page.sent_payloads and not launches
+    assert prompt.read_bytes() == prompt_bytes
+
+    discovery = {
+        "state": watcher.state, "stateDir": str(state_dir), "repository": str(watcher.project_dir),
+        "watcherRunning": False, "executorSessionExists": True, "activeWriterPresent": False,
+        "executorPidAlive": False, "executorPidAliveByField": {"codexPid": False, "active_codex_pid": False},
+    }
+    assert bootstrap.validate_rollover_sent_response_retry(discovery) == (
+        True, "SAFE_TO_AUTHORIZE_ONE_SENT_RESPONSE_RETRY",
+    )
+    before_status = json.loads(watcher.state_path.read_text(encoding="utf-8"))
+    assert bootstrap.validate_rollover_sent_response_retry(discovery)[0]
+    assert json.loads(watcher.state_path.read_text(encoding="utf-8")) == before_status
+    monkeypatch.setattr(bootstrap, "_default_process_records", lambda: [])
+    monkeypatch.setattr(bootstrap, "_session_exists", lambda _session: True)
+    monkeypatch.setattr(bootstrap, "_session_writer_records", lambda _session, _records: [])
+    monkeypatch.setattr(bootstrap, "_pid_alive", lambda _pid, _records: False)
+    token = (
+        "7fdbd798659f42295a18dd2d:4:"
+        "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0:"
+        "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+    )
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY", token)
+    assert watcher.consume_rollover_sent_response_retry_authorization() is True
+    authorization = watcher.state["rolloverSentResponseRetryAuthorization"]
+    assert authorization["priorEpoch"] == 4 and authorization["qualificationEpoch"] == 5
+    assert authorization["executorLaunchAuthorized"] is False
+    assert authorization["requestSha256"] == "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0"
+    assert authorization["promptSha256"] == "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+    assert watcher.state["rolloverRecoveryEpoch"] == 5
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state["rolloverTransactionId"] == "7fdbd798659f42295a18dd2d"
+    assert watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert watcher.consume_rollover_sent_response_retry_authorization() is False
+
+    # Continue epoch 5 with real ArchitectPlaywright, recovery parser, durable
+    # handover, fresh-session coordinator, envelope gate and dispatch authority.
+    old_page = _ArchitectDomPage("OLD-ARCHITECT")
+    old_page.events = events
+    pages["OLD-ARCHITECT"] = old_page
+    fresh_pages = []
+    original_new_page = old_page.context.new_page
+
+    def capture_fresh_page():
+        fresh = original_new_page()
+        fresh.staged_prompt = prompt.read_text(encoding="utf-8")
+        fresh.events = events
+        pages["NEW-ARCHITECT"] = fresh
+        fresh_pages.append(fresh)
+        events.append("fresh_created")
+        return fresh
+
+    old_page.context.new_page = capture_fresh_page
+    watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), state_dir)
+    assert watcher.state["rolloverRecoveryStartedAt"] == now
+    assert watcher_module.run_next_prompt_ready_once(
+        watcher, launch, "isolated", watcher.discussion_pause_active,
+    ) is None
+    assert len(old_page.sent_payloads) == 1
+    assert old_page.sent_payloads[0].startswith("ARCHITECT HANDOVER TRANSPORT RECOVERY")
+    assert watcher.state["architectConversationId"] == "NEW-ARCHITECT"
+    assert watcher.state["rolloverDue"] is False
+    assert len(fresh_pages) == 1
+    fresh_page = fresh_pages[0]
+    assert sum("Fresh Architect session bootstrap protocol" in item for item in fresh_page.sent_payloads) == 1
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    for _ in range(4):
+        if watcher.state.get("postDiscussionEnvelopeRequired") is False:
+            break
+        watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert prompt.read_bytes() == prompt_bytes
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest().upper() == "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+    assert launches == []
+    assert watcher_module.run_next_prompt_ready_once(
+        watcher, launch, "isolated", watcher.discussion_pause_active,
+    ) is not None
+    assert launches == [prompt_bytes.decode("utf-8")]
+    assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
+    assert prompt.read_bytes() == prompt_bytes
+
+
+def test_epoch4_sent_stale_timestamp_existing_response_public_recovery_no_resend(tmp_path, monkeypatch):
+    original, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = "7fdbd798659f42295a18dd2d"
+    handover = (
+        "Exact authoritative handover for staged task 000103.\n"
+        f"Rollover transaction ID: {tx}\n000103\nARCHITECT_HANDOVER_READY"
+    )
+    original.state["rolloverRecoveryStartedAt"] = 1_790_471_325.9053223 - 29581
+    original.state["rolloverAutomaticRecoveryNextEligibleAt"] = 1_790_471_325.9053223 + 60
+    original.state["architectDiscussionBaseline"] = {"count": 0, "text_hash": hashlib.sha256(b"").hexdigest()}
+    original.save()
+    events = []
+    old_page = _ArchitectDomPage("OLD-ARCHITECT")
+    old_page.assistants.append({"id": "legacy-handover", "text": handover})
+    old_page.events = events
+    pages = {"OLD-ARCHITECT": old_page}
+    fresh_pages = []
+    create_fresh_page = old_page.context.new_page
+
+    def observed_new_page():
+        assert watcher.state.get("pending_handover") == handover
+        assert watcher.state.get("rolloverHandoverResponseIdentity") == hashlib.sha256(handover.encode()).hexdigest()
+        page = create_fresh_page()
+        page.staged_prompt = prompt.read_text(encoding="utf-8")
+        page.events = events
+        pages["NEW-ARCHITECT"] = page
+        fresh_pages.append(page)
+        events.append("fresh_architect_created")
+        return page
+
+    old_page.context.new_page = observed_new_page
+    attach_history = []
+
+    def attach(_endpoint, conversation_id=None):
+        attach_history.append(conversation_id)
+        return ArchitectPlaywright(pages[conversation_id])
+
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    now = 1_790_471_325.9053223 + 120
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "time", lambda: now)
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+
+    # Restart from persisted epoch-4/SENT state; response is visible only in the
+    # controlled page DOM, so the real reconciliation path must consume it.
+    watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
+    launches = []
+    launch = lambda received, _result: launches.append(received) or type("Process", (), {"pid": 91003})()
+    persisted = []
+    persist = watcher.session_rollover.persist_validated_handover
+
+    def observe_persist(response):
+        persisted.append(response)
+        return persist(response)
+
+    watcher.session_rollover.persist_validated_handover = observe_persist
+    result = watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert result is None
+    assert watcher.state["architectConversationId"] == "NEW-ARCHITECT"
+    assert watcher.state["rolloverDue"] is False
+    assert persisted == [handover]
+    assert old_page.sent_payloads == []  # no old-Architect resend
+    assert len(fresh_pages) == 1
+    fresh_page = fresh_pages[0]
+    assert sum("Fresh Architect session bootstrap protocol" in item for item in fresh_page.sent_payloads) == 1
+    assert not launches
+    for _ in range(4):
+        if watcher.state.get("postDiscussionEnvelopeRequired") is False:
+            break
+        watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert prompt.read_bytes() == prompt_bytes
+    assert watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active) is not None
+    assert launches == [prompt_bytes.decode("utf-8")]
+    assert len(fresh_pages) == 1
+    assert sum("Fresh Architect session bootstrap protocol" in item for item in fresh_page.sent_payloads) == 1
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
+    assert watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state.get("rolloverTransactionId") is None
+    assert watcher.state["handoverRequested"] is False
+    assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert prompt.read_bytes() == prompt_bytes
+
+
+@pytest.mark.parametrize("mismatch", [
+    "reason", "transaction", "task", "prompt", "session", "writer", "watcher",
+    "validated_handover", "duplicate_authorization", "request_log",
+], ids=lambda value: value)
+def test_epoch4_sent_response_retry_authorization_rejects_mismatched_evidence(tmp_path, mismatch):
+    import crash_recovery_bootstrap as bootstrap
+
+    watcher, prompt, _prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "rolloverInProgress": False,
+        "rolloverLegacyHandoverResponseDisposition": "SENT_EPOCH_RESPONSE_NOT_RECOVERABLE",
+    })
+    log_dir = watcher.state_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "orchestrator.log").write_text(_epoch4_request_log_line() + "\n", encoding="utf-8")
+    watcher.save()
+    discovery = {
+        "state": watcher.state, "stateDir": str(watcher.state_dir), "repository": str(watcher.project_dir),
+        "watcherRunning": False, "executorSessionExists": True, "activeWriterPresent": False,
+        "executorPidAlive": False, "executorPidAliveByField": {"codexPid": False, "active_codex_pid": False},
+    }
+    if mismatch == "reason":
+        watcher.state["humanRequiredReason"] = "ARCHITECT_ROLLOVER_AUTOMATIC_RECOVERY_EXHAUSTED"
+    elif mismatch == "transaction":
+        watcher.state["rolloverTransactionId"] = "different"
+    elif mismatch == "task":
+        watcher.state["nextTaskId"] = "000104"
+    elif mismatch == "prompt":
+        watcher.state["nextPromptPath"] = str(watcher.prompts_dir / "different.txt")
+    elif mismatch == "session":
+        watcher.state["executorSessionId"] = "different"
+    elif mismatch == "writer":
+        discovery["activeWriterPresent"] = True
+    elif mismatch == "watcher":
+        discovery["watcherRunning"] = True
+    elif mismatch == "validated_handover":
+        watcher.state.update({
+            "pending_handover": "Existing 000103 response\nRollover transaction ID: 7fdbd798659f42295a18dd2d\nARCHITECT_HANDOVER_READY",
+            "rolloverHandoverResponseIdentity": hashlib.sha256(
+                b"Existing 000103 response\nRollover transaction ID: 7fdbd798659f42295a18dd2d\nARCHITECT_HANDOVER_READY"
+            ).hexdigest(),
+        })
+    elif mismatch == "duplicate_authorization":
+        watcher.state["rolloverSentResponseRetryAuthorizations"] = [{
+            "transactionId": "7fdbd798659f42295a18dd2d", "priorEpoch": 4,
+        }]
+    elif mismatch == "request_log":
+        (log_dir / "orchestrator.log").write_text("incomplete request evidence\n", encoding="utf-8")
+    result = bootstrap.validate_rollover_sent_response_retry(discovery)
+    assert result[0] is False
+    assert prompt.is_file()

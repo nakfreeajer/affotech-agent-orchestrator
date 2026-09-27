@@ -474,3 +474,15 @@ def test_rollover_retry_cli_status_is_read_only_and_wrapper_authority_is_separat
     import local_orchestrator_watcher as watcher_module
     main_source = inspect.getsource(watcher_module.main)
     assert main_source.index("hotkeys.start") < main_source.index("consume_rollover_diagnostic_retry_authorization") < main_source.index("while True")
+
+
+def test_sent_response_retry_wrapper_is_explicit_status_only_safe_and_separate():
+    script = Path(__file__).with_name("AFFOTECH-START.ps1").read_text(encoding="utf-8")
+    assert "[switch]$AuthorizeRolloverSentResponseRetry" in script
+    assert "--validate-rollover-sent-response-retry" in script
+    assert "ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY" in script
+    assert "$AuthorizeRolloverSentResponseRetry" in script
+    assert script.index("if ($StatusOnly)") < script.index("ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY =")
+    assert script.index('Read-Host "Type START') < script.index("ORCHESTRATOR_AUTHORIZE_ROLLOVER_SENT_RESPONSE_RETRY =")
+    assert "-not $AuthorizeRolloverSentResponseRetry" in script
+    assert "Executor retry, diagnostic retry, post-fix qualification, and sent-response retry are separate" in script
