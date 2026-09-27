@@ -4836,6 +4836,7 @@ class _ArchitectDomPage:
         self.staged_prompt = ""
         self.events = []
         self.pending_assistant = None
+        self.visible_handover_candidates = []
         self.keyboard = _ArchitectDomKeyboard(self)
 
     def get_by_role(self, role, name=None):
@@ -4866,6 +4867,10 @@ class _ArchitectDomPage:
             return list(self.assistants)
         if script == watcher_module.assistant_latest_entry_script():
             return self.assistants[-1] if self.assistants else None
+        if "const marker = 'ARCHITECT_HANDOVER_READY'" in script and "document.querySelector('main')" in script:
+            return list(self.visible_handover_candidates)
+        if "window.scrollTo" in script:
+            return False
         if "stop-button" in script:
             return False
         if "data-message-author-role=\"user\"" in script:
@@ -9289,6 +9294,218 @@ def test_epoch4_sent_stale_timestamp_existing_response_public_recovery_no_resend
     assert watcher.state.get("rolloverTransactionId") is None
     assert watcher.state["handoverRequested"] is False
     assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert prompt.read_bytes() == prompt_bytes
+
+
+def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path, monkeypatch):
+    """The public HUMAN_REQUIRED entry relays a rendered response missed by history selectors."""
+    original, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    handover = (
+        "AFFOTECH ARCHITECT SESSION HANDOVER\n"
+        "Authoritative preserved handover for the already-staged pending task.\n"
+        f"Rollover transaction ID: {tx}\n"
+        "Target task 000103.\nARCHITECT_HANDOVER_READY"
+    )
+    prompt_hash = hashlib.sha256(prompt_bytes).hexdigest().upper()
+    authorization = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4,
+        "qualificationEpoch": 5,
+        "requestSha256": "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0",
+        "promptSha256": prompt_hash, "automaticRecoveryEpochCount": 3,
+        "automaticRecoveryMaxEpochs": 3, "executorLaunchAuthorized": False,
+        "requiresNormalRolloverCompletion": True,
+    }
+    original.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "rolloverRecoveryEpoch": 5, "rolloverRecoveryState": "RECOVERING",
+        "rolloverAutomaticRecoveryEpochCount": 3, "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverInProgress": True,
+        "rolloverDue": True, "rolloverPending": True, "handoverRequested": True,
+        "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5,
+        "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverSentResponseRetryAuthorization": authorization,
+        "rolloverSentResponseRetryAuthorizations": [authorization],
+        "postDiscussionEnvelopeRequired": True, "postDiscussionProtocolTaskId": "000103",
+        "postDiscussionProtocolTransactionId": tx,
+        "postDiscussionProtocolRolloverCommittedTransactionId": None,
+        "discussionPauseActive": False, "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorProcessState": "COMPLETED_WITH_RESULT", "executorLaunchState": "LAUNCHED",
+        "architectConversationId": "OLD-ARCHITECT",
+    })
+    for key in ("pending_handover", "rolloverHandoverResponseIdentity", "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState"):
+        original.state.pop(key, None)
+    original.save()
+
+    events = []
+    old_page = _ArchitectDomPage("OLD-ARCHITECT")
+    old_page.events = events
+    # The basic historical APIs intentionally miss the response. Only the
+    # controlled currently-rendered transcript-DOM observer exposes it.
+    old_page.visible_handover_candidates = [{
+        "text": handover, "identity": "rendered-turn-000103", "role": None, "tag": "DIV",
+    }]
+    assert old_page.assistants == []
+    pages = {"OLD-ARCHITECT": old_page}
+    fresh_pages = []
+    launches = []
+
+    def capture_fresh_page():
+        page = _ArchitectDomContext.new_page(old_page.context)
+        page.staged_prompt = prompt.read_text(encoding="utf-8")
+        page.events = events
+        pages["NEW-ARCHITECT"] = page
+        fresh_pages.append(page)
+        events.append("fresh_architect_created")
+        return page
+
+    old_page.context.new_page = capture_fresh_page
+    attach_calls = []
+
+    def attach(_endpoint, conversation_id=None):
+        attach_calls.append(conversation_id)
+        return ArchitectPlaywright(pages[conversation_id])
+
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach))
+    monkeypatch.setattr(watcher_module, "canonicalize_attached_architect_conversation", lambda _w, _b, requested: requested)
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: 1.0)
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
+    saved = []
+    persist = watcher.session_rollover.persist_validated_handover
+
+    def capture_persist(response):
+        saved.append(response)
+        return persist(response)
+
+    watcher.session_rollover.persist_validated_handover = capture_persist
+    launch = lambda received, _path: launches.append(received) or type("Process", (), {"pid": 91003})()
+
+    # Public startup path; no retry authorization is consumed and no request is sent.
+    assert watcher_module.run_human_required_startup_once(watcher, launch) == "NEXT_PROMPT_READY"
+    assert watcher.state["architectConversationId"] == "NEW-ARCHITECT"
+    assert watcher.state["rolloverDue"] is False
+    assert saved == [handover]
+    assert "pending_handover" not in watcher.state
+    assert old_page.sent_payloads == []
+    assert old_page.closed is True
+    assert len(fresh_pages) == 1
+    fresh = fresh_pages[0]
+    assert sum("Fresh Architect session bootstrap protocol" in payload for payload in fresh.sent_payloads) == 1
+    assert watcher.state["rolloverRecoveryEpoch"] == 5
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state["rolloverSentResponseRetryAuthorization"] == authorization
+    assert prompt.read_bytes() == prompt_bytes
+    assert watcher.state["postDiscussionProtocolRolloverCommittedTransactionId"] == tx
+
+    # The envelope gate is now bound to the committed new authority. Only after
+    # it accepts the exact existing prompt may the normal dispatch gate launch.
+    for _ in range(5):
+        if watcher.state.get("postDiscussionEnvelopeRequired") is False:
+            break
+        watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert prompt.read_bytes() == prompt_bytes
+    watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert launches == [prompt_bytes.decode("utf-8")]
+    assert old_page.sent_payloads == []
+    assert len(fresh_pages) == 1
+    assert sum("Fresh Architect session bootstrap protocol" in payload for payload in fresh.sent_payloads) == 1
+    assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
+    assert prompt.read_bytes() == prompt_bytes
+    assert attach_calls[0] == "OLD-ARCHITECT"
+
+
+@pytest.mark.parametrize("mismatch", [
+    "reason", "transaction", "task", "prompt_hash", "executor_session", "writer", "process",
+    "protocol_transaction", "wrong_epoch", "wrong_retry_state",
+])
+def test_epoch5_direct_relay_authority_fails_closed_on_any_identity_mismatch(tmp_path, mismatch):
+    original, prompt, _prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    authorization = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4, "qualificationEpoch": 5,
+        "requestSha256": "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0",
+        "promptSha256": "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85",
+        "automaticRecoveryEpochCount": 3, "automaticRecoveryMaxEpochs": 3,
+        "executorLaunchAuthorized": False, "requiresNormalRolloverCompletion": True,
+    }
+    original.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "nextTaskId": "000103",
+        "rolloverRecoveryEpoch": 5, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3, "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": True, "handoverRequested": True, "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverRecoveryState": "RECOVERING",
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5,
+        "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverSentResponseRetryAuthorization": authorization,
+        "rolloverSentResponseRetryAuthorizations": [authorization],
+        "postDiscussionEnvelopeRequired": True, "postDiscussionProtocolTaskId": "000103",
+        "postDiscussionProtocolTransactionId": tx,
+        "postDiscussionProtocolRolloverCommittedTransactionId": None,
+        "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorProcessState": "STOPPED", "executorLaunchState": "LAUNCHED",
+        "discussionPauseActive": False,
+    })
+    if mismatch == "reason": original.state["humanRequiredReason"] = "OTHER"
+    elif mismatch == "transaction": original.state["rolloverTransactionId"] = "other"
+    elif mismatch == "task": original.state["nextTaskId"] = "000104"
+    elif mismatch == "prompt_hash": authorization["promptSha256"] = "0" * 64
+    elif mismatch == "executor_session": original.state["executorSessionId"] = "other"
+    elif mismatch == "writer": original.state["governedExecutorActiveWriter"] = True
+    elif mismatch == "process": original.state["executorProcessState"] = "RUNNING"
+    elif mismatch == "protocol_transaction": original.state["postDiscussionProtocolTransactionId"] = "other"
+    elif mismatch == "wrong_epoch": original.state["rolloverRecoveryEpoch"] = 6
+    elif mismatch == "wrong_retry_state": original.state["rolloverLegacyHandoverReemissionState"] = "INVALID_RESPONSE"
+    assert watcher_module._legacy_sent_response_relay_eligible(original) is False
+
+
+def test_epoch5_visible_handover_absent_stays_human_required_without_retry_or_fresh_tab(tmp_path, monkeypatch):
+    original, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    authorization = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4, "qualificationEpoch": 5,
+        "requestSha256": "41db427219d5b7e9e139ee2b4164a047c46b2160e835f1303422995767c1b9b0",
+        "promptSha256": hashlib.sha256(prompt_bytes).hexdigest().upper(),
+        "automaticRecoveryEpochCount": 3, "automaticRecoveryMaxEpochs": 3,
+        "executorLaunchAuthorized": False, "requiresNormalRolloverCompletion": True,
+    }
+    original.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE",
+        "rolloverRecoveryEpoch": 5, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3, "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": True, "handoverRequested": True, "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "RECONCILE_PENDING", "rolloverRecoveryState": "RECOVERING",
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5,
+        "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverSentResponseRetryAuthorization": authorization,
+        "rolloverSentResponseRetryAuthorizations": [authorization],
+        "postDiscussionEnvelopeRequired": True, "postDiscussionProtocolTaskId": "000103",
+        "postDiscussionProtocolTransactionId": tx, "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorProcessState": "STOPPED", "executorLaunchState": "LAUNCHED", "discussionPauseActive": False,
+    })
+    original.save()
+    old = _ArchitectDomPage("OLD-ARCHITECT")
+    attached = []
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(lambda _endpoint, conversation_id=None: attached.append(conversation_id) or ArchitectPlaywright(old)))
+    watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
+    launches = []
+    assert watcher_module.run_human_required_startup_once(watcher, lambda *args: launches.append(args)) == "HUMAN_REQUIRED"
+    assert watcher.state["humanRequiredReason"] == "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE"
+    assert watcher.state["rolloverLegacyHandoverResponseDisposition"] == "NO_STABLE_VALID_HANDOVER_OBSERVER"
+    assert watcher.state["rolloverRecoveryEpoch"] == 5
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
+    assert watcher.state["rolloverLegacyHandoverReemissionAttemptedEpoch"] == 5
+    assert watcher.state["rolloverLegacyHandoverReemissionState"] == "WAIT_TIMEOUT"
+    assert watcher.state["rolloverTransactionId"] == tx and watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
+    assert old.assistants == [] and old.sent_payloads == [] and not launches
+    assert attached == ["OLD-ARCHITECT"]
     assert prompt.read_bytes() == prompt_bytes
 
 

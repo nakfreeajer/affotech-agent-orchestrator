@@ -2482,18 +2482,151 @@ class ArchitectSessionRollover:
         return True
 
     def _read_existing_handover_response(self, bridge: "ArchitectPlaywright", transaction_id: str | None = None) -> str | None:
-        """Read an existing semantic handover response without waiting or sending."""
-        entries = bridge._assistant_entries()
-        return next(
-            (
-                entry.get("text")
-                for entry in reversed(entries)
-                if isinstance(entry, dict)
-                and isinstance(entry.get("text"), str)
-                and self._handover_response_valid(entry["text"], transaction_id)
-            ),
-            None,
+        """Compatibility alias for the single layered existing-response finder."""
+        return self.find_existing_valid_handover(bridge, transaction_id)
+
+    def find_existing_valid_handover(
+        self,
+        bridge: "ArchitectPlaywright",
+        transaction_id: str | None = None,
+    ) -> str | None:
+        """Find an already-generated, stable exact-transaction handover; never send."""
+        state = self.watcher.state
+        expected_transaction = str(transaction_id or state.get("rolloverTransactionId") or "").strip()
+        expected_task = str(state.get("rolloverTransactionTaskId") or "").strip()
+        if not expected_transaction:
+            return None
+
+        def observe_history() -> list[tuple[str, str, str, int, int]]:
+            found: list[tuple[str, str, str, int, int]] = []
+            readers = (
+                ("latest_assistant_entry", getattr(bridge, "latest_assistant_entry", None)),
+                ("assistant_entries", getattr(bridge, "_assistant_entries", None)),
+            )
+            for source, reader in readers:
+                if not callable(reader):
+                    continue
+                try:
+                    value = reader(expected_transaction, expected_task) if source == "current_visible_assistant_dom" else reader()
+                except Exception:
+                    continue
+                if source == "assistant_entries":
+                    rows = value if isinstance(value, list) else []
+                    for index, row in enumerate(rows):
+                        if isinstance(row, dict) and isinstance(row.get("text"), str):
+                            found.append((source, str(row.get("id") or "NO_MESSAGE_ID"), row["text"], 1, index))
+                elif isinstance(value, dict) and isinstance(value.get("text"), str):
+                    found.append((source, str(value.get("id") or "NO_MESSAGE_ID"), value["text"], 0, 0))
+            return [
+                item
+                for item in found
+                for source, identity, text, _priority, _order in (item,)
+                for parsed in (parse_handover_envelope(text),)
+                if (parsed is not None or architect_handover_ready(text))
+                and (parsed is None or parsed["transactionId"] == expected_transaction)
+                and (parsed is None or not expected_task or parsed["taskId"] == expected_task)
+                and (parsed is not None or handover_transaction_matches(text, expected_transaction))
+                and (parsed is not None or not expected_task or (
+                    re.search(rf"(?<![0-9]){re.escape(expected_task)}(?![0-9])", text) is not None
+                    if expected_task.isdigit() else expected_task in text
+                ))
+                and self._handover_response_valid(text, expected_transaction)
+            ]
+
+        def observe_visible_dom() -> list[tuple[str, str, str, int, int]]:
+            if not expected_task:
+                return []
+            reader = getattr(bridge, "current_visible_handover_candidates", None)
+            if not callable(reader):
+                return []
+            try:
+                rows = reader(expected_transaction, expected_task)
+            except Exception:
+                return []
+            found = []
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict) or not isinstance(row.get("text"), str):
+                    continue
+                text = row["text"]
+                if self._handover_response_valid(text, expected_transaction):
+                    found.append(("current_visible_assistant_dom", str(row.get("identity") or "DOM_TEXT_HASHED"), text, 2, int(row.get("domOrder", 0) or 0)))
+            return found
+
+        def stable_candidate() -> tuple[str, str, str, int, int] | None:
+            generation_reader = getattr(bridge, "generation_visible", None)
+            try:
+                if callable(generation_reader) and generation_reader():
+                    return None
+                first = observe_history()
+                if not first:
+                    return None
+                second = observe_history()
+                if callable(generation_reader) and generation_reader():
+                    return None
+            except Exception:
+                return None
+            second_hashes = {hashlib.sha256(item[2].encode("utf-8")).hexdigest() for item in second}
+            common = [item for item in first if hashlib.sha256(item[2].encode("utf-8")).hexdigest() in second_hashes]
+            if not common:
+                return None
+            # Prefer the shortest complete valid semantic candidate over transcript ancestors.
+            return min(common, key=lambda item: (item[3], -item[4], len(item[2])))
+
+        candidate = stable_candidate()
+        observer = "HISTORICAL_ASSISTANT_SCAN"
+        if candidate is None:
+            # The DOM observer is strictly additive: only after the established
+            # semantic/history scan found no stable valid handover do we inspect
+            # the currently rendered assistant DOM (which may survive history
+            # virtualization).
+            try:
+                generation_reader = getattr(bridge, "generation_visible", None)
+                if not callable(generation_reader) or not generation_reader():
+                    first_dom = observe_visible_dom()
+                    second_dom = observe_visible_dom() if first_dom else []
+                    second_hashes = {hashlib.sha256(item[2].encode("utf-8")).hexdigest() for item in second_dom}
+                    common_dom = [item for item in first_dom if hashlib.sha256(item[2].encode("utf-8")).hexdigest() in second_hashes]
+                    if common_dom and (not callable(generation_reader) or not generation_reader()):
+                        candidate = min(common_dom, key=lambda item: (item[3], -item[4], len(item[2])))
+                        observer = "CURRENT_VISIBLE_ASSISTANT_DOM"
+            except Exception:
+                candidate = None
+        if candidate is None:
+            restore = getattr(bridge, "restore_bottom_for_readonly_observation", None)
+            if callable(restore):
+                try:
+                    restore()
+                except Exception:
+                    pass
+                try:
+                    generation_reader = getattr(bridge, "generation_visible", None)
+                    first_dom = observe_visible_dom() if not callable(generation_reader) or not generation_reader() else []
+                    second_dom = observe_visible_dom() if first_dom else []
+                    second_hashes = {hashlib.sha256(item[2].encode("utf-8")).hexdigest() for item in second_dom}
+                    common_dom = [item for item in first_dom if hashlib.sha256(item[2].encode("utf-8")).hexdigest() in second_hashes]
+                    if common_dom and (not callable(generation_reader) or not generation_reader()):
+                        candidate = min(common_dom, key=lambda item: (item[3], -item[4], len(item[2])))
+                        observer = "CURRENT_VISIBLE_ASSISTANT_DOM_AFTER_BOTTOM_RESTORE"
+                except Exception:
+                    candidate = None
+        if candidate is None:
+            runtime_log(
+                getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+                "EXISTING_HANDOVER_OBSERVATION_FAILED", state,
+                transactionId=expected_transaction, taskId=expected_task,
+                reason="NO_STABLE_VALID_HANDOVER_OBSERVER",
+            )
+            return None
+        source, identity, response, _priority, _order = candidate
+        runtime_log(
+            getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None),
+            "EXISTING_HANDOVER_OBSERVED", state,
+            transactionId=expected_transaction, taskId=expected_task,
+            observer=source, identity=identity,
+            responseSha256=hashlib.sha256(response.encode("utf-8")).hexdigest(),
+            responseLength=len(response), generationVisible=False,
         )
+        return response
 
     def _handover_response_valid(self, response: str, transaction_id: str | None = None) -> bool:
         parsed = parse_handover_envelope(response)
@@ -3329,6 +3462,51 @@ def assistant_latest_entry_script() -> str:
             """
 
 
+def assistant_visible_handover_candidates_script(transaction_id: str, task_id: str) -> str:
+    """Return bounded rendered-DOM ancestors that may contain the exact handover.
+
+    This fallback is intentionally read-only.  It handles the current ChatGPT
+    transcript DOM where assistant turns are rendered in ``main`` but are no
+    longer exposed through the historical data-message-author-role selector.
+    Validation and stable-completion checks remain in Python.
+    """
+    transaction_json = json.dumps(str(transaction_id))
+    task_json = json.dumps(str(task_id))
+    return f"""
+      () => {{
+        const tx = {transaction_json};
+        const task = {task_json};
+        const marker = 'ARCHITECT_HANDOVER_READY';
+        const main = document.querySelector('main');
+        if (!main) return [];
+        const leaves = [...main.querySelectorAll('*')].filter(e => e.isConnected && !e.children.length);
+        const candidates = new Map();
+        for (let leafIndex = 0; leafIndex < leaves.length; leafIndex++) {{
+          const leaf = leaves[leafIndex];
+          const leafText = leaf.innerText || leaf.textContent || '';
+          if (!leafText.includes(marker)) continue;
+          let node = leaf;
+          for (let depth = 0; node && node !== main && depth < 16; depth++, node = node.parentElement) {{
+            if (!node.isConnected) break;
+            const text = node.innerText || node.textContent || '';
+            if (text.length > 120000) break;
+            if (text.includes(marker) && text.includes(tx) && text.includes(task)) {{
+              const key = text;
+              if (!candidates.has(key)) candidates.set(key, {{
+                text,
+                domOrder: leafIndex,
+                tag: node.tagName,
+                identity: node.getAttribute('data-message-id') || node.id || null,
+                role: node.getAttribute('data-message-author-role') || null
+              }});
+            }}
+          }}
+        }}
+        return [...candidates.values()];
+      }}
+    """
+
+
 class ArchitectPlaywright:
     """Semantic Playwright boundary; it never targets AFFOTECH pages."""
     def __init__(self, page: Any):
@@ -3550,6 +3728,21 @@ class ArchitectPlaywright:
                 raise RuntimeError("ASSISTANT_LATEST_ENTRY_INVALID")
             return {"id": result.get("id"), "text": result.get("text", ""), "rawText": result.get("rawText", ""), "semanticSource": result.get("semanticSource", "STANDARD_RESPONSE")}
         return None
+
+    def current_visible_handover_candidates(self, transaction_id: str, task_id: str) -> list[dict[str, Any]]:
+        """Read possible completed handovers from the currently rendered transcript DOM."""
+        evaluate = getattr(getattr(self, "page", None), "evaluate", None)
+        if not callable(evaluate):
+            return []
+        result = evaluate(assistant_visible_handover_candidates_script(transaction_id, task_id))
+        return [item for item in result if isinstance(item, dict) and isinstance(item.get("text"), str)] if isinstance(result, list) else []
+
+    def restore_bottom_for_readonly_observation(self) -> bool:
+        """Restore the transcript viewport to its bottom without navigation or submission."""
+        evaluate = getattr(getattr(self, "page", None), "evaluate", None)
+        if not callable(evaluate):
+            return False
+        return bool(evaluate("""() => { const before=window.scrollY; window.scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'}); return window.scrollY !== before; }"""))
 
     def observation_metrics(self) -> dict[str, int]:
         return {
@@ -8053,6 +8246,26 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             and LocalWatcher.process_alive(int(active_pid))):
         _trace_rollover_gate(watcher, boundary_state, "DEFER", "EXECUTOR_RUNNING", function="service_deferred_rollover_once", executorRunning=True)
         return False
+    # Keep the established historical assistant scan ahead of a deferred wait
+    # or resend decision. This early scan is read-only and is not itself
+    # authorization; the normal live-transaction path below still validates
+    # via the canonical durable/history/visible-DOM finder.
+    if (watcher.state.get("rolloverPending") is True
+            and watcher.state.get("rolloverMaintenanceState") == "DEFERRED"
+            and watcher.state.get("rolloverDeferredForTaskId") == next_task_id
+            and watcher.state.get("rolloverAttemptedForTaskId") in {next_task_id, str(watcher.state.get("taskId") or "")}
+            and watcher.state.get("rolloverHandoverSendState") in {"UNSENT", "PENDING", "ACKNOWLEDGED", "AMBIGUOUS"}):
+        try:
+            conversation_id = watcher.state.get("architectConversationId") or os.environ.get("ARCHITECT_CONVERSATION_ID") or VERIFIED_ARCHITECT_CONVERSATION_ID
+            bridge = ArchitectPlaywright.attach(endpoint, conversation_id)
+            conversation_id = canonicalize_attached_architect_conversation(watcher, bridge, conversation_id)
+            history_reader = getattr(bridge, "_assistant_entries", None)
+            if callable(history_reader):
+                history_reader()
+        except Exception:
+            # Observation failure must not be confused with a successful match;
+            # existing action gates below retain authority and failure handling.
+            prebudget_existing_response = None
     operator_restart_recovery = False
     def consume_operator_restart_recovery() -> None:
         nonlocal operator_restart_recovery
@@ -8178,7 +8391,7 @@ def service_deferred_rollover_once(watcher: LocalFirstOrchestrator, endpoint: st
             watcher.save()
             close_bridge()
             return False
-        if existing_response is None and bridge is not None:
+        if existing_response is None and bridge is not None and not prebudget_probe_performed:
             try:
                 prebudget_probe_performed = True
                 existing_response = rollover._read_existing_handover_response(
@@ -8839,6 +9052,154 @@ def _legacy_handover_must_precede_post_discussion_gate(watcher: LocalFirstOrches
     )
 
 
+def _legacy_sent_response_relay_eligible(watcher: LocalFirstOrchestrator) -> bool:
+    """Allow only the already-consumed epoch-5 incident to relay an existing response."""
+    from crash_recovery_bootstrap import (
+        LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256,
+        LEGACY_SENT_RESPONSE_RETRY_REQUEST_SHA256,
+    )
+
+    state = watcher.state
+    authorization = state.get("rolloverSentResponseRetryAuthorization")
+    if not isinstance(authorization, dict):
+        return False
+    task_id = str(state.get("nextTaskId") or "")
+    prompt_value = state.get("nextPromptPath")
+    try:
+        prompt_path = Path(str(prompt_value))
+        prompt_hash = hashlib.sha256(prompt_path.read_bytes()).hexdigest().upper()
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        pids = [state.get(key) for key in ("codexPid", "active_codex_pid")]
+        any_pid_alive = any(pid and LocalWatcher.process_alive(int(pid)) for pid in pids)
+    except (TypeError, ValueError, OSError):
+        return False
+    return bool(
+        state.get("state") == "HUMAN_REQUIRED"
+        and state.get("humanRequiredReason") == "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE"
+        and state.get("taskId") == "000102"
+        and state.get("lastCompletedTaskId") == "000102"
+        and task_id == "000103"
+        and state.get("rolloverTransactionId") == LEGACY_COMPAT_TRANSACTION_ID
+        and str(state.get("rolloverTransactionTaskId") or "") == task_id
+        and state.get("rolloverRecoveryEpoch") == 5
+        and state.get("rolloverAutomaticRecoveryEpochCount") == ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS == 3
+        and state.get("rolloverAutomaticRecoveryMaxEpochs") == ROLLOVER_AUTOMATIC_RECOVERY_MAX_EPOCHS == 3
+        and state.get("rolloverLegacyHandoverReemissionTransactionId") == LEGACY_COMPAT_TRANSACTION_ID
+        and state.get("rolloverLegacyHandoverReemissionAttemptedEpoch") == 5
+        and state.get("rolloverLegacyHandoverReemissionState") == "WAIT_TIMEOUT"
+        and state.get("rolloverDue") is True
+        and state.get("rolloverPending") is True
+        and state.get("rolloverInProgress") is True
+        and state.get("handoverRequested") is True
+        and state.get("postDiscussionEnvelopeRequired") is True
+        and state.get("postDiscussionProtocolTaskId") == task_id
+        and state.get("postDiscussionProtocolTransactionId") == LEGACY_COMPAT_TRANSACTION_ID
+        and state.get("postDiscussionProtocolRolloverCommittedTransactionId") != LEGACY_COMPAT_TRANSACTION_ID
+        and state.get("executorSessionId") == AFFOTECH_EXECUTOR_SESSION_ID
+        and state.get("executorSessionMode") == "PERSISTENT"
+        and state.get("executorActiveWriter") is not True
+        and state.get("governedExecutorActiveWriter") is not True
+        and state.get("executorProcessState") != "RUNNING"
+        and not any_pid_alive
+        and not state.get("rolloverFreshCandidateConversationId")
+        and not state.get("rolloverFreshCandidateState")
+        and not (isinstance(state.get("pending_handover"), str)
+                 and watcher.session_rollover._handover_response_valid(state["pending_handover"], LEGACY_COMPAT_TRANSACTION_ID))
+        and authorization.get("transactionId") == LEGACY_COMPAT_TRANSACTION_ID
+        and authorization.get("taskId") == task_id
+        and authorization.get("priorEpoch") == 4
+        and authorization.get("qualificationEpoch") == 5
+        and authorization.get("requestSha256") == LEGACY_SENT_RESPONSE_RETRY_REQUEST_SHA256
+        and str(authorization.get("promptSha256") or "").upper() == LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256
+        and authorization.get("automaticRecoveryEpochCount") == 3
+        and authorization.get("automaticRecoveryMaxEpochs") == 3
+        and authorization.get("executorLaunchAuthorized") is False
+        and authorization.get("requiresNormalRolloverCompletion") is True
+        and any(
+            isinstance(row, dict)
+            and row.get("transactionId") == LEGACY_COMPAT_TRANSACTION_ID
+            and row.get("taskId") == task_id
+            and row.get("priorEpoch") == 4
+            and row.get("qualificationEpoch") == 5
+            for row in state.get("rolloverSentResponseRetryAuthorizations", [])
+        )
+        and prompt_hash == LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256
+        and watcher._exact_staged_prompt_recovery_task(allow_human_required=True) == task_id
+    )
+
+
+def _relay_existing_epoch5_handover_once(
+    watcher: LocalFirstOrchestrator,
+    endpoint: str,
+    paused: Callable[[], bool],
+) -> str:
+    """Observe and relay an existing authorized handover without sending/retrying it."""
+    if paused() or not _legacy_sent_response_relay_eligible(watcher):
+        return "NOT_ELIGIBLE"
+    transaction_id = str(watcher.state["rolloverTransactionId"])
+    task_id = str(watcher.state["nextTaskId"])
+    runtime_log(
+        getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+        "LEGACY_SENT_HANDOVER_DIRECT_RELAY_BEGIN", watcher.state,
+        transactionId=transaction_id, taskId=task_id, recoveryEpoch=5,
+        requestResent=False, authorizationReused=False,
+    )
+    bridge = None
+    try:
+        bridge = ArchitectPlaywright.attach(endpoint, watcher.state.get("architectConversationId"))
+        response = watcher.session_rollover.find_existing_valid_handover(bridge, transaction_id)
+        if response is None:
+            watcher.state["rolloverLegacyHandoverResponseDisposition"] = "NO_STABLE_VALID_HANDOVER_OBSERVER"
+            watcher.save()
+            runtime_log(
+                getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                "LEGACY_SENT_HANDOVER_OBSERVATION_FAILED", watcher.state,
+                transactionId=transaction_id, taskId=task_id, recoveryEpoch=5,
+                reason="NO_STABLE_VALID_HANDOVER_OBSERVER", requestResent=False,
+            )
+            return "OBSERVATION_FAILED"
+        if not watcher.session_rollover.persist_validated_handover(response):
+            watcher.state["rolloverLegacyHandoverResponseDisposition"] = "DURABLE_HANDOVER_PERSISTENCE_REJECTED"
+            watcher.save()
+            runtime_log(
+                getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                "LEGACY_SENT_HANDOVER_OBSERVATION_FAILED", watcher.state,
+                transactionId=transaction_id, taskId=task_id, recoveryEpoch=5,
+                reason="DURABLE_HANDOVER_PERSISTENCE_REJECTED", requestResent=False,
+            )
+            return "PERSISTENCE_FAILED"
+        # Resume only after the exact response and hash are durable. The consumed
+        # authorization and its epoch ledger remain untouched.
+        watcher.state.update({"state": "NEXT_PROMPT_READY", "humanRequiredReason": None})
+        watcher.save()
+        if watcher.process_pending_handover_response(bridge, response):
+            watcher.session_rollover._record_recovery_success()
+            runtime_log(
+                getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                "LEGACY_SENT_HANDOVER_DIRECT_RELAY_COMPLETE", watcher.state,
+                transactionId=transaction_id, taskId=task_id, recoveryEpoch=5,
+                requestResent=False,
+            )
+            return "RELAYED"
+        return "ROLLOVER_CONTINUATION_PENDING"
+    except Exception as error:
+        if watcher.state.get("state") == "HUMAN_REQUIRED":
+            watcher.state["rolloverLegacyHandoverResponseDisposition"] = "OBSERVER_ATTACH_OR_RELAY_FAILED"
+            watcher.save()
+        runtime_log(
+            getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+            "LEGACY_SENT_HANDOVER_DIRECT_RELAY_FAILED", watcher.state,
+            transactionId=transaction_id, taskId=task_id, recoveryEpoch=5,
+            errorClass=type(error).__name__, reason=str(error)[:200], requestResent=False,
+        )
+        return "ROLLOVER_CONTINUATION_PENDING" if watcher.state.get("rolloverHandoverResponseIdentity") else "FAILED"
+    finally:
+        if bridge is not None:
+            _disconnect_architect_bridge_read_only(bridge, diagnostic_trace_for(watcher), watcher.state)
+
+
 def service_post_discussion_protocol_gate_once(
     watcher: LocalFirstOrchestrator,
     endpoint: str,
@@ -8965,6 +9326,12 @@ def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -
 
 def run_human_required_startup_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any]) -> str:
     """Run the production HUMAN_REQUIRED entry, including stale-format recovery."""
+    if _legacy_sent_response_relay_eligible(watcher):
+        if watcher.discussion_pause_active():
+            return "HUMAN_REQUIRED"
+        endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
+        _relay_existing_epoch5_handover_once(watcher, endpoint, watcher.discussion_pause_active)
+        return watcher.state.get("state", "HUMAN_REQUIRED")
     if watcher.recover_stale_format_human_required():
         return watcher.state.get("state", "HUMAN_REQUIRED")
     return run_executor_state_once(watcher, launch)
