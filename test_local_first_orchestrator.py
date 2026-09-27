@@ -10538,6 +10538,145 @@ def test_qualification_page_identity_conversation_mismatch_fails_closed():
             _QualificationIdentityBrowser(page), evidence, "OLD_ARCHITECT")
 
 
+def test_qualification_input_is_durable_with_identity_before_old_send_even_on_failure(tmp_path):
+    task_id = "QUAL-TASK-ABC123"
+    transaction_id = "QUAL-TX-identity"
+    payload = "synthetic request\n" + task_id + "\n" + transaction_id
+    evidence = {"taskId": task_id, "transactionId": transaction_id}
+    evidence_path = tmp_path / "qualification-evidence.json"
+    def persist():
+        real_qualification_module._atomic_json(evidence_path, evidence)
+    original_called = []
+    bridge = type("Bridge", (), {})()
+    bridge.read_live_composer_payload = lambda _composer=None: payload
+    def original(_bridge, actual_payload, timeout):
+        assert _bridge.read_live_composer_payload() == actual_payload
+        saved = json.loads(evidence_path.read_text(encoding="utf-8"))
+        item = saved["inputs"]["OLD_ARCHITECT_REQUEST"]
+        assert item["taskId"] == task_id
+        assert item["transactionId"] == transaction_id
+        assert Path(item["exactPayloadFilePath"]).read_bytes() == actual_payload.encode("utf-8")
+        assert item["payloadSha256"] == hashlib.sha256(actual_payload.encode("utf-8")).hexdigest()
+        assert item["sendAttemptCount"] == 1
+        original_called.append(timeout)
+        raise RuntimeError("simulated disabled Send after exact composer acceptance")
+    submitter = real_qualification_module._QualificationInputSubmitter(
+        original, tmp_path, evidence, persist, task_id, transaction_id, payload)
+    real_qualification_module._persist_static_qualification_input(
+        tmp_path, evidence, "staged-prompt.txt", "synthetic prompt", task_id, transaction_id, persist)
+    real_qualification_module._persist_qualification_input(
+        tmp_path, evidence, "OLD_ARCHITECT_REQUEST", payload, task_id, transaction_id,
+        persist, count_send_attempt=False)
+    with pytest.raises(RuntimeError, match="simulated disabled Send"):
+        submitter(bridge, payload, 12.0)
+    metadata = evidence["inputs"]["OLD_ARCHITECT_REQUEST"]
+    assert original_called == [12.0]
+    assert metadata["composerAcceptancePassed"] is True
+    assert metadata["composerExpectedSha256"] == metadata["composerObservedSha256"]
+    assert metadata["composerExpectedLength"] == metadata["composerObservedLength"]
+    assert metadata["composerReadAttempts"] == 1
+    assert evidence["oldArchitectRequestSha256"] == metadata["payloadSha256"]
+    assert Path(evidence["oldArchitectRequestPath"]).read_bytes() == payload.encode("utf-8")
+    assert not list((tmp_path / "inputs").glob("*.tmp-*"))
+
+
+def test_qualification_initial_inputs_and_identity_are_complete_before_first_browser_mutation(tmp_path):
+    evidence = {}
+    evidence_path = tmp_path / "qualification-evidence.json"
+    def persist():
+        real_qualification_module._atomic_json(evidence_path, evidence)
+    staged = "synthetic staged prompt\n"
+    handover = "synthetic expected handover\n"
+    request = "synthetic request\nQUAL-TASK-T\nQUAL-TX-X\n" + handover
+    task_id, transaction_id = "QUAL-TASK-T", "QUAL-TX-X"
+    real_qualification_module._persist_initial_qualification_inputs(
+        tmp_path, evidence, task_id, transaction_id, staged, handover, request, persist)
+    # This is the state inspected by the first page-create/navigation boundary.
+    saved = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert saved["taskId"] == task_id and saved["transactionId"] == transaction_id
+    assert saved["stagedPromptSha256"] == hashlib.sha256(staged.encode()).hexdigest()
+    assert saved["expectedHandoverSha256"] == hashlib.sha256(handover.encode()).hexdigest()
+    assert saved["oldArchitectRequestSha256"] == hashlib.sha256(request.encode()).hexdigest()
+    assert Path(saved["oldArchitectRequestPath"]).read_bytes() == request.encode()
+    assert Path(saved["inputs"]["staged-prompt.txt"]["exactPayloadFilePath"]).read_bytes() == staged.encode()
+    assert Path(saved["inputs"]["expected-handover.txt"]["exactPayloadFilePath"]).read_bytes() == handover.encode()
+
+
+@pytest.mark.parametrize("stage,payload", [
+    ("FRESH_ARCHITECT_BOOTSTRAP", "synthetic exact bootstrap"),
+    ("POST_DISCUSSION_REPAIR_REQUEST", "synthetic repair request"),
+])
+def test_qualification_bootstrap_and_repair_inputs_persist_before_submission(tmp_path, stage, payload):
+    task_id, transaction_id = "QUAL-TASK-XYZ", "QUAL-TX-XYZ"
+    evidence = {}
+    evidence_path = tmp_path / "qualification-evidence.json"
+    def persist():
+        real_qualification_module._atomic_json(evidence_path, evidence)
+    seen = []
+    bridge = type("Bridge", (), {})()
+    bridge.read_live_composer_payload = lambda _composer=None: payload
+    def original(_bridge, actual, _timeout):
+        assert _bridge.read_live_composer_payload() == actual
+        saved = json.loads(evidence_path.read_text(encoding="utf-8"))
+        metadata = saved["inputs"][stage]
+        assert Path(metadata["exactPayloadFilePath"]).read_bytes() == actual.encode("utf-8")
+        assert metadata["payloadSha256"] == hashlib.sha256(actual.encode("utf-8")).hexdigest()
+        assert metadata["sendAttemptCount"] == 1
+        seen.append(actual)
+        return "submitted"
+    submitter = real_qualification_module._QualificationInputSubmitter(
+        original, tmp_path, evidence, persist, task_id, transaction_id, "old request")
+    if stage == "FRESH_ARCHITECT_BOOTSTRAP":
+        submitter.bootstrap_payload = payload
+    else:
+        submitter.stage_hint = stage
+    assert submitter(bridge, payload, 5.0) == "submitted"
+    assert seen == [payload]
+    assert evidence["inputs"][stage]["taskId"] == task_id
+    assert evidence["inputs"][stage]["transactionId"] == transaction_id
+
+
+def test_qualification_input_identity_rejects_same_length_randomized_reconstruction(tmp_path):
+    evidence = {}
+    persist = lambda: None
+    original = "request QUAL-TASK-AAAA QUAL-TX-1111"
+    same_length_different_identity = "request QUAL-TASK-BBBB QUAL-TX-2222"
+    assert len(original) == len(same_length_different_identity)
+    real_qualification_module._persist_qualification_input(
+        tmp_path, evidence, "OLD_ARCHITECT_REQUEST", original, "QUAL-TASK-AAAA",
+        "QUAL-TX-1111", persist, count_send_attempt=False)
+    with pytest.raises(RuntimeError, match="QUALIFICATION_INPUT_IDENTITY_CONFLICT"):
+        real_qualification_module._persist_qualification_input(
+            tmp_path, evidence, "OLD_ARCHITECT_REQUEST", same_length_different_identity,
+            "QUAL-TASK-BBBB", "QUAL-TX-2222", persist)
+    assert Path(evidence["oldArchitectRequestPath"]).read_bytes() == original.encode("utf-8")
+    assert evidence["oldArchitectRequestSha256"] == hashlib.sha256(original.encode("utf-8")).hexdigest()
+
+
+def test_qualification_input_comparison_uses_persisted_bytes_not_new_random_values(tmp_path):
+    evidence = {}
+    payload = "synthetic request QUAL-TASK-FIXED QUAL-TX-FIXED"
+    real_qualification_module._persist_qualification_input(
+        tmp_path, evidence, "OLD_ARCHITECT_REQUEST", payload, "QUAL-TASK-FIXED",
+        "QUAL-TX-FIXED", lambda: None, count_send_attempt=False)
+    persisted = Path(evidence["oldArchitectRequestPath"]).read_bytes()
+    assert hashlib.sha256(persisted).hexdigest() == evidence["oldArchitectRequestSha256"]
+    assert persisted == payload.encode("utf-8")
+    assert "random" not in evidence["inputs"]["OLD_ARCHITECT_REQUEST"]
+
+
+def test_qualification_atomic_input_write_leaves_complete_file_and_no_temp(tmp_path):
+    evidence = {}
+    payload = "complete synthetic bytes\n"
+    real_qualification_module._persist_static_qualification_input(
+        tmp_path, evidence, "expected-handover.txt", payload, "QUAL-TASK-A",
+        "QUAL-TX-A", lambda: None)
+    path = tmp_path / "inputs" / "expected-handover.txt"
+    assert path.read_bytes() == payload.encode("utf-8")
+    assert evidence["inputs"]["expected-handover.txt"]["payloadSha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert not list(path.parent.glob("*.tmp-*"))
+
+
 @pytest.mark.parametrize("conversation_id", sorted(watcher_module.QUALIFICATION_PROTECTED_CONVERSATION_IDS) + ["preexisting-unowned"])
 def test_real_qualification_page_guard_refuses_protected_or_preexisting_unowned(monkeypatch, conversation_id):
     monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "QUALIFICATION")

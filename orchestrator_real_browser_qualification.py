@@ -262,9 +262,176 @@ def _sha(path: Path) -> tuple[str | None, int | None]:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _atomic_write_bytes(path, data)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        with temp.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_QUALIFICATION_INPUT_FILES = {
+    "OLD_ARCHITECT_REQUEST": "old-architect-request.txt",
+    "FRESH_ARCHITECT_BOOTSTRAP": "fresh-architect-bootstrap.txt",
+    "POST_DISCUSSION_REPAIR_REQUEST": "post-discussion-repair-request.txt",
+}
+
+
+def _persist_qualification_input(root: Path, evidence: dict[str, Any], stage: str,
+                                 payload: str, task_id: str, transaction_id: str | None,
+                                 persist_evidence, *, count_send_attempt: bool = True) -> dict[str, Any]:
+    filename = _QUALIFICATION_INPUT_FILES.get(stage)
+    if filename is None or not isinstance(payload, str):
+        raise RuntimeError("QUALIFICATION_INPUT_STAGE_INVALID")
+    payload_bytes = payload.encode("utf-8")
+    path = root / "inputs" / filename
+    if path.exists() and path.read_bytes() != payload_bytes:
+        raise RuntimeError("QUALIFICATION_INPUT_IDENTITY_CONFLICT:" + stage)
+    if not path.exists():
+        _atomic_write_bytes(path, payload_bytes)
+    inputs = evidence.setdefault("inputs", {})
+    prior = inputs.get(stage, {})
+    metadata = {
+        "stage": stage,
+        "createdAt": prior.get("createdAt") or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "payloadSha256": hashlib.sha256(payload_bytes).hexdigest(),
+        "payloadByteLength": len(payload_bytes),
+        "payloadCharacterLength": len(payload),
+        "taskId": task_id,
+        "transactionId": transaction_id,
+        "exactPayloadFilePath": str(path),
+        "sendAttemptCount": int(prior.get("sendAttemptCount", 0)) + int(count_send_attempt),
+    }
+    inputs[stage] = metadata
+    if stage == "OLD_ARCHITECT_REQUEST":
+        evidence.update({
+            "oldArchitectRequestSha256": metadata["payloadSha256"],
+            "oldArchitectRequestPath": str(path),
+        })
+    persist_evidence()
+    return metadata
+
+
+def _persist_static_qualification_input(root: Path, evidence: dict[str, Any], name: str,
+                                        payload: str, task_id: str, transaction_id: str,
+                                        persist_evidence) -> dict[str, Any]:
+    """Persist synthetic input bytes and their identity before browser work."""
+    if not name or Path(name).name != name or not isinstance(payload, str):
+        raise RuntimeError("QUALIFICATION_STATIC_INPUT_INVALID")
+    payload_bytes = payload.encode("utf-8")
+    path = root / "inputs" / name
+    if path.exists() and path.read_bytes() != payload_bytes:
+        raise RuntimeError("QUALIFICATION_INPUT_IDENTITY_CONFLICT:" + name)
+    if not path.exists():
+        _atomic_write_bytes(path, payload_bytes)
+    metadata = {
+        "stage": name,
+        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "payloadSha256": hashlib.sha256(payload_bytes).hexdigest(),
+        "payloadByteLength": len(payload_bytes),
+        "payloadCharacterLength": len(payload),
+        "taskId": task_id,
+        "transactionId": transaction_id,
+        "exactPayloadFilePath": str(path),
+    }
+    evidence.setdefault("inputs", {})[name] = metadata
+    persist_evidence()
+    return metadata
+
+
+def _persist_initial_qualification_inputs(root: Path, evidence: dict[str, Any], task_id: str,
+                                         transaction_id: str, staged_prompt: str,
+                                         expected_handover: str, old_request: str,
+                                         persist_evidence) -> None:
+    evidence.update({
+        "taskId": task_id,
+        "transactionId": transaction_id,
+        "stagedPromptSha256": hashlib.sha256(staged_prompt.encode("utf-8")).hexdigest(),
+        "expectedHandoverSha256": hashlib.sha256(expected_handover.encode("utf-8")).hexdigest(),
+    })
+    _persist_static_qualification_input(root, evidence, "staged-prompt.txt", staged_prompt,
+                                         task_id, transaction_id, persist_evidence)
+    _persist_static_qualification_input(root, evidence, "expected-handover.txt", expected_handover,
+                                         task_id, transaction_id, persist_evidence)
+    _persist_qualification_input(root, evidence, "OLD_ARCHITECT_REQUEST", old_request,
+                                 task_id, transaction_id, persist_evidence, count_send_attempt=False)
+
+
+class _QualificationInputSubmitter:
+    """Persist exact synthetic payload/evidence before delegating each send."""
+    def __init__(self, original_submit, root: Path, evidence: dict[str, Any], persist_evidence,
+                 task_id: str, transaction_id: str, old_request: str):
+        self.original_submit = original_submit
+        self.root = root
+        self.evidence = evidence
+        self.persist_evidence = persist_evidence
+        self.task_id = task_id
+        self.transaction_id = transaction_id
+        self.old_request = old_request
+        self.bootstrap_payload: str | None = None
+        self.stage_hint: str | None = None
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return lambda payload, timeout=30.0: self(instance, payload, timeout)
+
+    def __call__(self, bridge: Any, payload: str, timeout: float = 30.0):
+        if payload == self.old_request:
+            stage = "OLD_ARCHITECT_REQUEST"
+        elif self.bootstrap_payload is not None and payload == self.bootstrap_payload:
+            stage = "FRESH_ARCHITECT_BOOTSTRAP"
+        elif self.stage_hint == "POST_DISCUSSION_REPAIR_REQUEST":
+            stage = self.stage_hint
+        else:
+            raise RuntimeError("QUALIFICATION_UNCLASSIFIED_BROWSER_SEND")
+        metadata = _persist_qualification_input(
+            self.root, self.evidence, stage, payload, self.task_id, self.transaction_id,
+            self.persist_evidence)
+        original_reader = bridge.read_live_composer_payload
+        had_instance_reader = "read_live_composer_payload" in getattr(bridge, "__dict__", {})
+        read_count = 0
+
+        def recording_reader(composer=None):
+            nonlocal read_count
+            observed = original_reader(composer)
+            read_count += 1
+            observed_bytes = observed.encode("utf-8") if isinstance(observed, str) else b""
+            passed = isinstance(observed, str) and runtime.composer_payload_matches(observed, payload)
+            metadata.update({
+                "composerExpectedSha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                "composerObservedSha256": hashlib.sha256(observed_bytes).hexdigest() if isinstance(observed, str) else None,
+                "composerExpectedLength": len(payload),
+                "composerObservedLength": len(observed) if isinstance(observed, str) else None,
+                "composerAcceptancePassed": passed,
+                "composerReadAttempts": read_count,
+            })
+            self.persist_evidence()
+            return observed
+
+        bridge.read_live_composer_payload = recording_reader
+        try:
+            return self.original_submit(bridge, payload, timeout)
+        finally:
+            if had_instance_reader:
+                bridge.read_live_composer_payload = original_reader
+            else:
+                try:
+                    delattr(bridge, "read_live_composer_payload")
+                except AttributeError:
+                    pass
 
 
 def _write_event(handle, event: str, fields: dict[str, Any]) -> None:
@@ -341,6 +508,8 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
     close_requests: list[str] = []
     logger = None
     committed = False
+    original_submit_impl = runtime.ArchitectPlaywright.submit_result_bounded
+    input_submitter = None
     try:
         os.environ.update({
             "AFFOTECH_RUNTIME_CONTEXT": "QUALIFICATION",
@@ -400,6 +569,13 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         prompt_request = ("This is a disposable browser qualification, not business work. Return exactly the following "
                           "synthetic handover envelope as your entire response, with no Markdown fences or extra text:\n\n"
                           + expected_handover)
+
+        _persist_initial_qualification_inputs(root, evidence, task_id, transaction_id,
+                                              staged_prompt, expected_handover, prompt_request,
+                                              persist_evidence)
+        input_submitter = _QualificationInputSubmitter(
+            original_submit_impl, root, evidence, persist_evidence, task_id, transaction_id, prompt_request)
+        runtime.ArchitectPlaywright.submit_result_bounded = input_submitter
 
         old_page = owned_context.new_page()
         pages.append(old_page)
@@ -471,6 +647,8 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
 
         bootstrap_payload_hash = None
         forced_ack = {"done": False}
+        bootstrap_payload = runtime.fresh_architect_bootstrap_payload(handover)
+        input_submitter.bootstrap_payload = bootstrap_payload
         original_submit = runtime.ArchitectPlaywright.submit_result_bounded
         def submit_then_induce_ack_ambiguity(bridge, payload: str, timeout: float = 30.0):
             nonlocal bootstrap_payload_hash
@@ -516,6 +694,7 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         fresh_bridge.runtime_run_id = runtime_run_id
         fresh_bridge.runtime_watcher = watcher
         fresh_bridge.runtime_conversation_id = fresh_id
+        input_submitter.stage_hint = "POST_DISCUSSION_REPAIR_REQUEST"
         if not watcher.request_post_discussion_envelope_repair(fresh_bridge):
             raise RuntimeError("QUALIFICATION_PROTOCOL_REPAIR_REQUEST_FAILED")
         repair_baseline = watcher.state.get("postDiscussionProtocolBaseline")
@@ -592,6 +771,7 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
                 playwright_runtime.stop()
             except Exception:
                 pass
+        runtime.ArchitectPlaywright.submit_result_bounded = original_submit_impl
         handle.close()
 
 
