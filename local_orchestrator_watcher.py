@@ -1299,6 +1299,73 @@ def normalize_prompt(text: str) -> str:
     return " ".join(text.strip().split())
 
 
+def normalize_composer_payload(text: str) -> str:
+    """Normalize only rich-editor presentation details, preserving logical spacing."""
+    return str(text).replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+
+
+def composer_payload_matches(observed: Any, expected: str) -> bool:
+    return (isinstance(observed, str)
+            and normalize_composer_payload(observed) == normalize_composer_payload(expected))
+
+
+def composer_snapshot_payload(snapshot: Any) -> str | None:
+    """Serialize a scoped editor snapshot while retaining paragraph/BR boundaries."""
+    if not isinstance(snapshot, dict):
+        return None
+    kind = snapshot.get("kind")
+    if kind == "value" and isinstance(snapshot.get("payload"), str):
+        return normalize_composer_payload(snapshot["payload"])
+    if kind == "text" and isinstance(snapshot.get("text"), str):
+        return normalize_composer_payload(snapshot["text"])
+
+    def render(node: Any) -> str | None:
+        if not isinstance(node, dict):
+            return None
+        node_kind = node.get("kind")
+        if node_kind == "text":
+            value = node.get("text")
+            return normalize_composer_payload(value) if isinstance(value, str) else None
+        if node_kind == "br":
+            return "" if node.get("trailingBreak") is True else "\n"
+        children = node.get("children")
+        if not isinstance(children, list):
+            return None
+        rendered = [render(child) for child in children]
+        if any(item is None for item in rendered):
+            return None
+        values = [str(item) for item in rendered]
+        if node_kind in {"block", "root"}:
+            if not values:
+                return ""
+            if any(isinstance(child, dict) and child.get("kind") == "block" for child in children):
+                return "\n".join(values)
+        return "".join(values)
+
+    tree = snapshot.get("tree")
+    if kind != "contenteditable" or not isinstance(tree, dict):
+        return None
+    payload = render(tree)
+    return normalize_composer_payload(payload) if isinstance(payload, str) else None
+
+
+_COMPOSER_SNAPSHOT_SCRIPT = r"""el => {
+  const walk = node => {
+    if (node.nodeType === Node.TEXT_NODE) return {kind:'text', text:node.nodeValue || ''};
+    if (node.nodeType !== Node.ELEMENT_NODE) return {kind:'element', children:[]};
+    const tag = node.tagName.toLowerCase();
+    if (tag === 'br') return {kind:'br', trailingBreak:node.classList.contains('ProseMirror-trailingBreak')};
+    const block = ['p','div','li','pre','blockquote'].includes(tag);
+    return {kind:block?'block':'element', tag, children:[...node.childNodes].map(walk)};
+  };
+  if ((el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') && 'value' in el)
+    return {kind:'value', payload:el.value};
+  if (el.isContentEditable)
+    return {kind:'contenteditable', tree:{kind:'root', children:[...el.childNodes].map(walk)}};
+  return {kind:'text', text:el.innerText || el.textContent || ''};
+}"""
+
+
 def relay_task_key(publication_id: str, content_sha256: str) -> str:
     if not isinstance(publication_id, str) or not isinstance(content_sha256, str):
         raise ValueError("RELAY_KEY_INVALID")
@@ -4538,16 +4605,39 @@ class ArchitectPlaywright:
         """Clear only an exactly matching pre-send draft after safe failure."""
         try:
             composer = self._live_composer()
-            observed = composer.inner_text(timeout=1000)
-            if not isinstance(observed, str) or normalize_prompt(observed) != normalize_prompt(payload):
+            observed = self.read_live_composer_payload(composer)
+            if not composer_payload_matches(observed, payload):
                 return False
             composer.focus(timeout=1000)
             composer.press("ControlOrMeta+A", timeout=1000)
             composer.press("Backspace", timeout=1000)
-            cleared = composer.inner_text(timeout=1000)
-            return isinstance(cleared, str) and not cleared.strip()
+            cleared = self.read_live_composer_payload(self._live_composer())
+            return cleared == ""
         except Exception:
             return False
+
+    def read_live_composer_payload(self, composer: Any | None = None) -> str | None:
+        """Read only the current actionable composer using its native DOM structure."""
+        current = composer or self._live_composer()
+        evaluate = getattr(current, "evaluate", None)
+        if callable(evaluate):
+            snapshot = evaluate(_COMPOSER_SNAPSHOT_SCRIPT, timeout=1000)
+            payload = composer_snapshot_payload(snapshot)
+            if payload is None:
+                raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", "UNSUPPORTED_EDITOR_SNAPSHOT")
+            return payload
+        input_value = getattr(current, "input_value", None)
+        if callable(input_value):
+            try:
+                value = input_value(timeout=1000)
+            except TypeError:
+                value = input_value()
+            return normalize_composer_payload(value) if isinstance(value, str) else None
+        reader = getattr(current, "inner_text", None)
+        if callable(reader):
+            value = reader(timeout=1000)
+            return normalize_composer_payload(value) if isinstance(value, str) else None
+        return None
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         _qualification_assert_page_allowed(self.page, "send")
@@ -4625,22 +4715,31 @@ class ArchitectPlaywright:
             detail = type(last_error).__name__ if last_error else None
             raise ResultSubmissionError("ARCHITECT_COMPOSER_POPULATE_OPERATION_TIMEOUT", detail) from last_error
 
-        try:
-            composer = self._live_composer()
-            observed = composer.inner_text(timeout=1000)
-        except Exception as error:
-            code = "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT" if type(error).__name__ == "TimeoutError" else "ARCHITECT_COMPOSER_INPUT_REJECTED"
+        expected_payload = normalize_composer_payload(result)
+        acceptance_deadline = min(deadline, time.monotonic() + 3.0)
+        observed = None
+        last_observation_error = None
+        while time.monotonic() < acceptance_deadline:
+            try:
+                # Re-resolve on every read: the rich editor can replace its
+                # contenteditable node during hydration after keyboard input.
+                current_composer = self._live_composer()
+                observed = self.read_live_composer_payload(current_composer)
+                last_observation_error = None
+                if observed is not None and composer_payload_matches(observed, expected_payload):
+                    break
+            except Exception as error:
+                last_observation_error = error
+            remaining = acceptance_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.05, remaining))
+        else:
             if populated and not self.sendActionAttempted:
                 self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
-            raise ResultSubmissionError(code, type(error).__name__) from error
-        if not isinstance(observed, str) or not observed.strip():
-            if populated and not self.sendActionAttempted:
-                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
-            raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED")
-        if normalize_prompt(observed) != normalize_prompt(result):
-            if populated and not self.sendActionAttempted:
-                self.last_unsent_payload_cleared = self.clear_unsent_payload(result)
-            raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", "CONTENT_MISMATCH")
+            if last_observation_error is not None and type(last_observation_error).__name__ == "TimeoutError":
+                raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT", type(last_observation_error).__name__) from last_observation_error
+            detail = "CONTENT_MISMATCH" if isinstance(observed, str) and observed else "EMPTY_CURRENT_COMPOSER"
+            raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", detail)
         assistant_count_before = self.assistant_count()
 
         try:

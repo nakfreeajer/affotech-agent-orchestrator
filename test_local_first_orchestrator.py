@@ -1216,26 +1216,196 @@ def test_composer_rerender_between_input_and_verification_reacquires_current_edi
     assert page.sent == [result]
 
 
-def test_unsent_known_payload_is_cleared_after_pre_send_input_failure():
+def test_persistently_unreadable_composer_fails_closed_without_send():
     page = FakeComposerPage()
     original_inner_text = FakeComposer.inner_text
     reads = {"count": 0}
 
-    def failing_once(composer, **kwargs):
+    def always_unreadable(composer, **kwargs):
         reads["count"] += 1
-        if reads["count"] == 1:
+        if reads["count"] < 100:
             raise TimeoutError("acceptance unavailable")
         return original_inner_text(composer, **kwargs)
 
-    FakeComposer.inner_text = failing_once
+    FakeComposer.inner_text = always_unreadable
     try:
         with pytest.raises(ResultSubmissionError) as error:
-            ArchitectPlaywright(page).submit_result_bounded("known unsent payload", timeout=1)
+            ArchitectPlaywright(page).submit_result_bounded("known unsent payload", timeout=0.2)
         assert error.value.code == "ARCHITECT_COMPOSER_INPUT_ACCEPTANCE_TIMEOUT"
-        assert page.content == ""
+        assert page.content == "known unsent payload"
         assert page.sent == []
+        assert reads["count"] > 1
     finally:
         FakeComposer.inner_text = original_inner_text
+
+
+@pytest.mark.parametrize("snapshot,expected", [
+    ({"kind": "value", "payload": "line one\nline two"}, "line one\nline two"),
+    ({"kind": "contenteditable", "tree": {"kind": "root", "children": [
+        {"kind": "block", "tag": "p", "children": [{"kind": "text", "text": "plain text"}]},
+    ]}}, "plain text"),
+    ({"kind": "contenteditable", "tree": {"kind": "root", "children": [
+        {"kind": "block", "tag": "p", "children": [{"kind": "text", "text": "line one"}]},
+        {"kind": "block", "tag": "p", "children": [{"kind": "text", "text": "line two"}]},
+    ]}}, "line one\nline two"),
+    ({"kind": "contenteditable", "tree": {"kind": "root", "children": [
+        {"kind": "block", "tag": "p", "children": [{"kind": "text", "text": "line one"}]},
+        {"kind": "block", "tag": "p", "children": [{"kind": "br", "trailingBreak": True}]},
+        {"kind": "block", "tag": "p", "children": [{"kind": "text", "text": "line two"}]},
+    ]}}, "line one\n\nline two"),
+    ({"kind": "contenteditable", "tree": {"kind": "root", "children": [
+        {"kind": "block", "tag": "p", "children": [
+            {"kind": "text", "text": "line one"}, {"kind": "br", "trailingBreak": False},
+            {"kind": "text", "text": "line two"},
+        ]},
+    ]}}, "line one\nline two"),
+    ({"kind": "contenteditable", "tree": {"kind": "root", "children": [
+        {"kind": "block", "tag": "p", "children": [{"kind": "text", "text": "a\u00a0b"}]},
+    ]}}, "a b"),
+])
+def test_composer_snapshot_reader_handles_proven_rich_editor_presentations(snapshot, expected):
+    assert watcher_module.composer_snapshot_payload(snapshot) == expected
+
+
+@pytest.mark.parametrize("observed", [
+    "prefix expected", "expected suffix", "partial", "unrelated text",
+])
+def test_composer_payload_acceptance_rejects_non_exact_text(observed):
+    assert watcher_module.composer_payload_matches(observed, "expected") is False
+
+
+def test_composer_payload_acceptance_only_normalizes_nbsp_and_line_endings():
+    assert watcher_module.composer_payload_matches("line one\r\nline two\u00a0x", "line one\nline two x")
+    assert watcher_module.composer_payload_matches("a  b", "a b") is False
+
+
+def test_stale_composer_payload_is_not_accepted_when_current_replacement_is_empty():
+    class Node:
+        def __init__(self, text=""):
+            self.text = text
+
+    class Locator:
+        def __init__(self, page, node):
+            self.page, self.node, self.last = page, node, self
+        def is_visible(self, **_): return True
+        def is_editable(self, **_): return True
+        def focus(self, **_): return None
+        def press(self, key, **_):
+            if key == "ControlOrMeta+A": self.node.text = ""
+        def inner_text(self, **_): return self.node.text
+
+    class ReplacingKeyboard:
+        def __init__(self, page): self.page = page
+        def insert_text(self, payload):
+            self.page.stale.text = payload
+            self.page.current = Node("")
+
+    class Button(FakeButton):
+        def click(self, **_): self.page.send_clicks += 1
+
+    class Page:
+        def __init__(self):
+            self.stale = Node()
+            self.current = self.stale
+            self.keyboard = ReplacingKeyboard(self)
+            self.send_clicks = 0
+            self.sent = []
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox": return Locator(self, self.current)
+            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return FakeStopButton()
+            return Button(self)
+        def locator(self, _):
+            class Count:
+                def count(self): return 0
+            return Count()
+        def submit(self): raise AssertionError("send must not be touched")
+
+    page = Page()
+    bridge = ArchitectPlaywright(page)
+    with pytest.raises(ResultSubmissionError, match="ARCHITECT_COMPOSER_INPUT_REJECTED"):
+        bridge.submit_result_bounded("stale exact payload", timeout=0.15)
+    assert page.stale.text == "stale exact payload"
+    assert page.current.text == ""
+    assert page.send_clicks == 0
+    assert bridge.sendActionAttempted is False
+
+
+def test_replaced_composer_accepts_only_exact_payload_on_new_current_node():
+    class Node:
+        def __init__(self, text=""):
+            self.text = text
+
+    class Locator:
+        def __init__(self, page, node): self.page, self.node, self.last = page, node, self
+        def is_visible(self, **_): return True
+        def is_editable(self, **_): return True
+        def focus(self, **_): return None
+        def press(self, key, **_):
+            if key == "ControlOrMeta+A": self.node.text = ""
+        def inner_text(self, **_): return self.node.text
+
+    class Keyboard:
+        def __init__(self, page): self.page = page
+        def insert_text(self, payload):
+            self.page.stale.text = payload
+            self.page.current = Node(payload)
+
+    class Page(FakeComposerPage):
+        def __init__(self):
+            super().__init__()
+            self.stale, self.current = Node(), None
+            self.keyboard = Keyboard(self)
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                if self.current is None: self.current = self.stale
+                return Locator(self, self.current)
+            return super().get_by_role(role, **kwargs)
+        def submit(self):
+            self.sent.append(self.current.text)
+            self.current.text = ""
+
+    page = Page()
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("exact new-node payload", timeout=1)
+    assert page.stale.text == "exact new-node payload"
+    assert page.sent == ["exact new-node payload"]
+
+
+@pytest.mark.parametrize("replacement", ["prefix expected", "expected suffix", "expect", "unrelated"])
+def test_nonexact_replacement_never_touches_send_control(replacement):
+    class Node:
+        def __init__(self, text=""): self.text = text
+    class Locator:
+        def __init__(self, page, node): self.page, self.node, self.last = page, node, self
+        def is_visible(self, **_): return True
+        def is_editable(self, **_): return True
+        def focus(self, **_): return None
+        def press(self, key, **_):
+            if key == "ControlOrMeta+A": self.node.text = ""
+        def inner_text(self, **_): return self.node.text
+    class Keyboard:
+        def __init__(self, page): self.page = page
+        def insert_text(self, payload):
+            self.page.stale.text = payload
+            self.page.current = Node(replacement)
+    class Button(FakeButton):
+        def click(self, **_): self.page.send_clicks += 1
+    class Page:
+        def __init__(self): self.stale, self.current, self.keyboard, self.send_clicks = Node(), None, None, 0; self.keyboard=Keyboard(self)
+        def get_by_role(self, role, **kwargs):
+            if role == "textbox":
+                if self.current is None: self.current=self.stale
+                return Locator(self,self.current)
+            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return FakeStopButton()
+            return Button(self)
+        def locator(self, _):
+            class Count:
+                def count(self): return 0
+            return Count()
+    page=Page()
+    with pytest.raises(ResultSubmissionError, match="ARCHITECT_COMPOSER_INPUT_REJECTED"):
+        ArchitectPlaywright(page).submit_result_bounded("expected", timeout=0.1)
+    assert page.send_clicks == 0
 
 
 def test_stale_composer_is_reacquired_before_focus_and_send():
