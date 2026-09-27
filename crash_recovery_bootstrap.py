@@ -34,6 +34,14 @@ LEGACY_DIAGNOSTIC_RETRY_PROMPT_SHA256 = "70D6ECCAB4FED573CD03C4DDF3867073E087C47
 LEGACY_DIAGNOSTIC_RETRY_FAILED_EPOCH = 2
 LEGACY_POSTFIX_QUALIFICATION_FAILED_EPOCH = 3
 LEGACY_POSTFIX_QUALIFICATION_FIX_COMMIT = "2fe16f5e387f7dc97142b08ea38b4824e6dc44d3"
+MINIMUM_PYTHON_VERSION = (3, 10)
+
+
+def require_supported_python() -> None:
+    if sys.version_info < MINIMUM_PYTHON_VERSION:
+        required = ".".join(str(part) for part in MINIMUM_PYTHON_VERSION)
+        running = ".".join(str(part) for part in sys.version_info[:3])
+        raise RuntimeError("UNSUPPORTED_PYTHON_VERSION: requires Python %s or newer; running %s" % (required, running))
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -569,6 +577,11 @@ def probe_architect(endpoint: str, conversation_id: str, state: dict[str, Any]) 
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        require_supported_python()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--state-dir")

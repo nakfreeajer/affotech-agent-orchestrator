@@ -20,10 +20,12 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         WatcherInstanceLock, handle_architect_value_error,
                                         run_human_required_startup_once, DiscussionHotkeyController,
                                         RemoteDiscussionControlMonitor,
+                                        WatcherLivenessWatchdog,
                                         architect_process_tree_memory_bytes,
                                         resident_human_decision_response,
                                         dispatch_next_prompt_once)
 import local_orchestrator_watcher as watcher_module
+import crash_recovery_bootstrap as bootstrap_module
 
 
 def envelope(task, action="EXECUTE", prompt="next task", documentation=None):
@@ -3770,14 +3772,15 @@ def test_unidentified_prior_fresh_page_never_creates_replacement_tab_after_resta
                           "handoverRequested": True, "rolloverFreshPageCreated": True,
                           "architectConversationId": "OLD"})
     watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
     calls = []
     class Bridge:
         page = type("Page", (), {"url": "https://chatgpt.com/c/OLD", "context": type("Context", (), {"pages": []})()})()
         def open_fresh_with_handover(self, _handover): calls.append(1); return None
-    assert watcher.session_rollover.complete_from_response(Bridge(), canonical_handover(watcher, "handover")) is False
+    assert restarted.session_rollover.complete_from_response(Bridge(), canonical_handover(restarted, "handover")) is False
     assert calls == []
-    assert watcher.state["state"] == "NEXT_PROMPT_READY"
-    assert watcher.state.get("humanRequiredReason") is None
+    assert restarted.state["state"] == "NEXT_PROMPT_READY"
+    assert restarted.state.get("humanRequiredReason") is None
 
 
 def test_ambiguous_fresh_submission_persists_candidate_without_closing_it(tmp_path, monkeypatch):
@@ -3834,12 +3837,60 @@ def test_ambiguous_fresh_candidate_is_reused_before_new_tab_creation(tmp_path):
                           "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
                           "pending_handover": canonical_handover(watcher, "complete old handover", task_id="000050")})
     watcher.save()
-    assert watcher.session_rollover.complete_from_response(bridge, watcher.state["pending_handover"]) is True
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    assert restarted.session_rollover.complete_from_response(bridge, restarted.state["pending_handover"]) is True
     assert calls == []
-    assert watcher.state["architectConversationId"] == "NEW"
+    assert restarted.state["architectConversationId"] == "NEW"
     assert old_page.closed is True
     assert new_page.closed is False
-    assert watcher.state["nextTaskId"] == "000050"
+    assert restarted.state["nextTaskId"] == "000050"
+
+
+def test_restart_after_bootstrap_submission_without_ready_never_resubmits(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    handover = canonical_handover(watcher, "complete old handover", task_id="000050", transaction_id="restart-bootstrap-tx")
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY", "taskId": "000049", "lastCompletedTaskId": "000049",
+        "nextTaskId": "000050", "rolloverDue": True, "rolloverPending": True,
+        "rolloverInProgress": True, "handoverRequested": True,
+        "rolloverTransactionId": "restart-bootstrap-tx", "rolloverTransactionTaskId": "000050",
+        "rolloverAttemptedForTaskId": "000050", "architectConversationId": "OLD",
+        "pending_handover": handover, "rolloverFreshPageCreated": True,
+        "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+        "rolloverFreshBootstrapPayloadHash": hashlib.sha256(bootstrap.encode()).hexdigest(),
+    })
+    watcher.save()
+
+    class Page:
+        def __init__(self, conversation_id, users=(), assistants=()):
+            self.url = f"https://chatgpt.com/c/{conversation_id}"
+            self.users, self.assistants, self.closed, self.context = list(users), list(assistants), False, None
+
+        def evaluate(self, script):
+            if "stop-button" in script:
+                return False
+            if 'data-message-author-role="user"' in script:
+                return self.users
+            if 'data-message-author-role="assistant"' in script:
+                return self.assistants
+            return False
+
+    old = Page("OLD")
+    submitted_but_not_ready = Page("CANDIDATE", [bootstrap], [])
+    context = type("Context", (), {"pages": [old, submitted_but_not_ready]})()
+    old.context = submitted_but_not_ready.context = context
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+
+    class Bridge:
+        page = old
+        def open_fresh_with_handover(self, _handover):
+            raise AssertionError("ambiguous submitted bootstrap must not be duplicated")
+
+    assert restarted.session_rollover.complete_from_response(Bridge(), handover) is False
+    assert len(context.pages) == 2
+    assert submitted_but_not_ready.users == [bootstrap]
+    assert submitted_but_not_ready.assistants == []
 
 
 def test_fresh_candidate_reacquisition_uses_bootstrap_and_ready_proof(tmp_path):
@@ -4455,6 +4506,26 @@ def test_next_prompt_persisted_and_launches_exactly_one_codex_child(tmp_path):
     assert watcher.launch_next(lambda *_: (_ for _ in ()).throw(AssertionError("duplicate launch"))) is None
 
 
+def test_restart_after_durable_executor_launch_claim_fails_closed_without_duplicate(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "orchestrator")
+    watcher.state.update({
+        "state": "NEXT_PROMPT_READY",
+        "taskId": "000102",
+        "nextTaskId": "000103",
+        "executorLaunchState": "LAUNCH_CLAIMED",
+        "executorLaunchClaimTaskId": "000103",
+        "discussionPauseActive": False,
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    launched = []
+    assert restarted.launch_next(lambda *_: launched.append(True)) is None
+    assert launched == []
+    assert restarted.state["state"] == "HUMAN_REQUIRED"
+    assert restarted.state["humanRequiredReason"] == "EXECUTOR_LAUNCH_OUTCOME_AMBIGUOUS"
+    assert restarted.state["executorLaunchClaimTaskId"] == "000103"
+
+
 class FakeResponseBridge(ArchitectPlaywright):
     def __init__(self, entries, generation):
         self.entries = iter(entries)
@@ -4593,16 +4664,436 @@ def test_production_shaped_legacy_reemission_waits_through_empty_identity_then_c
     assert watcher.session_rollover._handover_response_valid(observed["text"], "7fdbd798659f42295a18dd2d")
 
 
-def test_architect_generation_has_no_wall_clock_failure_authority(monkeypatch):
-    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+def test_architect_generation_progress_refreshes_inactivity_but_hard_bound_remains(monkeypatch):
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
     bridge = FakeResponseBridge(
-        [[{"id": "a", "text": "draft"}], [{"id": "a", "text": "final " + watcher_module.COMPLETE}]],
-        [True, False],
+        [[{"id": "a", "text": "final " + watcher_module.COMPLETE}]],
+        [True, True, True, False],
     )
-    observed = bridge.wait_for_new_response({"count": 0, "text_hash": "", "entries": []}, poll_interval=999999)
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "text_hash": "", "entries": []}, poll_interval=0.5,
+        inactivity_timeout=1.0, hard_timeout=5.0,
+    )
     assert observed["state"] == "COMPLETED"
+    assert bridge.polls == 1
+    assert ticks[0] >= 1.5
+    assert "hard_timeout" in inspect.signature(ArchitectPlaywright.wait_for_new_response).parameters
+
+
+def test_architect_wait_no_progress_returns_typed_timeout_without_extra_scan(monkeypatch):
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+    empty = _wait_snapshot([])
+    bridge = FakeFastSnapshotWaitBridge([empty, empty])
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []},
+        poll_interval=0.5, inactivity_timeout=1.0, hard_timeout=4.0,
+    )
+    assert observed == {"state": "TIMED_OUT", "text": "", "timeoutReason": "NO_PROGRESS"}
     assert bridge.polls == 2
-    assert "timeout" not in inspect.signature(ArchitectPlaywright.wait_for_new_response).parameters
+    assert bridge.last_wait_diagnostics["completionReason"] == "NO_PROGRESS_TIMEOUT"
+
+
+def test_architect_wait_continuous_text_progress_survives_inactivity_window(monkeypatch):
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+    partials = [
+        _wait_snapshot([{"id": "assistant", "text": "a"}]),
+        _wait_snapshot([{"id": "assistant", "text": "answer"}]),
+        _wait_snapshot([{"id": "assistant", "text": "answer\n" + watcher_module.COMPLETE}]),
+    ]
+    bridge = FakeFastSnapshotWaitBridge(partials)
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []},
+        poll_interval=0.75, inactivity_timeout=1.0, hard_timeout=4.0,
+    )
+    assert observed["state"] == "COMPLETED"
+    assert bridge.polls == 3
+    assert ticks[0] == 1.5
+
+
+def test_liveness_watchdog_writes_bounded_stack_sidecar_without_workflow_state(tmp_path):
+    watchdog = WatcherLivenessWatchdog(tmp_path, "isolated-run", stall_seconds=0.05, poll_seconds=0.01)
+    captured = threading.Event()
+    original_capture = watchdog._capture
+
+    def capture_and_signal(phase, elapsed):
+        original_capture(phase, elapsed)
+        captured.set()
+
+    watchdog._capture = capture_and_signal
+    watchdog.mark("SENT_STATE_WRITE_BEGIN")
+    watchdog.start()
+    try:
+        assert captured.wait(2.0)
+    finally:
+        watchdog.stop()
+    artifact = watchdog.path.read_bytes()
+    assert b"runId=isolated-run" in artifact
+    assert b"phase=SENT_STATE_WRITE_BEGIN" in artifact
+    assert b"thread name=MainThread" in artifact
+    assert len(artifact) <= watcher_module.WATCHER_LIVENESS_MAX_ARTIFACT_BYTES
+    assert not hasattr(watchdog, "state")
+
+
+def test_direct_watcher_entry_rejects_unsupported_python_before_startup(monkeypatch):
+    monkeypatch.setattr(watcher_module.sys, "version_info", (3, 9, 99))
+    with pytest.raises(RuntimeError, match="UNSUPPORTED_PYTHON_VERSION"):
+        watcher_module.main()
+
+
+class _ArchitectDomLocator:
+    def __init__(self, page, selector, name=None):
+        self.page = page
+        self.selector = selector
+        self.name = name
+        self.last = self
+
+    def count(self):
+        if self.selector == 'assistant':
+            return len(self.page.assistants)
+        if self.selector == 'user':
+            return len(self.page.users)
+        if self.selector == 'button' and getattr(self.name, "pattern", ""):
+            return 0 if "stop" in self.name.pattern.lower() else 1
+        return 1
+
+    def nth(self, index):
+        self.index = index
+        return self
+
+    def get_attribute(self, name):
+        entries = self.page.assistants if self.selector == 'assistant' else self.page.users
+        entry = entries[getattr(self, "index", 0)]
+        return entry.get("id") if name in {"id", "data-message-id"} else None
+
+    def inner_text(self, **_kwargs):
+        if self.selector == 'textbox':
+            return self.page.composer_text
+        if self.selector == 'assistant':
+            return self.page.assistants[getattr(self, "index", 0)]["text"]
+        if self.selector == 'user':
+            return self.page.users[getattr(self, "index", 0)]["text"]
+        return ""
+
+    def is_visible(self, **_kwargs):
+        return True
+
+    def is_editable(self, **_kwargs):
+        return True
+
+    def is_enabled(self, **_kwargs):
+        return True
+
+    def focus(self, **_kwargs):
+        return None
+
+    def press(self, key, **_kwargs):
+        if key == "Backspace":
+            self.page.composer_text = ""
+        elif key == "Enter":
+            self.page.submit_current()
+
+    def click(self, **_kwargs):
+        self.page.submit_current()
+
+
+class _ArchitectDomContext:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def new_page(self):
+        page = _ArchitectDomPage("NEW-ARCHITECT", self)
+        self.pages.append(page)
+        return page
+
+
+class _ArchitectDomKeyboard:
+    def __init__(self, page):
+        self.page = page
+
+    def insert_text(self, text):
+        self.page.composer_text = text
+
+
+class _ArchitectDomPage:
+    """Low-level controlled DOM substitute; ArchitectPlaywright remains real."""
+
+    def __init__(self, conversation_id, context=None):
+        self.conversation_id = conversation_id
+        self.url = f"https://chatgpt.com/c/{conversation_id}"
+        self.context = context or _ArchitectDomContext([])
+        self.context.pages.append(self) if self not in self.context.pages else None
+        self.assistants = []
+        self.users = []
+        self.composer_text = ""
+        self.closed = False
+        self.sent_payloads = []
+        self.staged_prompt = ""
+        self.events = []
+        self.pending_assistant = None
+        self.keyboard = _ArchitectDomKeyboard(self)
+
+    def get_by_role(self, role, name=None):
+        if role == "textbox":
+            return _ArchitectDomLocator(self, "textbox", name)
+        return _ArchitectDomLocator(self, "button", name)
+
+    def locator(self, selector):
+        if 'data-message-author-role="assistant"' in selector:
+            return _ArchitectDomLocator(self, "assistant")
+        if 'data-message-author-role="user"' in selector:
+            return _ArchitectDomLocator(self, "user")
+        return _ArchitectDomLocator(self, selector)
+
+    def goto(self, _url):
+        return None
+
+    def evaluate(self, script):
+        if script == watcher_module.assistant_fast_snapshot_script():
+            if self.pending_assistant is not None:
+                self.assistants.append({"id": f"assistant-{len(self.assistants) + 1}", "text": self.pending_assistant})
+                self.pending_assistant = None
+                self.events.append("exact_envelope_materialized")
+            latest = self.assistants[-1] if self.assistants else {}
+            return {"count": len(self.assistants), "latestMessageId": latest.get("id"),
+                    "latestText": latest.get("text", ""), "latestTextLength": len(latest.get("text", ""))}
+        if script == watcher_module.assistant_entries_script():
+            return list(self.assistants)
+        if script == watcher_module.assistant_latest_entry_script():
+            return self.assistants[-1] if self.assistants else None
+        if "stop-button" in script:
+            return False
+        if "data-message-author-role=\"user\"" in script:
+            return [entry["text"] for entry in self.users]
+        return {"found": False, "before": None, "after": None}
+
+    def submit_current(self):
+        payload = self.composer_text
+        self.composer_text = ""
+        self.users.append({"id": f"user-{len(self.users) + 1}", "text": payload})
+        self.sent_payloads.append(payload)
+        if payload.startswith("ARCHITECT HANDOVER TRANSPORT RECOVERY"):
+            response = (
+                "Authoritative existing rollover handover for exact staged task.\n"
+                f"Rollover transaction ID: {watcher_module.LEGACY_COMPAT_TRANSACTION_ID}\n"
+                "000103\n"
+                "ARCHITECT_HANDOVER_READY"
+            )
+            self.events.append("legacy_response_materialized")
+        elif "Fresh Architect session bootstrap protocol" in payload:
+            response = "ARCHITECT_SESSION_READY"
+            self.events.append("fresh_ready_materialized")
+        elif "previous completed response did not contain" in payload:
+            self.pending_assistant = envelope("000103", prompt=self.staged_prompt)
+            return
+        else:
+            response = "UNEXPECTED_CONTROLLED_PAGE_SUBMISSION"
+        self.assistants.append({"id": f"assistant-{len(self.assistants) + 1}", "text": response})
+
+    def close(self):
+        self.closed = True
+        self.events.append("page_closed")
+
+
+def test_real_architectplaywright_legacy_rollover_protocol_and_dispatch_e2e(tmp_path, monkeypatch):
+    source_prompt = Path(__file__).parent / ".agent-work" / "orchestrator" / "prompts" / "000103.txt"
+    prompt_bytes = source_prompt.read_bytes()
+    assert hashlib.sha256(prompt_bytes).hexdigest().upper() == "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+    prompt_text = prompt_bytes.decode("utf-8")
+
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "orchestrator")
+    watcher.project_dir = Path(__file__).resolve().parent
+    prompt = watcher.prompts_dir / "000103.txt"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_bytes(prompt_bytes)
+    worktree = tmp_path / "worktree-000103"
+    worktree.mkdir()
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "LEGACY_HANDOVER_REEMISSION_INVALID",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "nextTaskId": "000103",
+        "nextPromptPath": str(prompt), "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorSessionMode": "PERSISTENT", "executorProcessState": "STOPPED",
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": True,
+        "handoverRequested": True, "handoverReady": False,
+        "rolloverHandoverSendState": "AMBIGUOUS", "rolloverMaintenanceState": "DEFERRED",
+        "rolloverRecoveryState": "HUMAN_REQUIRED", "rolloverRecoveryEpoch": 3,
+        "rolloverAutomaticRecoveryEpochCount": 3, "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverTransactionId": tx, "rolloverTransactionTaskId": "000103",
+        "rolloverAttemptedForTaskId": "000103", "discussionPauseActive": True,
+        "architectConversationId": "OLD-ARCHITECT", "postDiscussionEnvelopeRequired": False,
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 3,
+        "rolloverLegacyHandoverReemissionState": "INVALID_RESPONSE",
+        "rolloverDiagnosticRetryAuthorizationConsumedTransactionId": tx,
+        "rolloverDiagnosticRetryAuthorization": {
+            "transactionId": tx, "taskId": "000103", "previousEpoch": 2, "newEpoch": 3,
+        },
+        "taskWorktrees": {"000103": {"taskId": "000103", "worktreePath": str(worktree)}},
+    })
+    watcher.save()
+    watcher._write_discussion_pause_marker(True)
+
+    # Construct the required prior diagnostic proof through the real artifact writer.
+    observation_dir = watcher.state_dir / "logs" / "diagnostic" / "legacy-handover-reemission"
+    observation_dir.mkdir(parents=True, exist_ok=True)
+    artifact = observation_dir / f"{tx}-epoch-3-observation-fixture.json"
+    diagnostic = {
+        "artifactPath": str(artifact), "transactionId": tx, "taskId": "000103", "recoveryEpoch": 3,
+        "observedState": "BLOCKED", "textLengthChars": 0, "textUtf8Bytes": 0,
+        "textSha256": hashlib.sha256(b"").hexdigest(), "artifactWritten": True,
+        "waiterDiagnostics": {"completionReason": "IDENTITY_CHANGED_WITH_EMPTY_TEXT", "pollCount": 1,
+                              "baselineAssistantCount": 0, "candidateAssistantCount": 0},
+    }
+    artifact.write_text(json.dumps(diagnostic), encoding="utf-8")
+    records = []
+    monkeypatch.setattr(bootstrap_module, "_default_process_records", lambda: records)
+    monkeypatch.setattr(bootstrap_module, "_session_exists", lambda _session: True)
+    monkeypatch.setattr(bootstrap_module, "_session_writer_records", lambda _session, _records: [])
+    monkeypatch.setattr(bootstrap_module, "_pid_alive", lambda _pid, _records: False)
+    monkeypatch.setenv("ORCHESTRATOR_AUTHORIZE_ROLLOVER_POSTFIX_QUALIFICATION", f"{tx}:3")
+    assert watcher.consume_rollover_postfix_qualification_authorization() is True
+    assert watcher.state["rolloverRecoveryEpoch"] == 4
+    assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
+    assert watcher.state["discussionPauseActive"] is True
+
+    events = []
+    old_page = _ArchitectDomPage("OLD-ARCHITECT")
+    old_page.staged_prompt = prompt_text
+    original_new_page = old_page.context.new_page
+
+    def create_fresh_page():
+        page = original_new_page()
+        page.staged_prompt = prompt_text
+        page.events = events
+        events.append("fresh_page_created")
+        return page
+
+    old_page.context.new_page = create_fresh_page
+    old_page.events = events
+    pages = {"OLD-ARCHITECT": old_page}
+    attach_calls = []
+    attached_bridges = []
+
+    def attach_controlled(_endpoint, conversation_id=None):
+        attach_calls.append(conversation_id)
+        page = pages.get(conversation_id)
+        assert page is not None, conversation_id
+        bridge = ArchitectPlaywright(page)
+        attached_bridges.append(bridge)
+        return bridge
+
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach_controlled))
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+    watcher.state["architectDiscussionBaseline"] = ArchitectPlaywright(old_page).assistant_baseline()
+    watcher.save()
+    watcher.request_discussion_resume()
+    assert watcher.state["postDiscussionEnvelopeRequired"] is True
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+
+    launches = []
+    launch = lambda received_prompt, _result: launches.append(received_prompt) or type("Process", (), {"pid": 12345})()
+    persisted_handovers = []
+    original_persist_handover = watcher.session_rollover.persist_validated_handover
+
+    def observe_persist_handover(response):
+        persisted_handovers.append(response)
+        return original_persist_handover(response)
+
+    watcher.session_rollover.persist_validated_handover = observe_persist_handover
+    lifecycle = []
+    original_save = watcher.save
+
+    def observe_lifecycle_save():
+        result = original_save()
+        if (watcher.state.get("architectConversationId") == "NEW-ARCHITECT"
+                and watcher.state.get("rolloverDue") is False
+                and "authority_committed" not in lifecycle):
+            lifecycle.append("authority_committed")
+            events.append("authority_committed")
+        return result
+
+    watcher.save = observe_lifecycle_save
+    launch_gate_calls = []
+    original_launch_next = watcher.launch_next
+
+    def observe_launch_gate(launcher):
+        launch_gate_calls.append("dispatch_authorized")
+        return original_launch_next(launcher)
+
+    watcher.launch_next = observe_launch_gate
+    first = watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert first is None
+    assert watcher.state["architectConversationId"] == "NEW-ARCHITECT", (
+        {key: watcher.state.get(key) for key in ("state", "humanRequiredReason", "rolloverRecoveryTerminalReason", "rolloverMaintenanceState", "rolloverHandoverSendState", "rolloverLegacyHandoverReemissionState", "rolloverFreshCandidateState", "rolloverRecoveryLastError")},
+        old_page.sent_payloads, old_page.assistants,
+    )
+    assert watcher.state["rolloverDue"] is False
+    fresh_page = next(page for page in old_page.context.pages if page.conversation_id == "NEW-ARCHITECT")
+    pages["NEW-ARCHITECT"] = fresh_page
+    assert len([x for x in old_page.sent_payloads if x.startswith("ARCHITECT HANDOVER TRANSPORT RECOVERY")]) == 1
+    assert len(persisted_handovers) == 1
+    assert old_page.closed is True
+    assert len([x for x in fresh_page.sent_payloads if "Fresh Architect session bootstrap protocol" in x]) == 1
+
+    # Exercise the accepted authority boundary as a real process restart:
+    # subsequent envelope recovery and dispatch must use the committed fresh
+    # conversation and must not recreate or recommit rollover authority.
+    watcher = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    watcher.project_dir = Path(__file__).resolve().parent
+    launch_gate_calls = []
+    original_launch_next = watcher.launch_next
+
+    def observe_restarted_launch_gate(launcher):
+        launch_gate_calls.append("dispatch_authorized")
+        return original_launch_next(launcher)
+
+    watcher.launch_next = observe_restarted_launch_gate
+
+    second = watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert second is None
+    assert watcher.state["postDiscussionEnvelopeRepairAttempted"] is True
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+    third = watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert third is None
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False, (
+        {key: watcher.state.get(key) for key in ("state", "humanRequiredReason", "postDiscussionProtocolBaseline", "postDiscussionEnvelopeRepairAwaiting", "postDiscussionProtocolFailure")},
+        fresh_page.sent_payloads, fresh_page.assistants,
+        [(bridge.last_state, getattr(bridge, "last_wait_diagnostics", None)) for bridge in attached_bridges],
+    )
+    # Crash/restart after the exact staged envelope is accepted but before
+    # dispatch.  The durable protocol disposition must be sufficient to
+    # authorize only the already-staged task, once.
+    watcher = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    watcher.project_dir = Path(__file__).resolve().parent
+    launch_gate_calls = []
+    original_launch_next = watcher.launch_next
+
+    def observe_pre_dispatch_launch_gate(launcher):
+        launch_gate_calls.append("dispatch_authorized")
+        return original_launch_next(launcher)
+
+    watcher.launch_next = observe_pre_dispatch_launch_gate
+    fourth = watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active)
+    assert fourth is not None
+    assert len(launches) == 1
+    assert len(launch_gate_calls) == 1
+    assert lifecycle == ["authority_committed"]
+    assert events.index("authority_committed") < events.index("page_closed")
+    assert launches[0] == prompt_text
+    assert watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["postDiscussionEnvelopeRequired"] is False
+    assert prompt.read_bytes() == prompt_bytes
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest().upper() == "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+    assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
+    assert len(attach_calls) >= 2
 
 
 def test_architect_response_requires_stopped_stable_final_envelope(monkeypatch):
@@ -7086,6 +7577,80 @@ def test_missing_envelope_staged_prompt_identity_mismatch_fails_closed(tmp_path,
     assert watcher.reconcile_post_discussion_response(bridge, corrected) == "FAILED"
     assert watcher.state["state"] == "HUMAN_REQUIRED"
     assert watcher.state["humanRequiredReason"] == "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"
+
+
+def test_legacy_reemission_timeout_is_persisted_ambiguous_and_never_resubmitted(tmp_path):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({
+        "discussionPauseActive": False,
+        "rolloverRecoveryEpoch": 4,
+        "rolloverLegacyHandoverReemissionTransactionId": watcher.state["rolloverTransactionId"],
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 3,
+        "rolloverLegacyHandoverReemissionState": "INVALID_RESPONSE",
+        "rolloverHandoverProtocolVersion": None,
+    })
+    submissions = []
+
+    class TimeoutBridge:
+        last_wait_diagnostics = {"completionReason": "NO_PROGRESS_TIMEOUT", "pollCount": 4}
+
+        def assistant_baseline(self):
+            return {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []}
+
+        def submit_result_bounded(self, request):
+            submissions.append(request)
+
+        def wait_for_new_response(self, _baseline, poll_interval=0.5):
+            assert poll_interval == 0.5
+            return {"state": "TIMED_OUT", "text": "", "timeoutReason": "NO_PROGRESS"}
+
+    bridge = TimeoutBridge()
+    status, response = watcher.session_rollover._request_legacy_handover_reemission_once(bridge, "000103")
+    assert (status, response) == ("WAIT", None)
+    assert watcher.state["rolloverLegacyHandoverReemissionState"] == "WAIT_TIMEOUT"
+    assert watcher.state["rolloverMaintenanceState"] == "RECONCILE_PENDING"
+    artifacts = list((watcher.state_dir / "logs" / "diagnostic" / "legacy-handover-reemission").glob("*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["observedState"] == "TIMED_OUT"
+    assert payload["textSha256"] == hashlib.sha256(b"").hexdigest()
+    assert watcher.session_rollover._request_legacy_handover_reemission_once(bridge, "000103")[0] == "ALREADY_ATTEMPTED"
+    assert len(submissions) == 1
+
+
+@pytest.mark.parametrize("phase", ["REQUESTING", "PRE_SENT", "SENT", "WAITING_RESPONSE"])
+def test_restart_matrix_legacy_request_phases_never_resubmit(tmp_path, phase):
+    watcher, _prompt, _prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({
+        "discussionPauseActive": False,
+        "rolloverRecoveryEpoch": 4,
+        "rolloverLegacyHandoverReemissionTransactionId": watcher.state["rolloverTransactionId"],
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 4,
+        "rolloverLegacyHandoverReemissionState": phase,
+    })
+    watcher.save()
+    restarted = LocalFirstOrchestrator(str(tmp_path), watcher.state_dir)
+    submissions = []
+
+    class MustNotObserveOrSubmit:
+        def assistant_baseline(self):
+            raise AssertionError("restart must not start another request or waiter")
+
+        def submit_result_bounded(self, _request):
+            submissions.append("duplicate")
+            raise AssertionError("duplicate Architect submission")
+
+        def wait_for_new_response(self, *_args, **_kwargs):
+            raise AssertionError("restart must reconcile; it must not repeat the one-shot send")
+
+    status, response = restarted.session_rollover._request_legacy_handover_reemission_once(
+        MustNotObserveOrSubmit(), "000103",
+    )
+    assert (status, response) == ("ALREADY_ATTEMPTED", None)
+    assert submissions == []
+    assert restarted.state["rolloverLegacyHandoverReemissionAttemptedEpoch"] == 4
+    assert restarted.state["rolloverTransactionId"] == "7fdbd798659f42295a18dd2d"
+    assert restarted.state["nextTaskId"] == "000103"
 
 
 def test_missing_envelope_reproduction_at_accepted_head_was_not_required_path(tmp_path):

@@ -206,6 +206,23 @@ def test_repository_identity_is_exactly_governed_remote_and_branch():
     assert bootstrap.repository_identity("https://github.com/other/repo.git") != bootstrap.EXPECTED_REPOSITORY_IDENTITY
 
 
+def test_bootstrap_rejects_unsupported_python_before_discovery_or_state_access(monkeypatch, capsys, tmp_path):
+    state_dir, _ = state_for(tmp_path, "NEXT_PROMPT_READY")
+    state_path = state_dir / "state.json"
+    before = state_path.read_bytes()
+    monkeypatch.setattr(bootstrap.sys, "version_info", (3, 9, 99))
+    assert bootstrap.main(["--repository", str(Path(__file__).resolve().parent), "--state-dir", str(state_dir)]) == 2
+    assert "UNSUPPORTED_PYTHON_VERSION" in capsys.readouterr().err
+    assert state_path.read_bytes() == before
+
+
+def test_python_contract_and_startup_wrapper_enforce_minimum_version():
+    script = Path(__file__).with_name("AFFOTECH-START.ps1").read_text(encoding="utf-8")
+    assert bootstrap.MINIMUM_PYTHON_VERSION == (3, 10)
+    assert "sys.version_info >= (3, 10)" in script
+    assert "no recovery or watcher action was started" in script
+
+
 def _rollover_retry_fixture(tmp_path, monkeypatch):
     state_dir = tmp_path / "orchestrator"
     prompt = state_dir / "prompts" / "000103.txt"

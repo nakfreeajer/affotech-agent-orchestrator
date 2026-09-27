@@ -9,6 +9,10 @@ $ErrorActionPreference = "Stop"
 $Repository = (Resolve-Path $PSScriptRoot).Path
 $StateDir = Join-Path $Repository ".agent-work\orchestrator"
 $Python = if (Test-Path "C:\Python314\python.exe") { "C:\Python314\python.exe" } else { "python" }
+$PythonVersionCheck = & $Python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+if ($LASTEXITCODE -ne 0) {
+    throw "Unsupported Python version ($PythonVersionCheck). AFFOTECH Orchestrator requires Python 3.10 or newer; no recovery or watcher action was started."
+}
 $Bootstrap = Join-Path $Repository "crash_recovery_bootstrap.py"
 $Endpoint = "http://127.0.0.1:9333"
 $ArchitectProfile = "C:\BraveDebug\Architect"
