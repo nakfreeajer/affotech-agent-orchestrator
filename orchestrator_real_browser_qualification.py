@@ -20,12 +20,136 @@ from urllib.parse import urlparse
 import local_orchestrator_watcher as runtime
 
 
+def _qualification_page_marker(run_id: str, role: str, nonce: str) -> str:
+    if role not in {"OLD_ARCHITECT", "FRESH_ARCHITECT"} or not run_id or not nonce:
+        raise RuntimeError("QUALIFICATION_PAGE_MARKER_INPUT_INVALID")
+    if any(":" in part for part in (run_id, role, nonce)):
+        raise RuntimeError("QUALIFICATION_PAGE_MARKER_INPUT_INVALID")
+    return f"AFFOTECH_QUALIFICATION:{run_id}:{role}:{nonce}"
+
+
+def _cdp_target_id(context: Any, page: Any) -> str:
+    """Read Chrome's stable target identity through a short-lived CDP session."""
+    session = None
+    try:
+        session = context.new_cdp_session(page)
+        info = session.send("Target.getTargetInfo")
+        target_info = info.get("targetInfo") if isinstance(info, dict) else None
+        target_id = target_info.get("targetId") if isinstance(target_info, dict) else None
+        if not isinstance(target_id, str) or not target_id:
+            raise RuntimeError("QUALIFICATION_CDP_TARGET_ID_UNAVAILABLE")
+        return target_id
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError("QUALIFICATION_CDP_TARGET_ID_UNAVAILABLE") from error
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+
+
+def find_owned_qualification_page(browser: Any, evidence: dict[str, Any], role: str) -> Any:
+    """Find exactly one page by persisted marker, with CDP target ID cross-check."""
+    run_id = evidence.get("runId")
+    rows = evidence.get("ownedPages")
+    if not isinstance(run_id, str) or not run_id or not isinstance(rows, list):
+        raise RuntimeError("QUALIFICATION_PAGE_EVIDENCE_INVALID")
+    if role not in {"OLD_ARCHITECT", "FRESH_ARCHITECT"}:
+        raise RuntimeError("QUALIFICATION_PAGE_ROLE_INVALID")
+    role_rows = [row for row in rows if isinstance(row, dict) and row.get("role") == role]
+    if len(role_rows) != 1:
+        raise RuntimeError("QUALIFICATION_PAGE_EVIDENCE_ROLE_AMBIGUOUS")
+    row = role_rows[0]
+    nonce = row.get("nonce")
+    if not isinstance(nonce, str) or not nonce or row.get("runId") != run_id:
+        raise RuntimeError("QUALIFICATION_PAGE_EVIDENCE_IDENTITY_INVALID")
+    marker = _qualification_page_marker(run_id, role, nonce)
+    if row.get("marker") != marker or row.get("markerVerified") is not True:
+        raise RuntimeError("QUALIFICATION_PAGE_EVIDENCE_MARKER_INVALID")
+    target_id = row.get("cdpTargetId")
+    if target_id is not None and (not isinstance(target_id, str) or not target_id):
+        raise RuntimeError("QUALIFICATION_PAGE_EVIDENCE_TARGET_ID_INVALID")
+
+    protected = set(runtime.QUALIFICATION_PROTECTED_CONVERSATION_IDS)
+    protected.update(str(value) for value in evidence.get("protectedConversationIds", []) if value)
+    marker_matches = []
+    try:
+        contexts = list(browser.contexts)
+    except Exception as error:
+        raise RuntimeError("QUALIFICATION_PAGE_INVENTORY_FAILED") from error
+    for context in contexts:
+        for page in list(context.pages):
+            url = str(getattr(page, "url", "") or "")
+            try:
+                conversation_id = runtime.architect_conversation_id_from_url(url)
+            except (RuntimeError, StopIteration, TypeError):
+                conversation_id = None
+            # Never evaluate or return a protected production page.
+            if conversation_id in protected:
+                if row.get("conversationId") == conversation_id:
+                    raise RuntimeError("QUALIFICATION_PROTECTED_PAGE_IDENTITY_CONFLICT")
+                continue
+            try:
+                page_marker = page.evaluate("() => window.name")
+            except Exception as error:
+                raise RuntimeError("QUALIFICATION_PAGE_MARKER_READ_FAILED") from error
+            if page_marker == marker:
+                marker_matches.append((page, context, conversation_id))
+    if len(marker_matches) > 1:
+        raise RuntimeError("QUALIFICATION_OWNED_PAGE_AMBIGUOUS")
+    if not marker_matches:
+        raise RuntimeError("QUALIFICATION_OWNED_PAGE_NOT_FOUND")
+    page, context, conversation_id = marker_matches[0]
+    expected_conversation = row.get("conversationId")
+    if expected_conversation and conversation_id and expected_conversation != conversation_id:
+        raise RuntimeError("QUALIFICATION_PAGE_CONVERSATION_ID_MISMATCH")
+    if target_id is not None:
+        try:
+            observed_target_id = _cdp_target_id(context, page)
+        except RuntimeError:
+            raise
+        if observed_target_id != target_id:
+            raise RuntimeError("QUALIFICATION_PAGE_TARGET_ID_MISMATCH")
+    return page
+
+
 class _OwnedPage:
-    def __init__(self, raw: Any, context: "_OwnedContext", close_requests: list[str]):
+    def __init__(self, raw: Any, context: "_OwnedContext", close_requests: list[str],
+                 identity: dict[str, Any], persist_evidence):
         self._raw = raw
         self._owned_context = context
         self._close_requests = close_requests
+        self.identity = identity
+        self._persist_evidence = persist_evidence
         self._affotech_qualification_owned = True
+
+    def update_location(self) -> None:
+        url = str(self._raw.url or "")
+        try:
+            conversation_id = runtime.architect_conversation_id_from_url(url)
+        except (RuntimeError, StopIteration, TypeError):
+            conversation_id = None
+        self.identity["currentUrl"] = url
+        self.identity["conversationId"] = conversation_id
+        self._persist_evidence()
+        current_marker = self._raw.evaluate("() => window.name")
+        if current_marker != self.identity["marker"]:
+            # Chrome may clear window.name on cross-site navigation. Restore it
+            # only on this qualification-created page, then verify readback.
+            current_marker = self._raw.evaluate(
+                "marker => { window.name = marker; return window.name; }", self.identity["marker"])
+        if current_marker != self.identity["marker"]:
+            raise RuntimeError("QUALIFICATION_PAGE_MARKER_READBACK_FAILED")
+        self.identity["markerVerified"] = True
+        try:
+            self.identity["cdpTargetId"] = _cdp_target_id(self._owned_context._raw, self._raw)
+        except RuntimeError as error:
+            self.identity["cdpTargetId"] = None
+            self.identity["cdpTargetIdCaptureError"] = str(error)
+        self._persist_evidence()
 
     @property
     def context(self):
@@ -44,7 +168,9 @@ class _OwnedPage:
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.hostname != "chatgpt.com":
             raise RuntimeError("QUALIFICATION_NAVIGATION_ORIGIN_BLOCKED")
-        return self._raw.goto(url, wait_until="domcontentloaded", timeout=30000, **kwargs)
+        result = self._raw.goto(url, wait_until="domcontentloaded", timeout=30000, **kwargs)
+        self.update_location()
+        return result
 
     def close(self):
         runtime._qualification_assert_page_allowed(self, "close")
@@ -60,10 +186,14 @@ class _OwnedPage:
 
 
 class _OwnedContext:
-    def __init__(self, raw: Any, close_requests: list[str], write_event):
+    def __init__(self, raw: Any, close_requests: list[str], write_event, *, run_id: str,
+                 evidence: dict[str, Any], persist_evidence):
         self._raw = raw
         self._close_requests = close_requests
         self._write_event = write_event
+        self._run_id = run_id
+        self._evidence = evidence
+        self._persist_evidence = persist_evidence
         self._pages: list[_OwnedPage] = []
         self.inventory_complete = False
 
@@ -73,15 +203,50 @@ class _OwnedContext:
         # pre-existing (including protected) browser page.
         return [page for page in self._pages if not page.closed]
 
-    def new_page(self) -> _OwnedPage:
+    def new_page(self, role: str | None = None) -> _OwnedPage:
         if not self.inventory_complete:
             raise RuntimeError("QUALIFICATION_CDP_INVENTORY_REQUIRED")
         if len(self._pages) >= 2:
             raise RuntimeError("QUALIFICATION_OWNED_PAGE_LIMIT_EXCEEDED")
+        expected_role = "OLD_ARCHITECT" if not self._pages else "FRESH_ARCHITECT"
+        role = role or expected_role
+        if role != expected_role:
+            raise RuntimeError("QUALIFICATION_PAGE_ROLE_ORDER_INVALID")
         raw = self._raw.new_page()
-        page = _OwnedPage(raw, self, self._close_requests)
+        nonce = uuid.uuid4().hex
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        marker = _qualification_page_marker(self._run_id, role, nonce)
+        identity = {
+            "runId": self._run_id, "role": role, "nonce": nonce,
+            "creationTimestamp": created_at, "currentUrl": str(raw.url or ""),
+            "conversationId": None, "marker": marker, "markerVerified": False,
+            "cdpTargetId": None, "browserIdentityType": "CDP_TARGET_ID",
+            "playwrightGuidDiagnosticOnly": str(getattr(getattr(raw, "_impl_obj", None), "_guid", "UNAVAILABLE")),
+        }
+        page = _OwnedPage(raw, self, self._close_requests, identity, self._persist_evidence)
         self._pages.append(page)
+        self._evidence.setdefault("ownedPages", []).append(identity)
+        self._persist_evidence()
+        try:
+            initial_id = runtime.architect_conversation_id_from_url(str(raw.url or ""))
+        except (RuntimeError, StopIteration, TypeError):
+            initial_id = None
+        if initial_id in runtime.QUALIFICATION_PROTECTED_CONVERSATION_IDS:
+            raise RuntimeError("QUALIFICATION_PROTECTED_PAGE_CREATION_BLOCKED")
+        readback = raw.evaluate("marker => { window.name = marker; return window.name; }", marker)
+        if readback != marker:
+            raise RuntimeError("QUALIFICATION_PAGE_MARKER_READBACK_FAILED")
+        identity["markerVerified"] = True
+        self._persist_evidence()
+        try:
+            identity["cdpTargetId"] = _cdp_target_id(self._raw, raw)
+        except RuntimeError as error:
+            identity["cdpTargetId"] = None
+            identity["cdpTargetIdCaptureError"] = str(error)
+        page.update_location()
         self._write_event("QUALIFICATION_OWNED_PAGE_CREATED", {
+            "runId": self._run_id, "role": role, "nonce": nonce,
+            "creationTimestamp": created_at, "markerVerified": True,
             "pageGuid": str(getattr(getattr(raw, "_impl_obj", None), "_guid", "UNAVAILABLE")),
             "url": str(raw.url), "pageCount": len(self._pages),
         })
@@ -141,6 +306,19 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
     if state_hash_before is None:
         raise RuntimeError("QUALIFICATION_PRODUCTION_STATE_INTEGRITY_BASELINE_UNAVAILABLE")
 
+    evidence: dict[str, Any] = {
+        "runId": run_id, "runtimeContext": "QUALIFICATION", "realBrowser": True,
+        "fakeExecutor": True, "productionStateMutation": False,
+        "productionArchitectMutation": False, "productionStateSha256Before": state_hash_before,
+        "productionStateBytesBefore": state_size_before,
+        "productionLogSha256Before": production_log_hash_before,
+        "productionLogBytesBefore": production_log_size_before,
+        "ownedPages": [], "preExistingTargets": [], "protectedConversationIds": [],
+    }
+
+    def persist_evidence() -> None:
+        _atomic_json(evidence_path, evidence)
+
     log_path.parent.mkdir(parents=True, exist_ok=False)
     handle = log_path.open("x", encoding="utf-8", newline="\n")
     handle.write("runtimeContext=QUALIFICATION realBrowser=true fakeExecutor=true "
@@ -150,6 +328,7 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
     _write_event(handle, "QUALIFICATION_PREFLIGHT", {"runId": run_id, "endpoint": endpoint,
         "productionStateSha256": state_hash_before, "productionStateBytes": state_size_before,
         "productionLogSha256": production_log_hash_before, "productionLogBytes": production_log_size_before})
+    persist_evidence()
 
     previous = {key: os.environ.get(key) for key in (
         "AFFOTECH_RUNTIME_CONTEXT", "AFFOTECH_QUALIFICATION_RUN_ID", "AFFOTECH_QUALIFICATION_RUN_ROOT",
@@ -188,11 +367,15 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
             raise RuntimeError("QUALIFICATION_CDP_INVENTORY_INCOMPLETE")
         _write_event(handle, "QUALIFICATION_CDP_INVENTORY_RECORDED", {"pageCount": len(before_targets),
             "targets": before_targets, "protectedIds": sorted(protected), "preExistingPageGuids": sorted(before_guids)})
+        evidence["preExistingTargets"] = before_targets
+        evidence["protectedConversationIds"] = sorted(protected)
+        persist_evidence()
 
         def event(name: str, fields: dict[str, Any]):
             _write_event(handle, name, fields)
 
-        owned_context = _OwnedContext(contexts[0], close_requests, event)
+        owned_context = _OwnedContext(contexts[0], close_requests, event, run_id=run_id,
+                                      evidence=evidence, persist_evidence=persist_evidence)
         owned_context.inventory_complete = True
         event("QUALIFICATION_BROWSER_GUARD_READY", {"realBrowser": True, "preExistingPagesUntouchable": True})
         logger, runtime_run_id, runtime_log_path = runtime.initialize_runtime_logging(
@@ -242,6 +425,7 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         old_id = runtime.architect_conversation_id_from_url(old_page.url)
         if old_id in protected:
             raise RuntimeError("QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED:old-created")
+        old_page.update_location()
         os.environ["AFFOTECH_QUALIFICATION_OWNED_IDS"] = old_id
         event("QUALIFICATION_OLD_SESSION_READY", {"conversationId": old_id,
             "handoverSha256": hashlib.sha256(handover.encode()).hexdigest(), "handoverValidated": True})
@@ -312,6 +496,7 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         fresh_id = runtime.architect_conversation_id_from_url(fresh_page.url)
         if fresh_id in protected or fresh_id == old_id:
             raise RuntimeError("QUALIFICATION_FRESH_CONVERSATION_ID_INVALID")
+        fresh_page.update_location()
         os.environ["AFFOTECH_QUALIFICATION_OWNED_IDS"] = old_id + "," + fresh_id
         event("QUALIFICATION_FRESH_SESSION_CREATED", {"conversationId": fresh_id, "freshTabCount": 1})
         event("QUALIFICATION_BOOTSTRAP_OBSERVED", {"payloadSha256": bootstrap_payload_hash,
@@ -359,7 +544,7 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
             raise RuntimeError("QUALIFICATION_PRODUCTION_ARTIFACT_CHANGED")
         if {item["pageGuid"] for item in after_targets if item["pageGuid"] in before_guids} != before_guids:
             raise RuntimeError("QUALIFICATION_PREEXISTING_TARGET_LOST")
-        evidence = {
+        evidence.update({
             "runId": run_id, "runtimeContext": "QUALIFICATION", "realBrowser": True, "fakeExecutor": True,
             "productionStateMutation": False, "productionArchitectMutation": False,
             "productionStateSha256Before": state_hash_before, "productionStateSha256After": after_state_hash,
@@ -372,8 +557,9 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
             "oldArchitectRetireCount": 1, "protocolRecovered": True,
             "executorLaunchSpyCount": spy.count, "closeRequestsDeferredUntilEvidence": close_requests,
             "workflowState": watcher.state,
-        }
-        _atomic_json(evidence_path, evidence)
+            "terminalStatus": "QUALIFICATION_COMPLETE",
+        })
+        persist_evidence()
         _write_event(handle, "QUALIFICATION_EVIDENCE_PERSISTED", {"path": str(evidence_path),
             "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest()})
         # Only now may this run close its two exact, durably-identified tabs.
@@ -384,6 +570,10 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
             "freshConversationId": fresh_id, "executorLaunchSpyCount": spy.count})
         return evidence
     except Exception as error:
+        evidence["terminalStatus"] = "QUALIFICATION_FAILED"
+        evidence["terminalFailure"] = {"errorClass": type(error).__name__, "reason": str(error)[:300],
+                                        "ownedPageCount": len(pages)}
+        persist_evidence()
         _write_event(handle, "QUALIFICATION_FAILED_TABS_PRESERVED", {"errorClass": type(error).__name__,
             "reason": str(error)[:300], "ownedPageCount": len(pages), "evidencePath": str(evidence_path)})
         raise

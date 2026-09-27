@@ -10311,14 +10311,44 @@ def test_qualification_is_fake_executor_only_and_wrapper_preserves_status_pause(
 def test_real_browser_qualification_context_exposes_only_run_owned_pages_and_defers_close():
     events = []
     class RawPage:
-        url = "about:blank"
-        def is_closed(self): return False
-        def goto(self, *_args, **_kwargs): self.url = "https://chatgpt.com/"
+        def __init__(self, target_id="target-old"):
+            self.url = "about:blank"
+            self.name = ""
+            self.target_id = target_id
+            self.closed = False
+            self._impl_obj = type("Impl", (), {"_guid": "page-old-guid"})()
+        def is_closed(self): return self.closed
+        def goto(self, url, **_kwargs):
+            self.url = url
+            self.name = ""  # Model Chrome clearing window.name on cross-site navigation.
         def close(self, **_kwargs): self.closed = True
+        def evaluate(self, script, *args):
+            if "window.name = marker" in script:
+                self.name = args[0]
+            return self.name
+    class CDPSession:
+        def __init__(self, page): self.page = page
+        def send(self, method):
+            assert method == "Target.getTargetInfo"
+            return {"targetInfo": {"targetId": self.page.target_id}}
+        def detach(self): pass
     class RawContext:
-        pages = [type("PreExisting", (), {"url": "https://chatgpt.com/c/preexisting"})()]
-        def new_page(self): return RawPage()
-    context = real_qualification_module._OwnedContext(RawContext(), [], lambda *args: events.append(args))
+        def __init__(self):
+            self.pages = [type("PreExisting", (), {"url": "https://chatgpt.com/"})()]
+            self.counter = 0
+        def new_page(self):
+            self.counter += 1
+            page = RawPage("target-owned-" + str(self.counter))
+            self.pages.append(page)
+            return page
+        def new_cdp_session(self, page): return CDPSession(page)
+    raw_context = RawContext()
+    evidence = {"runId": "run-test", "ownedPages": []}
+    snapshots = []
+    def persist(): snapshots.append(json.loads(json.dumps(evidence)))
+    context = real_qualification_module._OwnedContext(
+        raw_context, [], lambda *args: events.append(args), run_id="run-test",
+        evidence=evidence, persist_evidence=persist)
     with pytest.raises(RuntimeError, match="QUALIFICATION_CDP_INVENTORY_REQUIRED"):
         context.new_page()
     context.inventory_complete = True
@@ -10328,9 +10358,184 @@ def test_real_browser_qualification_context_exposes_only_run_owned_pages_and_def
     page.close()
     assert context.pages == [page]
     assert events[0][0] == "QUALIFICATION_OWNED_PAGE_CREATED"
-    assert context.new_page().url == "about:blank"
+    assert evidence["ownedPages"][0]["role"] == "OLD_ARCHITECT"
+    assert evidence["ownedPages"][0]["markerVerified"] is True
+    assert evidence["ownedPages"][0]["cdpTargetId"] == "target-owned-1"
+    assert evidence["ownedPages"][0]["runId"] == "run-test"
+    assert evidence["ownedPages"][0]["nonce"]
+    assert evidence["ownedPages"][0]["creationTimestamp"]
+    assert any(not row["ownedPages"][0]["markerVerified"] for row in snapshots)
+    assert evidence["ownedPages"][0]["currentUrl"] == "https://chatgpt.com/"
+    assert evidence["ownedPages"][0]["conversationId"] is None
+    fresh_page = context.new_page()
+    assert fresh_page.url == "about:blank"
+    assert evidence["ownedPages"][1]["role"] == "FRESH_ARCHITECT"
+    fresh_page.goto("https://chatgpt.com/c/synthetic-conversation")
+    assert evidence["ownedPages"][1]["conversationId"] == "synthetic-conversation"
     with pytest.raises(RuntimeError, match="QUALIFICATION_OWNED_PAGE_LIMIT_EXCEEDED"):
         context.new_page()
+
+
+class _QualificationIdentityPage:
+    def __init__(self, url, marker, target_id, guid):
+        self.url = url
+        self.marker = marker
+        self.target_id = target_id
+        self._impl_obj = type("Impl", (), {"_guid": guid})()
+        self.marker_reads = 0
+    def evaluate(self, _script, *_args):
+        self.marker_reads += 1
+        return self.marker
+
+
+class _QualificationIdentitySession:
+    def __init__(self, page): self.page = page
+    def send(self, method):
+        assert method == "Target.getTargetInfo"
+        return {"targetInfo": {"targetId": self.page.target_id}}
+    def detach(self): pass
+
+
+class _QualificationIdentityContext:
+    def __init__(self, pages): self.pages = pages
+    def new_cdp_session(self, page): return _QualificationIdentitySession(page)
+
+
+class _QualificationIdentityBrowser:
+    def __init__(self, *pages): self.contexts = [_QualificationIdentityContext(list(pages))]
+
+
+def _qualification_page_evidence(role="OLD_ARCHITECT", run_id="run-identity", nonce="nonce-1",
+                                  target_id="stable-target", conversation_id=None):
+    marker = real_qualification_module._qualification_page_marker(run_id, role, nonce)
+    return {"runId": run_id, "protectedConversationIds": [], "ownedPages": [{
+        "runId": run_id, "role": role, "nonce": nonce, "marker": marker,
+        "markerVerified": True, "cdpTargetId": target_id,
+        "conversationId": conversation_id, "playwrightGuidDiagnosticOnly": "stale-guid",
+    }]}
+
+
+def test_qualification_page_identity_survives_new_cdp_playwright_wrapper_and_ignores_same_url_page():
+    evidence = _qualification_page_evidence()
+    marker = evidence["ownedPages"][0]["marker"]
+    preexisting = _QualificationIdentityPage("https://chatgpt.com/", "", "preexisting-target", "old-guid")
+    reattached = _QualificationIdentityPage("https://chatgpt.com/", marker, "stable-target", "new-playwright-guid")
+    found = real_qualification_module.find_owned_qualification_page(
+        _QualificationIdentityBrowser(preexisting, reattached), evidence, "OLD_ARCHITECT")
+    assert found is reattached
+    assert reattached._impl_obj._guid != evidence["ownedPages"][0]["playwrightGuidDiagnosticOnly"]
+    assert preexisting.marker_reads == 1
+
+
+def test_qualification_page_evidence_atomic_write_and_navigation_marker_restore(tmp_path):
+    raw_context = type("Context", (), {})()
+    raw_context.pages = []
+    raw_context.counter = 0
+    def new_page():
+        raw_context.counter += 1
+        page = type("RawPage", (), {})()
+        page.url = "about:blank"
+        page.name = ""
+        page.target_id = f"target-{raw_context.counter}"
+        page.closed = False
+        page._impl_obj = type("Impl", (), {"_guid": f"guid-{raw_context.counter}"})()
+        page.is_closed = lambda: page.closed
+        page.close = lambda **_kwargs: setattr(page, "closed", True)
+        def evaluate(script, *args):
+            if "window.name = marker" in script:
+                page.name = args[0]
+            return page.name
+        page.evaluate = evaluate
+        def goto(_url, **_kwargs):
+            page.url = "https://chatgpt.com/"
+            page.name = ""
+        page.goto = goto
+        raw_context.pages.append(page)
+        return page
+    raw_context.new_page = new_page
+    raw_context.new_cdp_session = lambda page: _QualificationIdentitySession(page)
+    evidence = {"runId": "run-atomic", "ownedPages": []}
+    evidence_path = tmp_path / "qualification-evidence.json"
+    persist = lambda: real_qualification_module._atomic_json(evidence_path, evidence)
+    context = real_qualification_module._OwnedContext(raw_context, [], lambda *_: None,
+        run_id="run-atomic", evidence=evidence, persist_evidence=persist)
+    context.inventory_complete = True
+    page = context.new_page()
+    page.goto("https://chatgpt.com/")
+    saved = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert saved["ownedPages"][0]["role"] == "OLD_ARCHITECT"
+    assert saved["ownedPages"][0]["markerVerified"] is True
+    assert saved["ownedPages"][0]["currentUrl"] == "https://chatgpt.com/"
+    assert page._raw.name == saved["ownedPages"][0]["marker"]
+    assert not evidence_path.with_suffix(".json.tmp").exists()
+    reattached = _QualificationIdentityPage(page.url, page._raw.name,
+        saved["ownedPages"][0]["cdpTargetId"], "new-guid-after-reconnect")
+    found = real_qualification_module.find_owned_qualification_page(
+        _QualificationIdentityBrowser(reattached), saved, "OLD_ARCHITECT")
+    assert found is reattached
+
+
+@pytest.mark.parametrize("mutation,match", [
+    (lambda e: e.update(runId="wrong-run"), "QUALIFICATION_PAGE_EVIDENCE_IDENTITY_INVALID"),
+    (lambda e: e["ownedPages"][0].update(role="FRESH_ARCHITECT"), "QUALIFICATION_PAGE_EVIDENCE_ROLE_AMBIGUOUS"),
+    (lambda e: e["ownedPages"][0].update(nonce="wrong-nonce"), "QUALIFICATION_PAGE_EVIDENCE_MARKER_INVALID"),
+])
+def test_qualification_owned_page_rejects_wrong_run_role_or_nonce(mutation, match):
+    evidence = _qualification_page_evidence()
+    mutation(evidence)
+    page = _QualificationIdentityPage("https://chatgpt.com/", "", "stable-target", "new-guid")
+    with pytest.raises(RuntimeError, match=match):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(page), evidence, "OLD_ARCHITECT")
+
+
+def test_qualification_owned_page_rejects_zero_duplicate_and_missing_identity():
+    evidence = _qualification_page_evidence()
+    marker = evidence["ownedPages"][0]["marker"]
+    with pytest.raises(RuntimeError, match="QUALIFICATION_OWNED_PAGE_NOT_FOUND"):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(_QualificationIdentityPage("https://chatgpt.com/", "", "other", "g")),
+            evidence, "OLD_ARCHITECT")
+    duplicates = [
+        _QualificationIdentityPage("https://chatgpt.com/", marker, "stable-target", "g1"),
+        _QualificationIdentityPage("https://chatgpt.com/", marker, "other-target", "g2"),
+    ]
+    with pytest.raises(RuntimeError, match="QUALIFICATION_OWNED_PAGE_AMBIGUOUS"):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(*duplicates), evidence, "OLD_ARCHITECT")
+    missing = _QualificationIdentityPage("https://chatgpt.com/", "", "stable-target", "g3")
+    with pytest.raises(RuntimeError, match="QUALIFICATION_OWNED_PAGE_NOT_FOUND"):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(missing), evidence, "OLD_ARCHITECT")
+
+
+def test_qualification_page_identity_rejects_cdp_target_mismatch_even_with_marker():
+    evidence = _qualification_page_evidence()
+    page = _QualificationIdentityPage("https://chatgpt.com/", evidence["ownedPages"][0]["marker"],
+                                      "reused-or-replaced-target", "new-guid")
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PAGE_TARGET_ID_MISMATCH"):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(page), evidence, "OLD_ARCHITECT")
+
+
+def test_qualification_page_identity_never_selects_protected_even_with_matching_marker():
+    protected_id = next(iter(watcher_module.QUALIFICATION_PROTECTED_CONVERSATION_IDS))
+    evidence = _qualification_page_evidence(conversation_id=protected_id)
+    page = _QualificationIdentityPage(f"https://chatgpt.com/c/{protected_id}",
+        evidence["ownedPages"][0]["marker"], "stable-target", "g")
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_PAGE_IDENTITY_CONFLICT"):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(page), evidence, "OLD_ARCHITECT")
+    assert page.marker_reads == 0
+
+
+def test_qualification_page_identity_conversation_mismatch_fails_closed():
+    evidence = _qualification_page_evidence(conversation_id="conversation-recorded")
+    page = _QualificationIdentityPage("https://chatgpt.com/c/different-conversation",
+        evidence["ownedPages"][0]["marker"], "stable-target", "g")
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PAGE_CONVERSATION_ID_MISMATCH"):
+        real_qualification_module.find_owned_qualification_page(
+            _QualificationIdentityBrowser(page), evidence, "OLD_ARCHITECT")
 
 
 @pytest.mark.parametrize("conversation_id", sorted(watcher_module.QUALIFICATION_PROTECTED_CONVERSATION_IDS) + ["preexisting-unowned"])
