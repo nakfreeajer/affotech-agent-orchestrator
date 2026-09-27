@@ -1,5 +1,6 @@
 param(
     [switch]$StatusOnly,
+    [switch]$Qualification,
     [string]$AuthorizeRetry,
     [switch]$AuthorizeRolloverDiagnosticRetry,
     [switch]$AuthorizeRolloverPostfixQualification,
@@ -23,6 +24,15 @@ if ((@([bool]$AuthorizeRetry, [bool]$AuthorizeRolloverDiagnosticRetry, [bool]$Au
     throw "Choose only one authorization surface; Executor retry, diagnostic retry, post-fix qualification, and sent-response retry are separate."
 }
 
+if ($Qualification) {
+    if ($StatusOnly -or $AuthorizeRetry -or $AuthorizeRolloverDiagnosticRetry -or $AuthorizeRolloverPostfixQualification -or $AuthorizeRolloverSentResponseRetry) {
+        throw "-Qualification is an isolated synthetic harness and cannot be combined with StatusOnly or any production authorization."
+    }
+    Write-Host "QUALIFICATION: synthetic isolated state and test DOM only; no production state/CDP/browser or Executor access."
+    & $Python (Join-Path $Repository "orchestrator_qualification.py") --run $Repository
+    exit $LASTEXITCODE
+}
+
 function Invoke-Recovery([string[]]$Extra) {
     $raw = & $Python $Bootstrap --repository $Repository --state-dir $StateDir @Extra
     if ($LASTEXITCODE -ne 0) { throw "Recovery preflight failed: $raw" }
@@ -42,6 +52,7 @@ function Show-Summary($Report, [string]$AuthorizationMode) {
     Write-Host "Architect conversation: https://chatgpt.com/c/$($s.architectConversationId)"
     Write-Host "Watcher: $(if($Report.discovery.watcherRunning){'WATCHER_ALREADY_RUNNING'}else{'STOPPED'})"
     Write-Host "Workflow state: $($s.state)"
+    Write-Host "Discussion pause: $(if($s.discussionPauseActive -eq $true){'ACTIVE'}else{'INACTIVE'})"
     Write-Host "Task: $($s.taskId)"
     Write-Host "Last completed: $($s.lastCompletedTaskId)"
     Write-Host "Executor session: $($s.executorSessionId)"

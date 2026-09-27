@@ -26,6 +26,7 @@ from local_orchestrator_watcher import (ArchitectPlaywright, LocalFirstOrchestra
                                         dispatch_next_prompt_once)
 import local_orchestrator_watcher as watcher_module
 import crash_recovery_bootstrap as bootstrap_module
+import orchestrator_qualification as qualification_module
 
 # Direct main() invocations in this deterministic suite must never target the
 # production orchestrator log, even if a test supplies the real repository path.
@@ -10063,3 +10064,81 @@ def test_epoch4_sent_response_retry_authorization_rejects_mismatched_evidence(tm
     result = bootstrap.validate_rollover_sent_response_retry(discovery)
     assert result[0] is False
     assert prompt.is_file()
+
+
+def test_qualification_synthetic_main_loop_uses_isolated_state_and_fake_launch(tmp_path):
+    # Bootstrap discovery reads repository identity but receives only the
+    # harness-created synthetic state path; it never opens production state.
+    result = qualification_module.run(Path(__file__).parent)
+    assert result["runtimeContext"] == "QUALIFICATION"
+    assert result["realBrowser"] is False
+    assert result["productionStateMutation"] is False
+    assert result["syntheticStateOnly"] is True
+    assert result["bootstrapClassification"] == "HUMAN_REQUIRED_NO_AUTOMATIC_ACTION"
+    assert Path(result["runRoot"]) / "state" != tmp_path / ".agent-work" / "orchestrator"
+    assert result["authorityCommitted"] is True
+    assert result["protocolRecovered"] is True
+    assert result["executorLaunchSpyCount"] == 1
+    assert result["authorityCommitCount"] == 1
+    assert result["oldArchitectRetireCount"] == 1
+    assert result["freshTabCount"] == 1
+    assert result["freshTabCreatedDuringRecovery"] == 0
+    assert result["protocolRepairSendCount"] == 1
+    assert result["bootstrapResendCount"] == 0
+    assert result["promptUnchanged"] is True
+    assert result["qualificationLogIsolated"] is True
+    assert result["requiredEventsPresent"] is True
+
+
+@pytest.mark.parametrize("conversation_id", sorted(watcher_module.QUALIFICATION_PROTECTED_CONVERSATION_IDS))
+def test_qualification_protected_conversations_fail_closed_for_attach_and_page_mutation(monkeypatch, conversation_id):
+    monkeypatch.setenv("AFFOTECH_RUNTIME_CONTEXT", "QUALIFICATION")
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_OWNED_IDS", conversation_id)
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_OR_UNIDENTIFIED_ATTACH_BLOCKED"):
+        ArchitectPlaywright.attach("unused", conversation_id)
+    page = type("ProtectedPage", (), {"url": f"https://chatgpt.com/c/{conversation_id}"})()
+    bridge = ArchitectPlaywright(page)
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED:send"):
+        bridge.submit_result_bounded("must never send")
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED:close"):
+        bridge.close()
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED:fresh-page-parent"):
+        bridge.open_fresh_with_handover("must never navigate")
+    with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED:fresh-page-parent"):
+        bridge.open_fresh_and_wait_ready("must never navigate")
+    for operation in ("send", "navigate", "close"):
+        with pytest.raises(RuntimeError, match="QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED"):
+            watcher_module._qualification_assert_page_allowed(page, operation)
+
+
+def test_qualification_log_path_must_be_under_run_qualification_log_root(monkeypatch, tmp_path):
+    run_root = tmp_path / "qualification" / "run-x"
+    expected = run_root / "logs"
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_RUN_ID", "run-x")
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_LOG_ROOT", str(expected))
+    monkeypatch.setenv("AFFOTECH_QUALIFICATION_LOG_PATH", str(expected / "qualification.log"))
+    logger, _, path = watcher_module.initialize_runtime_logging(tmp_path / "state", "run-x", "QUALIFICATION")
+    assert Path(path) == expected / "qualification.log"
+    assert Path(path).is_file()
+    assert not (tmp_path / "state" / "logs" / "orchestrator.log").exists()
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
+
+
+def test_qualification_is_fake_executor_only_and_wrapper_preserves_status_pause():
+    source = inspect.getsource(watcher_module.main)
+    wrapper = (Path(__file__).parent / "AFFOTECH-START.ps1").read_text(encoding="utf-8")
+    assert 'runtime_context == "QUALIFICATION" else visible_executor_launcher' in source
+    assert "class _QualificationExecutorLaunchSpy" in inspect.getsource(watcher_module)
+    assert '[switch]$Qualification' in wrapper
+    assert 'Discussion pause:' in wrapper
+    assert '$Qualification' in wrapper and 'orchestrator_qualification.py' in wrapper
+
+
+def test_qualification_mode_does_not_change_nonqualification_guard_behavior(monkeypatch):
+    monkeypatch.delenv("AFFOTECH_RUNTIME_CONTEXT", raising=False)
+    page = type("OrdinaryPage", (), {"url": "https://chatgpt.com/c/ordinary-test-conversation"})()
+    assert watcher_module._qualification_context_active() is False
+    watcher_module._qualification_assert_page_allowed(page, "ordinary-operation")

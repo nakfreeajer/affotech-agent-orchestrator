@@ -71,6 +71,52 @@ ROLLOVER_DIAGNOSTIC_ONLY_ENV = "ORCHESTRATOR_ROLLOVER_DIAGNOSTIC_ONLY"
 DIAGNOSTIC_TRACE_MAX_BYTES = 100 * 1024 * 1024
 DIAGNOSTIC_SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024
 _ACTIVE_DIAGNOSTIC_TRACE = None
+QUALIFICATION_PROTECTED_CONVERSATION_IDS = frozenset({
+    "6ab532e4-d274-83ec-b684-5dc204d84661",
+    "6ab8b6d4-1628-83ec-9079-670b78f653f2",
+})
+
+
+def _qualification_context_active(owner: Any = None) -> bool:
+    logger = getattr(owner, "runtime_logger", None)
+    if logger is None and getattr(owner, "runtime_watcher", None) is not None:
+        logger = getattr(owner.runtime_watcher, "runtime_logger", None)
+    return (str(getattr(logger, "runtime_context", "") or os.environ.get("AFFOTECH_RUNTIME_CONTEXT", "")).upper()
+            == "QUALIFICATION")
+
+
+def _qualification_protected_ids() -> set[str]:
+    values = set(QUALIFICATION_PROTECTED_CONVERSATION_IDS)
+    extra = os.environ.get("AFFOTECH_QUALIFICATION_PROTECTED_IDS", "")
+    values.update(item.strip() for item in extra.split(",") if item.strip())
+    return values
+
+
+def _qualification_owned_ids() -> set[str]:
+    return {item.strip() for item in os.environ.get("AFFOTECH_QUALIFICATION_OWNED_IDS", "").split(",") if item.strip()}
+
+
+def _qualification_assert_page_allowed(page: Any, operation: str, *, newly_created: bool = False) -> None:
+    """Fail closed before qualification browser operations on non-owned/protected pages."""
+    if not _qualification_context_active():
+        return
+    url = getattr(page, "url", "")
+    url = url() if callable(url) else url
+    try:
+        conversation_id = architect_conversation_id_from_url(str(url or ""))
+    except (RuntimeError, TypeError, StopIteration):
+        conversation_id = None
+    if conversation_id in _qualification_protected_ids():
+        raise RuntimeError("QUALIFICATION_PROTECTED_CONVERSATION_BLOCKED:" + operation)
+    owned = bool(getattr(page, "_affotech_qualification_owned", False))
+    if newly_created:
+        try:
+            setattr(page, "_affotech_qualification_owned", True)
+        except Exception as error:
+            raise RuntimeError("QUALIFICATION_PAGE_OWNERSHIP_UNAVAILABLE:" + operation) from error
+        owned = True
+    if not owned and conversation_id not in _qualification_owned_ids():
+        raise RuntimeError("QUALIFICATION_PAGE_IDENTITY_UNPROVEN:" + operation)
 
 
 class DiagnosticTracer:
@@ -489,10 +535,25 @@ def initialize_runtime_logging(
     """Initialize a privacy-safe log, isolating diagnostics from production history."""
     state_path = Path(state_dir)
     context = str(runtime_context or "DIAGNOSTIC").strip().upper()
-    if context not in {"PRODUCTION", "DIAGNOSTIC"}:
+    if context not in {"PRODUCTION", "DIAGNOSTIC", "QUALIFICATION"}:
         raise ValueError("RUNTIME_LOG_CONTEXT_INVALID")
-    log_path = (state_path / "logs" / "orchestrator.log" if context == "PRODUCTION"
-                else state_path / "logs" / "diagnostic" / "orchestrator-diagnostic.log")
+    if context == "PRODUCTION":
+        log_path = state_path / "logs" / "orchestrator.log"
+    elif context == "QUALIFICATION":
+        configured = os.environ.get("AFFOTECH_QUALIFICATION_LOG_PATH")
+        required_parent_value = os.environ.get("AFFOTECH_QUALIFICATION_LOG_ROOT")
+        run_root_value = os.environ.get("AFFOTECH_QUALIFICATION_RUN_ROOT")
+        run_id_value = os.environ.get("AFFOTECH_QUALIFICATION_RUN_ID")
+        if not configured or not required_parent_value or not run_root_value or not run_id_value:
+            raise ValueError("QUALIFICATION_LOG_PATH_REQUIRED")
+        log_path = Path(configured)
+        required_parent = Path(required_parent_value).resolve()
+        expected_parent = (Path(run_root_value).resolve() / "logs").resolve()
+        if (log_path.resolve().parent != required_parent or required_parent != expected_parent
+                or log_path.name != "qualification.log"):
+            raise ValueError("QUALIFICATION_LOG_PATH_OUTSIDE_ISOLATED_ROOT")
+    else:
+        log_path = state_path / "logs" / "diagnostic" / "orchestrator-diagnostic.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     logger = logging.getLogger(RUNTIME_LOGGER_NAME)
@@ -3138,6 +3199,7 @@ class ArchitectSessionRollover:
             if callable(bind_memory):
                 bind_memory(bridge, conversation_id)
             if hasattr(old_page, "close"):
+                _qualification_assert_page_allowed(old_page, "retire-old-architect")
                 mark_watcher_liveness(self.watcher, "OLD_ARCHITECT_RETIRE_BEGIN")
                 if tracer:
                     tracer.record("PLAYWRIGHT", "complete_from_response", "OLD_ARCHITECT_CLOSE_BEGIN", "BEGIN", self.watcher.state, conversationId=conversation_id, mutation=True)
@@ -3167,6 +3229,7 @@ class ArchitectSessionRollover:
                 self._record_fresh_candidate(new_page, "SUBMISSION_AMBIGUOUS" if ambiguous_submission else "FAILED")
             if not committed and not ambiguous_submission and new_page is not None and new_page is not old_page and hasattr(new_page, "close"):
                 try:
+                    _qualification_assert_page_allowed(new_page, "close-failed-fresh-page")
                     new_page.close()
                 except Exception:
                     pass
@@ -4483,6 +4546,7 @@ class ArchitectPlaywright:
             return False
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
+        _qualification_assert_page_allowed(self.page, "send")
         self._trace_operation("submit_result_bounded", "BEGIN", payloadLength=len(result), payloadSha256=hashlib.sha256(result.encode()).hexdigest(), mutation=True)
         """Submit a result with explicit, bounded stages and typed failures."""
         self.last_send_method = None
@@ -4661,6 +4725,7 @@ class ArchitectPlaywright:
             return False
 
     def close(self) -> None:
+        _qualification_assert_page_allowed(self.page, "close")
         started = time.monotonic()
         self._trace_operation("PLAYWRIGHT_CLOSE", "BEGIN", reason="bridge_close")
         runtime = getattr(self, "_runtime", None)
@@ -4684,7 +4749,10 @@ class ArchitectPlaywright:
         self._trace_operation("PLAYWRIGHT_CLOSE", "ERROR" if error else "END", started, reason="bridge_close", errorClass=type(error).__name__ if error else None, errorMessage=str(error)[:500] if error else None, stackTrace=traceback.format_exc() if error else None)
 
     def open_fresh_and_wait_ready(self, handover: str) -> bool:
+        _qualification_assert_page_allowed(self.page, "fresh-page-parent")
         new_page = self.page.context.new_page()
+        _qualification_assert_page_allowed(new_page, "fresh-page-create", newly_created=True)
+        _qualification_assert_page_allowed(new_page, "navigate")
         new_page.goto("https://chatgpt.com/")
         new_page.get_by_role("textbox").last.fill(f"{handover}\nReply exactly {READY}")
         new_page.get_by_role("textbox").last.press("Enter")
@@ -4695,11 +4763,13 @@ class ArchitectPlaywright:
 
     def open_fresh_with_handover(self, handover: str) -> Any:
         """Create one fresh tab and submit the handover with fresh-session framing."""
+        _qualification_assert_page_allowed(self.page, "fresh-page-parent")
         started = time.monotonic()
         mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FRESH_PAGE_CREATE_BEGIN")
         if self.diagnostic_trace:
             self.diagnostic_trace.record("ROLLOVER", "open_fresh_with_handover", "FRESH_SESSION_CREATE_BEGIN", "BEGIN", {}, pagesBefore=len(getattr(getattr(self.page, "context", None), "pages", [])))
         new_page = self.page.context.new_page()
+        _qualification_assert_page_allowed(new_page, "fresh-page-create", newly_created=True)
         mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FRESH_PAGE_CREATE_COMPLETE")
         if self.diagnostic_trace:
             self.diagnostic_trace.record("PLAYWRIGHT", "open_fresh_with_handover", "PLAYWRIGHT_VISIBLE_MUTATION", "END", {}, reason="fresh Architect page", mutation=True, callingFunction="open_fresh_with_handover", pageCountAfter=len(getattr(getattr(self.page, "context", None), "pages", [])))
@@ -4709,6 +4779,7 @@ class ArchitectPlaywright:
         fresh_bridge = None
         try:
             mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FRESH_PAGE_NAVIGATION_BEGIN")
+            _qualification_assert_page_allowed(new_page, "navigate")
             new_page.goto("https://chatgpt.com/")
             mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FRESH_PAGE_NAVIGATION_COMPLETE")
             if self.diagnostic_trace:
@@ -4772,6 +4843,11 @@ class ArchitectPlaywright:
 
     @staticmethod
     def attach(endpoint: str, conversation_id: str | None = None) -> "ArchitectPlaywright":
+        if _qualification_context_active():
+            if not conversation_id or str(conversation_id) in _qualification_protected_ids():
+                raise RuntimeError("QUALIFICATION_PROTECTED_OR_UNIDENTIFIED_ATTACH_BLOCKED")
+            if str(conversation_id) not in _qualification_owned_ids():
+                raise RuntimeError("QUALIFICATION_ATTACH_TARGET_NOT_OWNED")
         from playwright.sync_api import sync_playwright
         tracer = diagnostic_trace_for()
         attach_started = time.monotonic()
@@ -4817,6 +4893,7 @@ class ArchitectPlaywright:
                 tracer.connection_end(connection_id, error=RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND" if conversation_id else "ARCHITECT_PAGE_NOT_FOUND"), endpoint=endpoint, requested=conversation_id, started=attach_started)
             runtime.stop()
             raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND") if conversation_id else RuntimeError("ARCHITECT_PAGE_NOT_FOUND")
+        _qualification_assert_page_allowed(pages[-1], "attach")
         bridge = ArchitectPlaywright(pages[-1])
         bridge.diagnostic_trace = tracer
         bridge._diagnostic_connection_id = connection_id
@@ -9377,11 +9454,83 @@ def _ambiguous_fresh_candidate_recovery_eligible(watcher: LocalFirstOrchestrator
     )
 
 
+def _qualification_fresh_candidate_recovery_eligible(watcher: LocalFirstOrchestrator) -> bool:
+    """Validate only the harness's synthetic partial-state fixture, never production authority."""
+    if not _qualification_context_active(watcher):
+        return False
+    state = watcher.state
+    run_root_value = os.environ.get("AFFOTECH_QUALIFICATION_RUN_ROOT")
+    run_id = os.environ.get("AFFOTECH_QUALIFICATION_RUN_ID")
+    if not run_root_value or not run_id:
+        return False
+    run_root = Path(run_root_value).resolve()
+    try:
+        state_root = watcher.state_dir.resolve()
+        marker_path = run_root / "qualification.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        prompt_path = Path(str(state.get("nextPromptPath") or "")).resolve()
+        prompt_hash = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+        handover = state.get("pending_handover")
+        transaction_id = str(state.get("rolloverTransactionId") or "")
+        task_id = str(state.get("nextTaskId") or "")
+        handover_valid = isinstance(handover, str) and watcher.session_rollover._handover_response_valid(handover, transaction_id)
+        bootstrap_hash = hashlib.sha256(fresh_architect_bootstrap_payload(handover).encode("utf-8")).hexdigest() if handover_valid else None
+        worktree = state.get("taskWorktrees", {}).get(task_id)
+        worktree_path = Path(str(worktree.get("worktreePath") or "")).resolve() if isinstance(worktree, dict) else None
+        prompt_expected = watcher.prompts_dir / (task_id + ".txt")
+        isolated = (state_root == (run_root / "state").resolve()
+                    and prompt_path == prompt_expected.resolve()
+                    and prompt_path.is_relative_to(state_root)
+                    and worktree_path is not None and worktree_path.is_relative_to(run_root)
+                    and worktree_path.is_dir())
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+        return False
+    candidate_id = str(state.get("rolloverFreshCandidateConversationId") or "")
+    return bool(
+        marker.get("runId") == run_id and marker.get("syntheticOnly") is True
+        and state.get("qualificationSyntheticFixture") is True
+        and isolated and prompt_expected.is_file()
+        and state.get("qualificationExpectedPromptSha256") == prompt_hash
+        and state.get("state") == "HUMAN_REQUIRED"
+        and state.get("humanRequiredReason") == "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"
+        and state.get("postDiscussionProtocolFailure") == "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"
+        and state.get("taskId") == state.get("lastCompletedTaskId")
+        and task_id and task_id.startswith("QUAL-TASK-")
+        and transaction_id.startswith("QUAL-TX-")
+        and state.get("rolloverTransactionTaskId") == task_id
+        and state.get("rolloverRecoveryEpoch") == 5
+        and state.get("rolloverAutomaticRecoveryEpochCount") == 3
+        and state.get("rolloverAutomaticRecoveryMaxEpochs") == 3
+        and state.get("rolloverDue") is True and state.get("rolloverPending") is True
+        and state.get("rolloverInProgress") is False
+        and state.get("handoverRequested") is False
+        and state.get("postDiscussionEnvelopeRequired") is True
+        and state.get("postDiscussionProtocolTaskId") == task_id
+        and state.get("postDiscussionProtocolTransactionId") == transaction_id
+        and state.get("postDiscussionProtocolRolloverCommittedTransactionId") != transaction_id
+        and state.get("architectConversationId") not in _qualification_protected_ids()
+        and candidate_id not in _qualification_protected_ids()
+        and candidate_id in _qualification_owned_ids()
+        and state.get("executorSessionMode") == "QUALIFICATION_FAKE"
+        and state.get("executorProcessState") == "STOPPED"
+        and not state.get("executorActiveWriter") and not state.get("governedExecutorActiveWriter")
+        and state.get("rolloverFreshPageCreated") is True
+        and state.get("rolloverFreshCandidateState") == "SUBMISSION_AMBIGUOUS"
+        and state.get("rolloverFreshBootstrapPayloadHash") == bootstrap_hash
+        and state.get("rolloverHandoverResponseIdentity") == hashlib.sha256(handover.encode("utf-8")).hexdigest()
+        and handover_valid
+    )
+
+
 def _recover_ambiguous_fresh_candidate_once(watcher: LocalFirstOrchestrator, endpoint: str) -> str:
     """Reconcile the exact existing candidate; never create a page or resubmit its bootstrap."""
-    if watcher.discussion_pause_active() or not _ambiguous_fresh_candidate_recovery_eligible(watcher):
+    eligible = (_ambiguous_fresh_candidate_recovery_eligible(watcher)
+                or _qualification_fresh_candidate_recovery_eligible(watcher))
+    if watcher.discussion_pause_active() or not eligible:
         return "HUMAN_REQUIRED"
     candidate_id = str(watcher.state["rolloverFreshCandidateConversationId"])
+    transaction_id = str(watcher.state.get("rolloverTransactionId") or "")
+    task_id = str(watcher.state.get("nextTaskId") or "")
     handover = str(watcher.state["pending_handover"])
     bridge = None
     try:
@@ -9404,21 +9553,21 @@ def _recover_ambiguous_fresh_candidate_once(watcher: LocalFirstOrchestrator, end
             return "HUMAN_REQUIRED"
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
                     "EXISTING_FRESH_CANDIDATE_RECOVERY_BEGIN", watcher.state,
-                    candidateConversationId=candidate_id, transactionId=LEGACY_COMPAT_TRANSACTION_ID,
-                    taskId="000103", bootstrapResubmitted=False)
+                    candidateConversationId=candidate_id, transactionId=transaction_id,
+                    taskId=task_id, bootstrapResubmitted=False)
         if not watcher.session_rollover.reconcile_pending_handover(bridge, existing_handover=handover):
             return watcher.state.get("state", "HUMAN_REQUIRED")
         # The coordinator durably committed the candidate and the protocol's
         # committed-transaction evidence. Only then may the old HREQ state clear.
         if (watcher.state.get("architectConversationId") != candidate_id
-                or watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId") != LEGACY_COMPAT_TRANSACTION_ID):
+                or watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId") != transaction_id):
             return "HUMAN_REQUIRED"
         watcher.state.update({"state": "NEXT_PROMPT_READY", "humanRequiredReason": None})
         watcher.save()
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
                     "EXISTING_FRESH_CANDIDATE_RECOVERY_COMMITTED", watcher.state,
-                    candidateConversationId=candidate_id, transactionId=LEGACY_COMPAT_TRANSACTION_ID,
-                    taskId="000103", bootstrapResubmitted=False)
+                    candidateConversationId=candidate_id, transactionId=transaction_id,
+                    taskId=task_id, bootstrapResubmitted=False)
         return "NEXT_PROMPT_READY"
     except Exception as error:
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
@@ -9627,7 +9776,8 @@ def handle_architect_value_error(watcher: LocalFirstOrchestrator, bridge: Any) -
 
 def run_human_required_startup_once(watcher: LocalFirstOrchestrator, launch: Callable[[str, Path], Any]) -> str:
     """Run the production HUMAN_REQUIRED entry, including stale-format recovery."""
-    if _ambiguous_fresh_candidate_recovery_eligible(watcher):
+    if (_ambiguous_fresh_candidate_recovery_eligible(watcher)
+            or _qualification_fresh_candidate_recovery_eligible(watcher)):
         if watcher.discussion_pause_active():
             return "HUMAN_REQUIRED"
         endpoint = os.environ.get("ARCHITECT_CDP_ENDPOINT", "http://127.0.0.1:9333")
@@ -9649,6 +9799,32 @@ def passive_human_required_wait(watcher: LocalFirstOrchestrator, poll_interval: 
     time.sleep(interval)
     watcher.state = watcher._load_state()
     return watcher.state.get("state", "HUMAN_REQUIRED")
+
+
+class _QualificationExecutorLaunchSpy:
+    """Mandatory qualification-only dispatch sink; it never creates a process."""
+    def __init__(self, watcher: LocalFirstOrchestrator, logger: logging.Logger, run_id: str):
+        self.watcher = watcher
+        self.logger = logger
+        self.run_id = run_id
+        self.count = 0
+
+    def __call__(self, prompt: str, path: Path) -> Any:
+        self.count += 1
+        self.watcher.state["qualificationExecutorLaunchSpyCount"] = self.count
+        runtime_log(self.logger, self.run_id, "QUALIFICATION_EXECUTOR_LAUNCH_SPY", self.watcher.state,
+                    count=self.count, promptSha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    resultPath=str(path), realExecutor=False)
+        return type("QualificationFakeProcess", (), {"pid": 0})()
+
+
+class _QualificationHotkeys:
+    """No host keyboard hooks are installed by the isolated qualification run."""
+    def start(self, *_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    def stop(self) -> None:
+        return None
 
 
 def human_required_startup_recovery_due(
@@ -9776,6 +9952,28 @@ def main() -> None:
     global _ACTIVE_DIAGNOSTIC_TRACE
     project = os.environ.get("AFFOTECH_PROJECT_DIR", os.getcwd())
     state_dir = Path(os.environ.get("AFFOTECH_ORCHESTRATOR_STATE_DIR") or (Path(project) / ".agent-work" / "orchestrator"))
+    runtime_context = str(os.environ.get("AFFOTECH_RUNTIME_CONTEXT", "PRODUCTION")).upper()
+    qualification_run_id = os.environ.get("AFFOTECH_QUALIFICATION_RUN_ID")
+    qualification_root_value = os.environ.get("AFFOTECH_QUALIFICATION_RUN_ROOT")
+    if runtime_context == "QUALIFICATION":
+        if not qualification_run_id or not qualification_root_value:
+            print("QUALIFICATION_PREFLIGHT_FAILED reason=RUN_ID_OR_ROOT_MISSING")
+            return
+        qualification_root = Path(qualification_root_value).resolve()
+        marker_path = qualification_root / "qualification.json"
+        production_state_path = (Path(project) / ".agent-work" / "orchestrator" / "state.json").resolve()
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            initial_state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            print("QUALIFICATION_PREFLIGHT_FAILED reason=MARKER_OR_STATE_UNAVAILABLE")
+            return
+        if (marker.get("runId") != qualification_run_id or marker.get("syntheticOnly") is not True
+                or state_dir.resolve() != (qualification_root / "state").resolve()
+                or state_dir.resolve() == production_state_path.parent
+                or initial_state.get("qualificationSyntheticFixture") is not True):
+            print("QUALIFICATION_PREFLIGHT_FAILED reason=STATE_ROOT_NOT_ISOLATED")
+            return
     instance_lock = WatcherInstanceLock(state_dir)
     try:
         instance_lock.acquire()
@@ -9785,8 +9983,9 @@ def main() -> None:
     logger = None
     run_id = None
     try:
-        runtime_context = "DIAGNOSTIC" if rollover_diagnostic_only_enabled() else os.environ.get("AFFOTECH_RUNTIME_CONTEXT", "PRODUCTION")
-        logger, run_id, log_path = initialize_runtime_logging(state_dir, runtime_context=runtime_context)
+        logger, run_id, log_path = initialize_runtime_logging(
+            state_dir, run_id=qualification_run_id if runtime_context == "QUALIFICATION" else None,
+            runtime_context="DIAGNOSTIC" if rollover_diagnostic_only_enabled() else runtime_context)
     except Exception as error:
         print(f"ORCHESTRATOR_LOGGING_INIT_FAILED error={type(error).__name__}:{error}")
         instance_lock.release()
@@ -9816,6 +10015,12 @@ def main() -> None:
         watcher.state.get("architectSendState") or "NONE", watcher.state.get("architectConversationId") or "NONE", recovery_action))
     runtime_log(logger, run_id, "WATCHER_STARTED", watcher.state, source=log_path)
     runtime_log(logger, run_id, "STATE_RECOVERED", watcher.state, recoveryAction=recovery_action)
+    if runtime_context == "QUALIFICATION":
+        runtime_log(logger, run_id, "QUALIFICATION_PREFLIGHT", watcher.state, runtimeContext="QUALIFICATION",
+                    productionStateMutation="false", realBrowser="false", fakeExecutor="true")
+        runtime_log(logger, run_id, "QUALIFICATION_STATE_CREATED", watcher.state, stateRoot=str(state_dir))
+        runtime_log(logger, run_id, "QUALIFICATION_BROWSER_GUARD_READY", watcher.state,
+                    protectedConversationCount=len(_qualification_protected_ids()), realBrowser=False)
     if diagnostic_only:
         result = run_rollover_diagnostic_only(watcher, endpoint, diagnostic_trace)
         if diagnostic_trace:
@@ -9824,7 +10029,7 @@ def main() -> None:
             _ACTIVE_DIAGNOSTIC_TRACE = None
         instance_lock.release()
         return
-    hotkeys = DiscussionHotkeyController(watcher)
+    hotkeys = _QualificationHotkeys() if runtime_context == "QUALIFICATION" else DiscussionHotkeyController(watcher)
     if not hotkeys.start(lambda event: runtime_log(logger, run_id, event, watcher.state)) and os.name == "nt":
         print("ORCHESTRATOR_HOTKEY_REGISTRATION_FAILED")
         if diagnostic_trace:
@@ -9860,9 +10065,10 @@ def main() -> None:
     if discussion_paused():
         print(f"ORCHESTRATOR PAUSED BY HUMAN state={watcher.state.get('state')} taskId={watcher.state.get('taskId') or watcher.state.get('nextTaskId') or 'NONE'}")
         runtime_log(logger, run_id, "HUMAN_DISCUSSION_PAUSE_ACTIVE", watcher.state)
-    launch = visible_executor_launcher(project, watcher)
+    launch = (_QualificationExecutorLaunchSpy(watcher, logger, run_id)
+              if runtime_context == "QUALIFICATION" else visible_executor_launcher(project, watcher))
     remote_monitor = None
-    if hasattr(watcher, "discussion_pause_active"):
+    if runtime_context != "QUALIFICATION" and hasattr(watcher, "discussion_pause_active"):
         remote_monitor = RemoteDiscussionControlMonitor(
             watcher,
             lambda: ArchitectPlaywright.attach(
@@ -9877,8 +10083,15 @@ def main() -> None:
     last_logged_state = recovery_state
     stop_logged = False
     pause_notice = None
+    qualification_loop_iterations = 0
     try:
         while True:
+            if runtime_context == "QUALIFICATION":
+                qualification_loop_iterations += 1
+                if qualification_loop_iterations > 12:
+                    runtime_log(logger, run_id, "QUALIFICATION_ABORTED", watcher.state,
+                                reason="SYNTHETIC_LOOP_BOUND_EXCEEDED", iterations=qualification_loop_iterations)
+                    return
             rollover = getattr(watcher, "session_rollover", None)
             if diagnostic_trace:
                 diagnostic_trace.record("MAIN", "main", "LOOP_BEGIN", "BEGIN", watcher.state, discussionPauseActive=bool(discussion_paused()), rolloverRecoveryState=watcher.state.get("rolloverRecoveryState"))
@@ -9985,11 +10198,18 @@ def main() -> None:
                 if diagnostic_trace:
                     diagnostic_trace.record("MAIN", "main", "LOOP_DECISION", "DECISION", watcher.state, decision="NEXT_PROMPT_READY_DISPATCH_ATTEMPT")
                 process = run_next_prompt_ready_once(watcher, launch, endpoint, discussion_paused, logger, run_id)
+                if runtime_context == "QUALIFICATION" and getattr(launch, "count", 0) > 0:
+                    runtime_log(logger, run_id, "QUALIFICATION_EXECUTOR_SPY_REACHED", watcher.state,
+                                count=launch.count, realExecutor=False)
+                    for phase in ("QUALIFICATION_PROTOCOL_RECOVERED", "QUALIFICATION_EXECUTOR_SPY_REACHED", "QUALIFICATION_COMPLETE"):
+                        runtime_log(logger, run_id, phase, watcher.state, realBrowser=False, fakeExecutor=True)
+                    return
                 continue
             if state == "HUMAN_REQUIRED":
                 reason = str(watcher.state.get("humanRequiredReason") or "UNSPECIFIED")
                 exact_relay_due = _legacy_sent_response_relay_eligible(watcher)
-                exact_candidate_due = _ambiguous_fresh_candidate_recovery_eligible(watcher)
+                exact_candidate_due = (_ambiguous_fresh_candidate_recovery_eligible(watcher)
+                                       or _qualification_fresh_candidate_recovery_eligible(watcher))
                 exact_continuation_due = (exact_relay_due or exact_candidate_due) and not watcher.discussion_pause_active()
                 log_main_loop_decision(
                     watcher,
