@@ -8053,7 +8053,24 @@ def test_post_discussion_repair_captures_and_persists_baseline_before_one_send(t
     assert prompt in message
     assert "Reproduce the complete staged prompt byte-for-byte" in message
     assert hashlib.sha256(prompt.encode()).hexdigest().upper() in message
+    source_block = message.split("<STAGED_PROMPT_SOURCE>\n", 1)[1].split("\n</STAGED_PROMPT_SOURCE>", 1)[0]
+    assert source_block == prompt
+    assert "copy the complete authoritative staged prompt" in message
+    assert f"Expected staged prompt byte length: {len(prompt.encode('utf-8'))}" in message
+    assert f"Expected staged prompt character length: {len(prompt)}" in message
     assert len(bridge.sent) == 1
+
+
+def test_post_discussion_repair_unreadable_authoritative_prompt_fails_before_send(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "task-unreadable",
+                          "nextTaskId": "task-unreadable", "nextPromptPath": str(tmp_path / "missing.txt"),
+                          "postDiscussionEnvelopeRequired": True,
+                          "postDiscussionProtocolTaskId": "task-unreadable", "postDiscussionResumeEpoch": 1})
+    bridge = _PostDiscussionBridge([])
+    assert watcher.request_post_discussion_envelope_repair(bridge) is False
+    assert bridge.sent == []
+    assert watcher.state["postDiscussionProtocolFailure"] == "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"
 
 
 def test_post_discussion_repair_fails_closed_without_pre_send_baseline(tmp_path):
@@ -8134,6 +8151,58 @@ def test_visible_assistant_observer_excludes_user_composer_and_controls(excluded
     assert "main.querySelectorAll" in script
     assert '[data-testid^="conversation-turn-"]' in script
     assert excluded_source in {"user", "composer", "control"}
+
+
+def test_rendered_assistant_markdown_turn_dom_observer_preserves_order_and_exclusions():
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser_cache = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+        installed_chromium = sorted(browser_cache.glob("chromium-*/chrome-win*/chrome.exe"))
+        launch_options = {"headless": True}
+        if installed_chromium:
+            # Deterministic DOM-only test: use an already installed local
+            # Chromium even when its revision differs from the Python package.
+            launch_options["executable_path"] = str(installed_chromium[-1])
+        browser = playwright.chromium.launch(**launch_options)
+        try:
+            page = browser.new_page()
+            page.set_content("""
+              <main style="padding:20px">
+                <div class="group flex flex-col pb-2 pt-2">
+                  <div class="MarkdownRoot-old">prior assistant READY</div>
+                </div>
+                <div class="group flex flex-col pb-2 pt-2 bg-user-message">
+                  <div class="MarkdownRoot-user">user copied result</div>
+                </div>
+                <div class="group flex flex-col pb-2 pt-2">
+                  <div data-message-author-role="assistant" data-message-id="semantic-1">
+                    <div class="MarkdownRoot-semantic">semantic assistant</div>
+                  </div>
+                </div>
+                <div class="group flex flex-col pb-2 pt-2">
+                  <div class="MarkdownRoot-control"><button>control text</button></div>
+                </div>
+                <div data-testid="composer" class="composer">
+                  <div contenteditable="true" class="MarkdownRoot-draft">draft text</div>
+                </div>
+              </main>
+            """)
+            script = watcher_module.assistant_visible_response_candidates_script()
+            baseline = page.evaluate(script)
+            assert [row["text"] for row in baseline] == ["prior assistant READY", "semantic assistant"]
+            page.locator("main").evaluate("main => main.insertAdjacentHTML('beforeend', " + json.dumps(
+                '<div class="group flex flex-col pb-2 pt-2"><div class="MarkdownRoot-new">new exact response</div></div>'
+            ) + ")")
+            current = page.evaluate(script)
+            assert [row["text"] for row in current] == [
+                "prior assistant READY", "semantic assistant", "new exact response"
+            ]
+            assert current[:len(baseline)] == baseline
+            assert current[-1]["source"] == "MARKDOWN_ROOT"
+            assert current[-1]["identity"] != baseline[-1]["identity"]
+        finally:
+            browser.close()
 
 
 def test_rendered_malformed_one_line_result_is_observed_but_strict_parser_rejects(monkeypatch):
@@ -8366,6 +8435,26 @@ def test_missing_envelope_exact_staged_prompt_repairs_without_regeneration(tmp_p
     assert watcher.state["nextTaskId"] == "000103"
     assert hashlib.sha256(prompt.read_bytes()).hexdigest() == before_hash
     assert bridge.sent and len(bridge.sent) == 1
+
+
+def test_exact_staged_prompt_envelope_hash_remains_authoritative(tmp_path):
+    watcher, _prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path)
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "postDiscussionEnvelopeRequired": True,
+                          "postDiscussionEnvelopeRepairAwaiting": True,
+                          "postDiscussionProtocolTaskId": "000103",
+                          "postDiscussionProtocolTransactionId": watcher.state["rolloverTransactionId"]})
+    valid = envelope("000103", prompt=prompt_text)
+    accepted = watcher._accept_exact_staged_prompt_envelope(valid, "000103")
+    assert accepted["prompt"] == prompt_text
+
+    watcher, _prompt, prompt_text = _staged_prompt_missing_envelope_fixture(tmp_path / "mutated")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "postDiscussionEnvelopeRequired": True,
+                          "postDiscussionEnvelopeRepairAwaiting": True,
+                          "postDiscussionProtocolTaskId": "000103",
+                          "postDiscussionProtocolTransactionId": watcher.state["rolloverTransactionId"]})
+    mutated = prompt_text.replace("exact staged task", "exact staged Task", 1)
+    with pytest.raises(ValueError, match="ARCHITECT_STAGED_PROMPT_HASH_MISMATCH"):
+        watcher._accept_exact_staged_prompt_envelope(envelope("000103", prompt=mutated), "000103")
 
 
 @pytest.mark.parametrize("mutation", ["task", "transaction", "path", "missing"])

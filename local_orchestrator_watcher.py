@@ -3674,7 +3674,7 @@ def assistant_latest_entry_script() -> str:
 
 
 def assistant_visible_response_candidates_script() -> str:
-    """Read ordered rendered assistant message-content nodes, never transcript text."""
+    """Read ordered rendered assistant content roots, never transcript text."""
     return r"""
       () => {
         const main = document.querySelector('main');
@@ -3682,25 +3682,40 @@ def assistant_visible_response_candidates_script() -> str:
         const excluded = '[data-message-author-role="user"],[class*="bg-user-message"],' +
           '[class*="group/user-message"],textarea,input,[contenteditable="true"],' +
           '[role="textbox"],button,[role="button"],[role="menu"],[role="menuitem"],' +
-          '[aria-hidden="true"],nav,header,footer';
+          '[aria-hidden="true"],nav,header,footer,form,[data-testid*="composer"],' +
+          '[class*="composer"]';
         const visible = node => {
           const rect = node.getBoundingClientRect();
           const style = getComputedStyle(node);
           return node.isConnected && rect.width > 0 && rect.height > 0 &&
             style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
         };
-        const allowed = node => !node.closest(excluded) &&
-          !!node.closest('[data-message-author-role="assistant"],[data-message-id],[data-testid^="conversation-turn-"]') &&
-          visible(node);
+        const semanticAssistant = node => node.closest(
+          '[data-message-author-role="assistant"],[data-message-id],[data-testid^="conversation-turn-"]'
+        );
+        // Current ChatGPT can render assistant MarkdownRoot content in a
+        // transcript turn without semantic role/message attributes. Accept
+        // only the observed turn wrapper shape; never infer assistant authorship
+        // from arbitrary Markdown/page text.
+        const renderedAssistantTurn = node => node.closest(
+          '.group.flex.flex-col.pb-2.pt-2'
+        );
+        const allowed = (node, source) => {
+          if (!node.closest('main') || node.closest(excluded) || !visible(node)) return false;
+          if (semanticAssistant(node)) return true;
+          return source === 'MARKDOWN_ROOT' && !!renderedAssistantTurn(node);
+        };
         let nodes = [...main.querySelectorAll('[data-message-content]')].filter(allowed);
         let source = 'DATA_MESSAGE_CONTENT';
         if (!nodes.length) {
-          nodes = [...main.querySelectorAll('.text-size-chat.whitespace-pre-wrap')].filter(allowed);
           source = 'TEXT_SIZE_CHAT';
+          nodes = [...main.querySelectorAll('.text-size-chat.whitespace-pre-wrap')]
+            .filter(node => allowed(node, source));
         }
         if (!nodes.length) {
-          nodes = [...main.querySelectorAll('[class*="MarkdownRoot-"]')].filter(allowed);
           source = 'MARKDOWN_ROOT';
+          nodes = [...main.querySelectorAll('[class*="MarkdownRoot-"]')]
+            .filter(node => allowed(node, source));
         }
         const clean = node => {
           const clone = node.cloneNode(true);
@@ -3708,6 +3723,9 @@ def assistant_visible_response_candidates_script() -> str:
           return clone.innerText || clone.textContent || '';
         };
         const all = [...main.querySelectorAll('*')];
+        const assistantTurns = [...main.querySelectorAll(
+          '[data-message-author-role="assistant"],[data-message-id],[data-testid^="conversation-turn-"],.group.flex.flex-col.pb-2.pt-2'
+        )].filter(turn => !turn.closest(excluded) && visible(turn));
         const unique = [...new Set(nodes)].filter(node => {
           const text = clean(node);
           // Prefer the innermost selected content root when wrappers are nested.
@@ -3715,15 +3733,11 @@ def assistant_visible_response_candidates_script() -> str:
         });
         return unique.map((node, ordinal) => {
           const text = clean(node);
-          let turn = node;
-          while (turn && turn !== main && !turn.hasAttribute('data-message-id') &&
-                 !turn.hasAttribute('data-testid') && !turn.classList.contains('group')) {
-            turn = turn.parentElement;
-          }
-          const explicit = turn && turn !== main
-            ? (turn.getAttribute('data-message-id') || turn.getAttribute('data-testid')) : null;
+          const turn = semanticAssistant(node) || renderedAssistantTurn(node);
+          const explicit = turn && (turn.getAttribute('data-message-id') || turn.getAttribute('data-testid'));
+          const turnOrdinal = assistantTurns.indexOf(turn);
           return {
-            identity: explicit || ('rendered-assistant-order:' + ordinal),
+            identity: explicit || ('rendered-assistant-turn:' + turnOrdinal + ':' + ordinal),
             domOrder: all.indexOf(node),
             source,
             text
@@ -8422,10 +8436,10 @@ class LocalFirstOrchestrator:
                 staged_bytes = Path(str(prompt_path_value)).read_bytes()
                 staged_prompt = staged_bytes.decode("utf-8")
             except (OSError, UnicodeError):
-                if self.state.get("postDiscussionProtocolTransactionId"):
-                    self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"})
-                    self.save()
-                    return False
+                self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"})
+                self.save()
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="STAGED_PROMPT_UNREADABLE")
+                return False
         prompt_identity = []
         if staged_bytes is not None:
             prompt_identity = [
@@ -8455,10 +8469,10 @@ class LocalFirstOrchestrator:
         message_lines.extend(prompt_identity)
         if staged_prompt is not None:
             message_lines.extend([
-                "The following is the exact staged prompt reference. Use its complete contents as the prompt field when action=EXECUTE; this reference is not a request to change the decision:",
-                "BEGIN_EXACT_STAGED_PROMPT_REFERENCE",
+                "For action=EXECUTE, copy the complete authoritative staged prompt below verbatim between promptBegin and promptEnd. Do not include these source delimiters in the returned prompt unless they are literally part of the source text:",
+                "<STAGED_PROMPT_SOURCE>",
                 staged_prompt,
-                "END_EXACT_STAGED_PROMPT_REFERENCE",
+                "</STAGED_PROMPT_SOURCE>",
             ])
         message = "\n".join(message_lines)
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result", None)
