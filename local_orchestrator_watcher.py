@@ -4148,7 +4148,13 @@ class ArchitectPlaywright:
         return [messages.nth(index).inner_text() for index in range(messages.count())]
 
     def current_visible_user_message_texts(self) -> list[str]:
-        """Read only currently rendered user-message nodes when semantic selectors miss."""
+        """Read exact message-content nodes inside currently rendered user turns.
+
+        ChatGPT may decorate a truncated bubble with an ellipsis and a
+        "Show more" affordance. Those are siblings of the message-content
+        node, not part of the submitted payload, so the bubble itself is never
+        used as the text authority.
+        """
         evaluate = getattr(getattr(self, "page", None), "evaluate", None)
         if not callable(evaluate):
             return []
@@ -4157,12 +4163,28 @@ class ArchitectPlaywright:
           /* fresh-user-dom-fallback */
           const main = document.querySelector('main');
           if (!main) return [];
-          const nodes = [...main.querySelectorAll('[class*="bg-user-message"]')];
-          return nodes.map(node => {
-            const clone = node.cloneNode(true);
-            clone.querySelectorAll('button,[role="button"]').forEach(control => control.remove());
-            return clone.innerText || clone.textContent || '';
-          });
+          const userSelector = '[data-message-author-role="user"]';
+          const bubbles = [...main.querySelectorAll(userSelector)];
+          const containers = bubbles.length ? bubbles : [...main.querySelectorAll('[class*="bg-user-message"]')];
+          const chrome = 'button,[role="button"],[role="menu"],[role="menuitem"],[aria-hidden="true"]';
+          const output = [];
+          for (const bubble of containers) {
+            // Prefer an explicit semantic content node if this UI version
+            // exposes one; otherwise use the observed ChatGPT message-text
+            // wrapper. Never fall back to flattening the ancestor bubble.
+            const semantic = [...bubble.querySelectorAll('[data-message-content]')]
+              .filter(node => !node.closest(chrome));
+            const content = semantic.length
+              ? semantic
+              : [...bubble.querySelectorAll('.text-size-chat.whitespace-pre-wrap')]
+                  .filter(node => !node.closest(chrome));
+            const unique = [...new Set(content)];
+            if (unique.length !== 1) return [];
+            const clone = unique[0].cloneNode(true);
+            clone.querySelectorAll(chrome).forEach(control => control.remove());
+            output.push(clone.textContent || '');
+          }
+          return output;
         }
         """)
         return [text for text in result if isinstance(text, str)] if isinstance(result, list) else []
@@ -4271,12 +4293,15 @@ class ArchitectPlaywright:
             except Exception:
                 semantic = []
             if semantic:
-                observed = any(isinstance(text, str) and normalize_prompt(text) == target for text in semantic)
+                matches = [text for text in semantic if isinstance(text, str) and normalize_prompt(text) == target]
                 source = "SEMANTIC_HISTORY"
             else:
                 visible = self.current_visible_user_message_texts()
-                observed = any(isinstance(text, str) and normalize_prompt(text) == target for text in visible)
+                matches = [text for text in visible if isinstance(text, str) and normalize_prompt(text) == target]
                 source = "VISIBLE_USER_DOM"
+            # One matching message proves delivery. More than one is a
+            # duplicate-send condition and must not be silently accepted.
+            observed = len(matches) == 1
             signature = (source, target if observed else None)
             stable = stable + 1 if observed and signature == prior_identity else (1 if observed else 0)
             prior_identity = signature

@@ -4205,6 +4205,115 @@ def test_fresh_candidate_requires_exact_bootstrap_and_ready(tmp_path):
     assert watcher.session_rollover._existing_fresh_candidate_page(ArchitectPlaywright(old), handover) is None
 
 
+class _VisibleUserContentPage:
+    """Controlled DOM model for the user-bubble content-node fallback."""
+    def __init__(self, bubbles, ready=True):
+        self.bubbles = bubbles
+        self.ready = ready
+        self.url = "https://chatgpt.com/c/QUAL-FRESH"
+        self.context = None
+        self.send_attempts = 0
+        self.observation_script = None
+
+    def evaluate(self, script):
+        if "fresh-user-dom-fallback" in script:
+            self.observation_script = script
+            output = []
+            for bubble in self.bubbles:
+                semantic = list(bubble.get("semanticContentNodes", []))
+                candidates = semantic if semantic else list(bubble.get("classContentNodes", []))
+                if len(candidates) != 1:
+                    return []
+                output.append(candidates[0])
+            return output
+        if "fresh-assistant-ready-dom-fallback" in script:
+            return ["ARCHITECT_SESSION_READY"] if self.ready else []
+        if "writing-block-container" in script:
+            return []
+        if 'data-message-author-role="user"' in script:
+            return []
+        if 'data-message-author-role="assistant"' in script:
+            return []
+        return False
+
+
+def _visible_user_bubble(*content_nodes, chrome=()):
+    return {"classContentNodes": list(content_nodes), "chrome": list(chrome)}
+
+
+def test_visible_user_content_node_reconciles_exact_bootstrap_despite_bubble_ellipsis_and_controls(monkeypatch, tmp_path):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    payload = "fresh bootstrap exact bytes\nARCHITECT_SESSION_READY"
+    page = _VisibleUserContentPage([_visible_user_bubble(payload, chrome=("…", "Show more", "Copy"))])
+    bridge = ArchitectPlaywright(page)
+    bridge.user_message_texts = lambda: []
+    assert bridge.current_visible_user_message_texts() == [payload]
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.1) == "SENT"
+    assert bridge.sendActionAcknowledged is True
+    assert len(bridge.current_visible_user_message_texts()) == 1
+    assert page.send_attempts == 0
+    script = page.observation_script
+    assert ".text-size-chat.whitespace-pre-wrap" in script
+    assert "[data-message-content]" in script
+    assert "const chrome =" in script
+    assert 'button,[role="button"],[role="menu"],[role="menuitem"],[aria-hidden="true"]' in script
+    assert "clone.textContent || ''" in script
+    assert "clone.innerText || clone.textContent" not in script
+
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "ready-observation-test")
+    ready, source = watcher.session_rollover._fresh_page_ready_visible(page)
+    assert ready is True
+    assert source == "VISIBLE_ASSISTANT_DOM"
+
+
+def test_visible_user_payload_ending_in_ellipsis_is_preserved_exactly(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    payload = "a legitimate payload ending in ellipsis…"
+    page = _VisibleUserContentPage([_visible_user_bubble(payload, chrome=("Show more",))])
+    bridge = ArchitectPlaywright(page)
+    bridge.user_message_texts = lambda: []
+    assert bridge.current_visible_user_message_texts() == [payload]
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.1) == "SENT"
+    assert bridge.current_visible_user_message_texts()[0].endswith("…")
+
+
+def test_visible_user_altered_payload_is_not_reconciled(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    payload = "exact expected bootstrap"
+    page = _VisibleUserContentPage([_visible_user_bubble(payload + " altered")])
+    bridge = ArchitectPlaywright(page)
+    bridge.user_message_texts = lambda: []
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.02) == "AMBIGUOUS"
+    assert page.send_attempts == 0
+
+
+@pytest.mark.parametrize("bubbles", [
+    [_visible_user_bubble("same", "same")],
+    [_visible_user_bubble("same"), _visible_user_bubble("same")],
+])
+def test_visible_user_duplicate_or_ambiguous_content_fails_closed(monkeypatch, bubbles):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    page = _VisibleUserContentPage(bubbles)
+    bridge = ArchitectPlaywright(page)
+    bridge.user_message_texts = lambda: []
+    observed = bridge.current_visible_user_message_texts()
+    if len(bubbles) > 1:
+        assert observed == ["same", "same"]
+    else:
+        assert observed == []
+    assert bridge.reconcile_fresh_bootstrap_delivery("same", timeout=0.02) == "AMBIGUOUS"
+    assert page.send_attempts == 0
+
+
+def test_semantic_user_content_node_is_preferred_to_cosmetic_class_fallback():
+    payload = "semantic content"
+    page = _VisibleUserContentPage([{
+        "semanticContentNodes": [payload],
+        "classContentNodes": [payload + "…"],
+    }])
+    assert ArchitectPlaywright(page).current_visible_user_message_texts() == [payload]
+
+
 def test_ready_unidentified_candidate_is_reused_and_committed_without_new_tab(tmp_path):
     watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
     handover = canonical_handover(watcher, "complete old handover")
