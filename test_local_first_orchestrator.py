@@ -4637,8 +4637,144 @@ def test_disabled_send_is_never_forced():
     page = FakeComposerPage(logical_enabled=False)
     with pytest.raises(ResultSubmissionError) as error:
         ArchitectPlaywright(page).submit_result_bounded("blocked", timeout=1)
-    assert error.value.code == "ARCHITECT_SEND_CONTROL_DISABLED"
+    assert error.value.code == "ARCHITECT_SEND_CONTROL_DISABLED_TIMEOUT"
     assert page.native_submissions == 0
+
+
+class _ReadinessSendCandidate:
+    def __init__(self, page, *, identity, enabled, visible=True):
+        self.page = page
+        self.node_identity = identity
+        self.enabled = enabled
+        self.visible = visible
+        self.clicked = False
+    def is_visible(self, **_): return self.visible
+    def is_enabled(self, **_): return self.enabled
+    def evaluate(self, _script, **_): return self.node_identity
+    def click(self, **_):
+        self.clicked = True
+        self.page.clicked_identities.append(self.node_identity)
+        self.page.submit()
+
+
+class _ReadinessSendLocator:
+    def __init__(self, candidates):
+        self.candidates = candidates
+        self.last = candidates[-1] if candidates else None
+    def count(self): return len(self.candidates)
+    def nth(self, index): return self.candidates[index]
+
+
+class _SendReadinessPage(FakeComposerPage):
+    def __init__(self, states):
+        super().__init__()
+        self.states = list(states)
+        self.readiness_queries = 0
+        self.clicked_identities = []
+        self.mutate_payload_on_send_query = None
+    def get_by_role(self, role, **kwargs):
+        if role == "button" and "stop" in str(kwargs.get("name", "")).lower():
+            return FakeStopButton()
+        if role == "button":
+            index = min(self.readiness_queries, len(self.states) - 1)
+            self.readiness_queries += 1
+            if self.mutate_payload_on_send_query is not None:
+                self.content = self.mutate_payload_on_send_query
+            return _ReadinessSendLocator(self.states[index])
+        return super().get_by_role(role, **kwargs)
+
+
+def test_send_readiness_accepts_immediately_and_clicks_exactly_once():
+    page = _SendReadinessPage([[_ReadinessSendCandidate(None, identity="ready-1", enabled=True)]])
+    # Candidate.click delegates to the page; provide the owner after construction.
+    page.states[0][0].page = page
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("ready now", timeout=1)
+    assert page.sent == ["ready now"]
+    assert page.clicked_identities == ["ready-1"]
+    assert bridge.sendReadinessAttempts == 1
+    assert bridge.sendEnabledInitially is True
+    assert bridge.sendEnabledEventually is True
+    assert bridge.sendMethod == "playwright.click"
+
+
+def test_send_readiness_waits_while_disabled_then_enables():
+    disabled = lambda n: _ReadinessSendCandidate(None, identity=n, enabled=False)
+    enabled = _ReadinessSendCandidate(None, identity="ready", enabled=True)
+    page = _SendReadinessPage([[disabled("d1")], [disabled("d2")], [enabled]])
+    for state in page.states:
+        for candidate in state:
+            candidate.page = page
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("delayed ready", timeout=2)
+    assert page.sent == ["delayed ready"]
+    assert page.clicked_identities == ["ready"]
+    assert bridge.sendReadinessAttempts >= 3
+    assert bridge.sendEnabledInitially is False
+    assert bridge.sendEnabledEventually is True
+
+
+def test_send_readiness_reacquires_replaced_node_and_rejects_stale_disabled_control():
+    old = _ReadinessSendCandidate(None, identity="old-node", enabled=False)
+    current = _ReadinessSendCandidate(None, identity="new-node", enabled=True)
+    page = _SendReadinessPage([[old], [current]])
+    old.page = current.page = page
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("replacement ready", timeout=2)
+    assert page.clicked_identities == ["new-node"]
+    assert old.clicked is False
+    assert bridge.sendNodeReplacementObserved is True
+
+
+def test_send_readiness_allows_one_current_enabled_when_stale_disabled_duplicate_exists():
+    stale = _ReadinessSendCandidate(None, identity="stale-disabled", enabled=False)
+    current = _ReadinessSendCandidate(None, identity="current-enabled", enabled=True)
+    page = _SendReadinessPage([[stale, current]])
+    stale.page = current.page = page
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("one eligible control", timeout=1)
+    assert page.clicked_identities == ["current-enabled"]
+    assert bridge.sendCandidateCount == 2
+
+
+def test_send_readiness_multiple_eligible_controls_fail_closed_without_click():
+    candidates = [_ReadinessSendCandidate(None, identity=f"enabled-{i}", enabled=True) for i in range(2)]
+    page = _SendReadinessPage([candidates])
+    for candidate in candidates:
+        candidate.page = page
+    bridge = ArchitectPlaywright(page)
+    with pytest.raises(ResultSubmissionError) as error:
+        bridge.submit_result_bounded("ambiguous controls", timeout=1)
+    assert error.value.code == "ARCHITECT_SEND_CONTROL_AMBIGUOUS"
+    assert page.clicked_identities == []
+    assert page.native_submissions == 0
+
+
+@pytest.mark.parametrize("changed", ["changed payload", ""])
+def test_send_readiness_payload_change_or_empty_fails_closed_without_click(changed):
+    candidate = _ReadinessSendCandidate(None, identity="enabled", enabled=True)
+    page = _SendReadinessPage([[candidate]])
+    candidate.page = page
+    page.mutate_payload_on_send_query = changed
+    bridge = ArchitectPlaywright(page)
+    with pytest.raises(ResultSubmissionError) as error:
+        bridge.submit_result_bounded("expected payload", timeout=1)
+    assert error.value.code == "ARCHITECT_COMPOSER_INPUT_CHANGED_WHILE_WAITING"
+    assert page.clicked_identities == []
+    assert page.native_submissions == 0
+
+
+def test_send_readiness_permanently_disabled_times_out_without_enter_or_click():
+    disabled = _ReadinessSendCandidate(None, identity="disabled", enabled=False)
+    page = _SendReadinessPage([[disabled]])
+    disabled.page = page
+    bridge = ArchitectPlaywright(page)
+    with pytest.raises(ResultSubmissionError) as error:
+        bridge.submit_result_bounded("stay disabled", timeout=0.15)
+    assert error.value.code == "ARCHITECT_SEND_CONTROL_DISABLED_TIMEOUT"
+    assert page.clicked_identities == []
+    assert page.sent == []
+    assert bridge.sendEnabledEventually is False
 
 
 def test_unavailable_composer_fails_without_executor_rerun():

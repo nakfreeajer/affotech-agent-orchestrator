@@ -403,6 +403,7 @@ class _QualificationInputSubmitter:
         original_reader = bridge.read_live_composer_payload
         had_instance_reader = "read_live_composer_payload" in getattr(bridge, "__dict__", {})
         read_count = 0
+        submit_started = time.monotonic()
 
         def recording_reader(composer=None):
             nonlocal read_count
@@ -418,6 +419,8 @@ class _QualificationInputSubmitter:
                 "composerAcceptancePassed": passed,
                 "composerReadAttempts": read_count,
             })
+            if passed and "composerAcceptanceLatencyMs" not in metadata:
+                metadata["composerAcceptanceLatencyMs"] = round((time.monotonic() - submit_started) * 1000)
             self.persist_evidence()
             return observed
 
@@ -425,6 +428,19 @@ class _QualificationInputSubmitter:
         try:
             return self.original_submit(bridge, payload, timeout)
         finally:
+            for attr, field in (
+                ("sendReadinessLatencyMs", "sendReadinessLatencyMs"),
+                ("sendReadinessAttempts", "sendReadinessAttempts"),
+                ("sendCandidateCount", "sendCandidateCount"),
+                ("sendNodeReplacementObserved", "sendNodeReplacementObserved"),
+                ("sendEnabledInitially", "sendEnabledInitially"),
+                ("sendEnabledEventually", "sendEnabledEventually"),
+                ("sendMethod", "sendMethod"),
+            ):
+                if hasattr(bridge, attr):
+                    metadata[field] = getattr(bridge, attr)
+            if metadata:
+                self.persist_evidence()
             if had_instance_reader:
                 bridge.read_live_composer_payload = original_reader
             else:

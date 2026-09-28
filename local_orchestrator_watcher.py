@@ -4639,6 +4639,121 @@ class ArchitectPlaywright:
             return normalize_composer_payload(value) if isinstance(value, str) else None
         return None
 
+    def wait_for_live_send_control(self, expected_payload: str, deadline: float) -> Any:
+        """Return the current unique visible/enabled Send control while payload remains exact."""
+        started = time.monotonic()
+        attempts = 0
+        candidate_count = 0
+        enabled_initially = False
+        node_replaced = False
+        previous_fingerprint = None
+        self.sendReadinessLatencyMs = None
+        self.sendReadinessAttempts = 0
+        self.sendCandidateCount = 0
+        self.sendNodeReplacementObserved = False
+        self.sendEnabledInitially = None
+        self.sendEnabledEventually = False
+        self.sendMethod = None
+        send_name = re.compile(r"^\s*send(?:\s+prompt)?\s*$", re.I)
+        while time.monotonic() < deadline:
+            attempts += 1
+            self.sendReadinessAttempts = attempts
+            try:
+                composer = self._live_composer()
+                observed = self.read_live_composer_payload(composer)
+                if not isinstance(observed, str) or not composer_payload_matches(observed, expected_payload):
+                    detail = "EMPTY" if not observed else "CONTENT_MISMATCH"
+                    raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_CHANGED_WHILE_WAITING", detail)
+                locator = self.page.get_by_role("button", name=send_name)
+                count_method = getattr(locator, "count", None)
+                candidate_count = int(count_method()) if callable(count_method) else 1
+                candidates = []
+                for index in range(candidate_count):
+                    candidate = locator.nth(index) if callable(getattr(locator, "nth", None)) else locator.last
+                    try:
+                        visible = bool(candidate.is_visible(timeout=250))
+                        enabled = bool(candidate.is_enabled(timeout=250))
+                    except Exception:
+                        visible, enabled = False, False
+                    candidates.append((candidate, visible, enabled))
+                eligible = [(candidate, visible, enabled) for candidate, visible, enabled in candidates
+                            if visible and enabled]
+                any_enabled = bool(eligible)
+                if self.sendEnabledInitially is None:
+                    enabled_initially = any_enabled
+                    self.sendEnabledInitially = enabled_initially
+                self.sendEnabledEventually = any_enabled
+                fingerprint = None
+                identity_candidates = eligible or [row for row in candidates if row[1]]
+                if identity_candidates:
+                    current = identity_candidates[0][0]
+                    evaluator = getattr(current, "evaluate", None)
+                    if callable(evaluator):
+                        try:
+                            fingerprint = evaluator("""e => JSON.stringify({tag:e.tagName, id:e.id,
+                              testId:e.getAttribute('data-testid'), aria:e.getAttribute('aria-label'),
+                              title:e.getAttribute('title'), parent:e.parentElement?.getAttribute('data-testid'),
+                              html:e.outerHTML})""", timeout=250)
+                        except Exception:
+                            fingerprint = None
+                    if fingerprint is None:
+                        fingerprint = getattr(current, "node_identity", type(current).__name__)
+                    if previous_fingerprint is not None and fingerprint != previous_fingerprint:
+                        node_replaced = True
+                    previous_fingerprint = fingerprint
+                self.sendCandidateCount = candidate_count
+                self.sendReadinessAttempts = attempts
+                self.sendNodeReplacementObserved = node_replaced
+                if len(eligible) > 1:
+                    raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_AMBIGUOUS", str(len(eligible)))
+                if len(eligible) == 1:
+                    final_composer = self._live_composer()
+                    final_payload = self.read_live_composer_payload(final_composer)
+                    if not isinstance(final_payload, str) or not composer_payload_matches(final_payload, expected_payload):
+                        detail = "EMPTY" if not final_payload else "CONTENT_MISMATCH"
+                        raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_CHANGED_WHILE_WAITING", detail)
+                    latency = round((time.monotonic() - started) * 1000)
+                    self.sendReadinessLatencyMs = latency
+                    self.sendEnabledEventually = True
+                    runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                                "ARCHITECT_SEND_READINESS_CONFIRMED",
+                                getattr(getattr(self, "runtime_watcher", None), "state", None),
+                                latencyMs=latency, attempts=attempts, candidateCount=candidate_count,
+                                nodeReplacementObserved=node_replaced, enabledInitially=enabled_initially,
+                                enabledEventually=True)
+                    return eligible[0][0]
+            except ResultSubmissionError as error:
+                self.sendReadinessLatencyMs = round((time.monotonic() - started) * 1000)
+                self.sendReadinessAttempts = attempts
+                self.sendCandidateCount = candidate_count
+                self.sendNodeReplacementObserved = node_replaced
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                            "ARCHITECT_SEND_READINESS_FAILED",
+                            getattr(getattr(self, "runtime_watcher", None), "state", None),
+                            reason=error.code, latencyMs=self.sendReadinessLatencyMs,
+                            attempts=attempts, candidateCount=candidate_count,
+                            nodeReplacementObserved=node_replaced)
+                raise
+            except Exception:
+                # A transient rerender may make a locator unavailable for one poll.
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.05, remaining))
+        latency = round((time.monotonic() - started) * 1000)
+        self.sendReadinessLatencyMs = latency
+        self.sendReadinessAttempts = attempts
+        self.sendCandidateCount = candidate_count
+        self.sendNodeReplacementObserved = node_replaced
+        self.sendEnabledEventually = False
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                    "ARCHITECT_SEND_READINESS_TIMEOUT",
+                    getattr(getattr(self, "runtime_watcher", None), "state", None),
+                    latencyMs=latency, attempts=attempts, candidateCount=candidate_count,
+                    nodeReplacementObserved=node_replaced, enabledInitially=self.sendEnabledInitially,
+                    enabledEventually=False)
+        raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED_TIMEOUT")
+
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         _qualification_assert_page_allowed(self.page, "send")
         self._trace_operation("submit_result_bounded", "BEGIN", payloadLength=len(result), payloadSha256=hashlib.sha256(result.encode()).hexdigest(), mutation=True)
@@ -4741,26 +4856,14 @@ class ArchitectPlaywright:
             detail = "CONTENT_MISMATCH" if isinstance(observed, str) and observed else "EMPTY_CURRENT_COMPOSER"
             raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", detail)
         assistant_count_before = self.assistant_count()
-
-        try:
-            send = self.page.get_by_role("button", name=re.compile(r"^\s*send(?:\s+prompt)?\s*$", re.I)).last
-            send_visible = getattr(send, "is_visible", lambda **_: True)(timeout=1000)
-        except Exception as error:
-            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE", type(error).__name__) from error
-        if not send_visible:
-            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE")
-        try:
-            enabled = getattr(send, "is_enabled", lambda **_: True)(timeout=1000)
-        except Exception as error:
-            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE", type(error).__name__) from error
-        if not enabled:
-            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED")
+        send = self.wait_for_live_send_control(expected_payload, deadline)
         try:
             self.sendActionAttempted = True
             if self.diagnostic_trace:
                 self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send Architect payload", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
             send.click(timeout=1000)
             self.last_send_method = "playwright.click"
+            self.sendMethod = self.last_send_method
             self.initialSendMethod = self.last_send_method
             self.initialSendActionReturned = True
         except Exception as error:
