@@ -606,6 +606,8 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         old_bridge.runtime_logger = logger
         old_bridge.runtime_run_id = runtime_run_id
         old_bridge.runtime_conversation_id = "QUALIFICATION_PENDING_OLD"
+        old_bridge.runtime_expected_handover_transaction_id = transaction_id
+        old_bridge.runtime_expected_handover_task_id = task_id
         old_baseline = old_bridge.assistant_baseline()
         old_bridge.submit_result_bounded(prompt_request, timeout=45.0)
         old_observed = old_bridge.wait_for_new_response(old_baseline, poll_interval=0.5)

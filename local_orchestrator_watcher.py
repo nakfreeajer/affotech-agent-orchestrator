@@ -3674,12 +3674,13 @@ def assistant_latest_entry_script() -> str:
 
 
 def assistant_visible_handover_candidates_script(transaction_id: str, task_id: str) -> str:
-    """Return bounded rendered-DOM ancestors that may contain the exact handover.
+    """Return bounded rendered transcript candidates for canonical or legacy handovers.
 
     This fallback is intentionally read-only.  It handles the current ChatGPT
     transcript DOM where assistant turns are rendered in ``main`` but are no
-    longer exposed through the historical data-message-author-role selector.
-    Validation and stable-completion checks remain in Python.
+    longer exposed through the historical semantic assistant selector. User
+    turns, composer content, controls, and page chrome are excluded. Python's
+    strict parser and transaction/task checks remain authoritative.
     """
     transaction_json = json.dumps(str(transaction_id))
     task_json = json.dumps(str(task_id))
@@ -3687,25 +3688,45 @@ def assistant_visible_handover_candidates_script(transaction_id: str, task_id: s
       () => {{
         const tx = {transaction_json};
         const task = {task_json};
-        const marker = 'ARCHITECT_HANDOVER_READY';
+        const legacyMarker = 'ARCHITECT_HANDOVER_READY';
+        const excluded = '[data-message-author-role="user"],[class*="bg-user-message"],' +
+          '[class*="group/user-message"],textarea,input,[contenteditable="true"],' +
+          '[role="textbox"],button,[role="button"],[aria-hidden="true"],nav,header,footer';
         const main = document.querySelector('main');
         if (!main) return [];
-        const leaves = [...main.querySelectorAll('*')].filter(e => e.isConnected && !e.children.length);
+        const visible = (e) => {{
+          const rect = e.getBoundingClientRect();
+          const style = getComputedStyle(e);
+          return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
+            style.visibility !== 'hidden' && style.opacity !== '0';
+        }};
+        const cleanText = (source) => {{
+          const clone = source.cloneNode(true);
+          clone.querySelectorAll(excluded + ',script,style,svg').forEach(node => node.remove());
+          return clone.innerText || clone.textContent || '';
+        }};
+        const nodes = [...main.querySelectorAll('*')].slice(0, 6000)
+          .filter(e => e.isConnected && !e.closest(excluded) && visible(e));
         const candidates = new Map();
-        for (let leafIndex = 0; leafIndex < leaves.length; leafIndex++) {{
-          const leaf = leaves[leafIndex];
-          const leafText = leaf.innerText || leaf.textContent || '';
-          if (!leafText.includes(marker)) continue;
+        for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {{
+          const leaf = nodes[nodeIndex];
+          const leafText = cleanText(leaf);
+          if (!leafText.includes(tx) || !leafText.includes(task)) continue;
+          const canonicalShape = leafText.includes('<HANDOVER>') && leafText.includes('</HANDOVER>');
+          const legacyShape = leafText.includes(legacyMarker);
+          if (!canonicalShape && !legacyShape) continue;
           let node = leaf;
           for (let depth = 0; node && node !== main && depth < 16; depth++, node = node.parentElement) {{
-            if (!node.isConnected) break;
-            const text = node.innerText || node.textContent || '';
+            if (!node.isConnected || node.closest(excluded) || !visible(node)) break;
+            const text = cleanText(node);
             if (text.length > 120000) break;
-            if (text.includes(marker) && text.includes(tx) && text.includes(task)) {{
+            const hasCanonicalShape = text.includes('<HANDOVER>') && text.includes('</HANDOVER>');
+            const hasLegacyShape = text.includes(legacyMarker);
+            if (text.includes(tx) && text.includes(task) && (hasCanonicalShape || hasLegacyShape)) {{
               const key = text;
               if (!candidates.has(key)) candidates.set(key, {{
                 text,
-                domOrder: leafIndex,
+                domOrder: nodeIndex,
                 tag: node.tagName,
                 identity: node.getAttribute('data-message-id') || node.id || null,
                 role: node.getAttribute('data-message-author-role') || null
@@ -4387,6 +4408,29 @@ class ArchitectPlaywright:
         self._history_recovery_attempted = False
         stability_poll_pending = False
         current: dict[str, Any] | None = None
+        visible_handover_hash = None
+        visible_handover_text = None
+        visible_handover_stability_polls = 0
+
+        def expected_handover_identity() -> tuple[str, str]:
+            watcher = getattr(self, "runtime_watcher", None)
+            state = getattr(watcher, "state", {})
+            transaction = str(state.get("rolloverTransactionId") or
+                              getattr(self, "runtime_expected_handover_transaction_id", "") or "").strip()
+            task = str(state.get("rolloverTransactionTaskId") or
+                       getattr(self, "runtime_expected_handover_task_id", "") or "").strip()
+            return transaction, task
+
+        def valid_expected_handover(candidate_text: str, transaction: str, task: str) -> bool:
+            parsed = parse_handover_envelope(candidate_text)
+            if parsed is not None:
+                return parsed["transactionId"] == transaction and parsed["taskId"] == task
+            watcher = getattr(self, "runtime_watcher", None)
+            rollover = getattr(watcher, "session_rollover", None)
+            validator = getattr(rollover, "_handover_response_valid", None)
+            return bool(transaction and task and callable(validator)
+                        and validator(candidate_text, transaction))
+
         while True:
             poll_count += 1
             mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FIRST_POLL_LOG_BEGIN" if poll_count == 1 else "WAITER_POLL_LOG_BEGIN")
@@ -4501,6 +4545,13 @@ class ArchitectPlaywright:
                 expected_task_id = None
                 if isinstance(wait_state, dict):
                     expected_task_id = wait_state.get("nextTaskId") or wait_state.get("taskId")
+                expected_transaction_id, expected_handover_task_id = expected_handover_identity()
+                parsed_handover = parse_handover_envelope(text)
+                canonical_handover = bool(
+                    expected_transaction_id and expected_handover_task_id and parsed_handover
+                    and parsed_handover["transactionId"] == expected_transaction_id
+                    and parsed_handover["taskId"] == expected_handover_task_id
+                )
                 machine_result_envelope = False
                 if expected_task_id:
                     try:
@@ -4532,13 +4583,16 @@ class ArchitectPlaywright:
                     mark_watcher_liveness(getattr(self, "runtime_watcher", None), "WAITER_SLEEP_COMPLETE")
                     continue
                 if (text.rstrip().endswith(COMPLETE) or architect_handover_ready(text)
-                        or extract_executor_prompt_envelope(text) is not None or machine_result_envelope):
+                        or extract_executor_prompt_envelope(text) is not None or machine_result_envelope
+                        or canonical_handover):
                     self.last_state = "COMPLETED"
                     result = {"state": "COMPLETED", "text": text}
                     if text.rstrip().endswith(COMPLETE):
                         reason = "TERMINAL_COMPLETE_MARKER"
                     elif architect_handover_ready(text):
                         reason = "HANDOVER_READY_MARKER"
+                    elif canonical_handover:
+                        reason = "CANONICAL_HANDOVER_STABLE_SEMANTIC_ASSISTANT"
                     elif machine_result_envelope:
                         reason = "ORCHESTRATOR_RESULT_ENVELOPE"
                     else:
@@ -4547,6 +4601,53 @@ class ArchitectPlaywright:
                 self.last_state = "BLOCKED"
                 result = {"state": "BLOCKED", "text": text}
                 return finish(result, "STABLE_TWO_POLL_NO_COMPLETION_MARKER", current, text, generation_check_skipped)
+            # Semantic history remains authoritative when it finds a response.
+            # If it has no changed assistant entry, inspect only the bounded,
+            # read-only visible-handover candidates; the JS observer excludes
+            # user bubbles, composer contents, controls, and page chrome.
+            expected_transaction_id, expected_handover_task_id = expected_handover_identity()
+            visible_reader = getattr(self, "current_visible_handover_candidates", None)
+            if (not text and not identity_changed and expected_transaction_id and expected_handover_task_id
+                    and callable(visible_reader) and not last_generation_visible):
+                try:
+                    rows = visible_reader(expected_transaction_id, expected_handover_task_id)
+                except Exception:
+                    rows = []
+                candidates = [row.get("text") for row in rows if isinstance(row, dict)
+                              and isinstance(row.get("text"), str)
+                              and valid_expected_handover(row["text"], expected_transaction_id,
+                                                          expected_handover_task_id)]
+                visible_text = candidates[-1] if candidates else None
+                if visible_text is not None:
+                    visible_hash = hashlib.sha256(visible_text.encode("utf-8")).hexdigest()
+                    if visible_hash == visible_handover_hash:
+                        visible_handover_stability_polls += 1
+                    else:
+                        visible_handover_hash = visible_hash
+                        visible_handover_text = visible_text
+                        visible_handover_stability_polls = 1
+                        last_progress_at = time.monotonic()
+                    runtime_log(
+                        getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "ARCHITECT_WAIT_VISIBLE_HANDOVER_CANDIDATE",
+                        getattr(getattr(self, "runtime_watcher", None), "state", None),
+                        candidateSha256=visible_hash, candidateLength=len(visible_text),
+                        stablePolls=visible_handover_stability_polls,
+                        transactionId=expected_transaction_id, taskId=expected_handover_task_id,
+                    )
+                    if visible_handover_stability_polls >= 2 and not self.generation_visible():
+                        self.last_state = "COMPLETED"
+                        reason = "CANONICAL_HANDOVER_STABLE_VISIBLE_DOM"
+                        self.last_wait_observer = "CURRENT_VISIBLE_ASSISTANT_DOM"
+                        return finish({"state": "COMPLETED", "text": visible_handover_text}, reason, current)
+                    self.last_state = "RUNNING"
+                    mark_watcher_liveness(getattr(self, "runtime_watcher", None), "WAITER_SLEEP_BEGIN")
+                    time.sleep(bounded_sleep_delay())
+                    mark_watcher_liveness(getattr(self, "runtime_watcher", None), "WAITER_SLEEP_COMPLETE")
+                    continue
+                visible_handover_hash = None
+                visible_handover_text = None
+                visible_handover_stability_polls = 0
             stable_hash = None
             stable_polls = 0
             if identity_changed:
@@ -4645,6 +4746,7 @@ class ArchitectPlaywright:
         attempts = 0
         candidate_count = 0
         enabled_initially = False
+        control_ever_found = False
         node_replaced = False
         previous_fingerprint = None
         self.sendReadinessLatencyMs = None
@@ -4667,6 +4769,7 @@ class ArchitectPlaywright:
                 locator = self.page.get_by_role("button", name=send_name)
                 count_method = getattr(locator, "count", None)
                 candidate_count = int(count_method()) if callable(count_method) else 1
+                control_ever_found = control_ever_found or candidate_count > 0
                 candidates = []
                 for index in range(candidate_count):
                     candidate = locator.nth(index) if callable(getattr(locator, "nth", None)) else locator.last
@@ -4752,6 +4855,8 @@ class ArchitectPlaywright:
                     latencyMs=latency, attempts=attempts, candidateCount=candidate_count,
                     nodeReplacementObserved=node_replaced, enabledInitially=self.sendEnabledInitially,
                     enabledEventually=False)
+        if not control_ever_found:
+            raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE")
         raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED_TIMEOUT")
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:

@@ -37,7 +37,10 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
             if self.kind == "composer":
                 return page.value
             return ""
-        def count(self): return 0
+        def count(self):
+            if self.kind == "composer": return int(composer)
+            if self.kind == "send": return int(send)
+            return 0
         def fill(self, value, **kwargs):
             if not composer: raise RuntimeError("missing composer")
             page.value = value
@@ -62,7 +65,11 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
             self.keyboard = type("Keyboard", (), {"insert_text": lambda _, value: setattr(page, "value", value)})()
         def get_by_role(self, role, **kwargs):
             if role == "textbox": return self.composer_locator
-            if role == "button": return self.send_locator
+            if role == "button":
+                name = kwargs.get("name")
+                if getattr(name, "search", lambda _value: None)("stop"):
+                    return Locator("stop")
+                return self.send_locator
             raise AssertionError(role)
         def locator(self, selector):
             if selector == '[data-message-author-role="assistant"]':
@@ -88,14 +95,14 @@ def test_result_submission_uses_explicit_stages_and_acknowledges_without_live_br
 def test_result_submission_classifies_post_populate_failures():
     from local_orchestrator_watcher import ArchitectPlaywright
     cases = [
-        (_submission_page(send=False), "ARCHITECT_SEND_CONTROL_UNAVAILABLE"),
-        (_submission_page(enabled=False), "ARCHITECT_SEND_CONTROL_DISABLED"),
-        (_submission_page(click_error=RuntimeError("click")), "ARCHITECT_SEND_ACTION_FAILED"),
-        (_submission_page(acknowledge=False), "ARCHITECT_SUBMISSION_ACK_TIMEOUT"),
+        (_submission_page(send=False), "ARCHITECT_SEND_CONTROL_UNAVAILABLE", 1.0),
+        (_submission_page(enabled=False), "ARCHITECT_SEND_CONTROL_DISABLED_TIMEOUT", 1.0),
+        (_submission_page(click_error=RuntimeError("click")), "ARCHITECT_SEND_ACTION_FAILED", 1.0),
+        (_submission_page(acknowledge=False), "ARCHITECT_SUBMISSION_ACK_TIMEOUT", 1.0),
     ]
-    for page, code in cases:
+    for page, code, timeout in cases:
         try:
-            ArchitectPlaywright(page).submit_result_bounded("captured result", timeout=0.2)
+            ArchitectPlaywright(page).submit_result_bounded("captured result", timeout=timeout)
         except ResultSubmissionError as error:
             assert error.code == code
         else:

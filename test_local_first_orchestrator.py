@@ -4880,6 +4880,25 @@ class FakeFastSnapshotWaitBridge(ArchitectPlaywright):
         return entries[-1] if entries else None
 
 
+class FakeCanonicalVisibleWaitBridge(FakeFastSnapshotWaitBridge):
+    def __init__(self, visible_rows, semantic_snapshots=None):
+        super().__init__(semantic_snapshots or [_wait_snapshot([])] * 20)
+        self.visible_rows = iter(visible_rows)
+        self.visible_reads = 0
+        self.runtime_expected_handover_transaction_id = "QUAL-TX-observer"
+        self.runtime_expected_handover_task_id = "QUAL-TASK-observer"
+
+    def current_visible_handover_candidates(self, _transaction_id, _task_id):
+        self.visible_reads += 1
+        return next(self.visible_rows)
+
+
+def _canonical_observer_handover(body="stable synthetic body"):
+    return watcher_module.make_handover_envelope(
+        "QUAL-TX-observer", "QUAL-TASK-observer", body
+    )
+
+
 def _wait_snapshot(entries):
     if not entries:
         empty_hash = hashlib.sha256(b"").hexdigest()
@@ -4955,6 +4974,163 @@ def test_same_assistant_id_text_advance_and_new_identity_remain_detected(monkeyp
     )
     assert new_id["state"] == "COMPLETED"
     assert new_id_bridge.last_wait_diagnostics["candidateLatestAssistantIdentity"] == "assistant-new"
+
+
+def test_canonical_handover_without_legacy_ready_marker_is_found_and_stable(monkeypatch):
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+    response = _canonical_observer_handover()
+    bridge = FakeCanonicalVisibleWaitBridge([[{"text": response}], [{"text": response}]])
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []},
+        poll_interval=0.01, inactivity_timeout=1, hard_timeout=2,
+    )
+    assert "ARCHITECT_HANDOVER_READY" not in response
+    assert watcher_module.parse_handover_envelope(observed["text"]) == {
+        "version": 1, "transactionId": "QUAL-TX-observer", "taskId": "QUAL-TASK-observer",
+        "body": "stable synthetic body",
+    }
+    assert observed["state"] == "COMPLETED"
+    assert bridge.visible_reads == 2
+    assert bridge.last_wait_observer == "CURRENT_VISIBLE_ASSISTANT_DOM"
+    assert bridge.last_wait_diagnostics["completionReason"] == "CANONICAL_HANDOVER_STABLE_VISIBLE_DOM"
+
+
+def test_canonical_handover_semantic_assistant_is_preferred_and_stabilized(monkeypatch):
+    response = _canonical_observer_handover()
+    snapshots = [
+        _wait_snapshot([{"id": "assistant-canonical", "text": response}]),
+        _wait_snapshot([{"id": "assistant-canonical", "text": response}]),
+    ]
+    bridge = FakeCanonicalVisibleWaitBridge([], snapshots)
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []},
+        poll_interval=0.01, inactivity_timeout=1, hard_timeout=2,
+    )
+    assert observed == {"state": "COMPLETED", "text": response}
+    assert bridge.visible_reads == 0
+    assert bridge.last_wait_diagnostics["completionReason"] == "CANONICAL_HANDOVER_STABLE_SEMANTIC_ASSISTANT"
+
+
+def test_changing_canonical_visible_candidate_is_not_completed_prematurely(monkeypatch):
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+    partials = [[{"text": _canonical_observer_handover(f"changing body {index}")}]
+                for index in range(20)]
+    bridge = FakeCanonicalVisibleWaitBridge(partials)
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []},
+        poll_interval=0.01, inactivity_timeout=0.035, hard_timeout=0.2,
+    )
+    assert observed["state"] == "TIMED_OUT"
+    assert bridge.visible_reads >= 2
+    assert bridge.last_wait_diagnostics["completionReason"] == "HARD_DEADLINE"
+
+
+@pytest.mark.parametrize("candidate", [
+    "<HANDOVER>\nversion=1\ntransactionId=QUAL-TX-observer\ntaskId=QUAL-TASK-observer\n\nbody extra\n</HANDOVER> trailing",
+    "<HANDOVER>\nversion=1\ntransactionId=QUAL-TX-wrong\ntaskId=QUAL-TASK-observer\n\nbody\n</HANDOVER>",
+    "<HANDOVER>\nversion=1\ntransactionId=QUAL-TX-observer\ntaskId=QUAL-TASK-wrong\n\nbody\n</HANDOVER>",
+    "<HANDOVER>\nversion=1\ntransactionId=QUAL-TX-observer\ntaskId=QUAL-TASK-observer\n\nbody",
+])
+def test_malformed_incomplete_or_wrong_identity_canonical_candidate_is_rejected(monkeypatch, candidate):
+    ticks = [0.0]
+    monkeypatch.setattr(watcher_module.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: ticks.__setitem__(0, ticks[0] + delay))
+    bridge = FakeCanonicalVisibleWaitBridge([[{"text": candidate}]] * 10)
+    observed = bridge.wait_for_new_response(
+        {"count": 0, "latestMessageId": None, "latestTextHash": None, "entries": []},
+        poll_interval=0.01, inactivity_timeout=0.025, hard_timeout=0.1,
+    )
+    assert observed["state"] == "TIMED_OUT"
+    assert "ARCHITECT_HANDOVER_READY" not in candidate
+
+
+def test_visible_handover_script_excludes_user_composer_controls_and_requires_candidate_shape():
+    script = watcher_module.assistant_visible_handover_candidates_script("QUAL-TX-observer", "QUAL-TASK-observer")
+    assert '[data-message-author-role="user"]' in script
+    assert '[class*="bg-user-message"]' in script
+    assert '[contenteditable="true"]' in script
+    assert "textarea,input" in script
+    assert 'button,[role="button"]' in script
+    assert "const canonicalShape = leafText.includes('<HANDOVER>')" in script
+    assert "const legacyShape = leafText.includes(legacyMarker)" in script
+    assert "if (!canonicalShape && !legacyShape) continue" in script
+    # A user prompt may contain an exact envelope, but the rendered-DOM query
+    # must not traverse a user-message or composer subtree as an assistant turn.
+    assert "!e.closest(excluded)" in script and "clone.querySelectorAll(excluded" in script
+
+
+def test_existing_handover_finder_accepts_canonical_visible_dom_but_excludes_user_and_composer(tmp_path):
+    transaction = "QUAL-TX-observer"
+    task = "QUAL-TASK-observer"
+    response = watcher_module.make_handover_envelope(transaction, task, "visible assistant handover")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.state.update({"rolloverTransactionId": transaction, "rolloverTransactionTaskId": task,
+                          "rolloverHandoverProtocolVersion": 1})
+
+    class Bridge:
+        user_text = response
+        composer_text = response
+        visible_rows = [{"text": response, "identity": "visible-assistant-turn"}]
+        semantic = None
+        visible_reads = 0
+
+        def generation_visible(self):
+            return False
+
+        def latest_assistant_entry(self):
+            return self.semantic
+
+        def _assistant_entries(self):
+            return []
+
+        def current_visible_handover_candidates(self, _tx, _task):
+            self.visible_reads += 1
+            return list(self.visible_rows)
+
+    bridge = Bridge()
+    found = watcher.session_rollover.find_existing_valid_handover(bridge, transaction)
+    assert found == response
+    assert bridge.visible_reads >= 2  # two stable observations
+
+    # An exact copy in the user prompt or composer is not a candidate. The
+    # browser observer excludes those containers before returning rows.
+    bridge.visible_rows = []
+    bridge.visible_reads = 0
+    assert watcher.session_rollover.find_existing_valid_handover(bridge, transaction) is None
+    assert bridge.visible_reads >= 1
+
+
+def test_existing_semantic_handover_scan_precedes_visible_dom_fallback(tmp_path):
+    transaction = "QUAL-TX-observer"
+    task = "QUAL-TASK-observer"
+    response = watcher_module.make_handover_envelope(transaction, task, "semantic assistant handover")
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "state")
+    watcher.state.update({"rolloverTransactionId": transaction, "rolloverTransactionTaskId": task,
+                          "rolloverHandoverProtocolVersion": 1})
+
+    class Bridge:
+        visible_reads = 0
+
+        def generation_visible(self):
+            return False
+
+        def latest_assistant_entry(self):
+            return {"id": "semantic-assistant", "text": response}
+
+        def _assistant_entries(self):
+            return [{"id": "semantic-assistant", "text": response}]
+
+        def current_visible_handover_candidates(self, _tx, _task):
+            self.visible_reads += 1
+            return []
+
+    bridge = Bridge()
+    assert watcher.session_rollover.find_existing_valid_handover(bridge, transaction) == response
+    assert bridge.visible_reads == 0
 
 
 def test_production_shaped_legacy_reemission_waits_through_empty_identity_then_completes(monkeypatch, tmp_path):
@@ -5192,7 +5368,7 @@ class _ArchitectDomPage:
         if script == watcher_module.assistant_latest_entry_script():
             self.events.append("latest_assistant_entry_scan")
             return self.assistants[-1] if self.assistants else None
-        if "const marker = 'ARCHITECT_HANDOVER_READY'" in script and "document.querySelector('main')" in script:
+        if "const legacyMarker = 'ARCHITECT_HANDOVER_READY'" in script and "document.querySelector('main')" in script:
             self.events.append("visible_assistant_dom_scan")
             return list(self.visible_handover_candidates)
         if "window.scrollTo" in script:
