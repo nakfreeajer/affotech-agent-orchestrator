@@ -5505,7 +5505,7 @@ class _ArchitectDomPage:
             self.events.append("fresh_bootstrap_submitted")
             response = "ARCHITECT_SESSION_READY"
             self.events.append("fresh_ready_materialized")
-        elif "previous completed response did not contain" in payload:
+        elif "Formatting-only recovery of the final machine-readable response." in payload:
             self.events.append("exact_task_envelope_repair_submitted")
             self.pending_assistant = envelope("000103", prompt=self.staged_prompt)
             self.defer_pending_materialization_once = True
@@ -7991,6 +7991,11 @@ class _PostDiscussionBridge:
         snapshot = json.dumps(self.entries, separators=(",", ":"), ensure_ascii=False)
         return {"count": len(self.entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": list(self.entries)}
 
+    def assistant_response_baseline(self):
+        result = self.assistant_baseline()
+        result["visibleAssistantCandidates"] = []
+        return result
+
     def latest_assistant_entry(self):
         return self.entries[-1] if self.entries else None
 
@@ -8006,6 +8011,174 @@ class _PostDiscussionBridge:
 
     def close(self):
         return None
+
+
+def test_post_discussion_repair_captures_and_persists_baseline_before_one_send(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    prompt = "complete exact staged prompt\nline two\n"
+    prompt_path = watcher.prompts_dir / "task-1.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_bytes(prompt.encode("utf-8"))
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "task-1", "nextTaskId": "task-1",
+                          "nextPromptPath": str(prompt_path), "postDiscussionEnvelopeRequired": True,
+                          "postDiscussionProtocolTaskId": "task-1", "postDiscussionResumeEpoch": 4})
+    watcher.save()
+    bridge = _PostDiscussionBridge([_discussion_bridge_response("previous decision", "decision")])
+    events = []
+    original_baseline = bridge.assistant_response_baseline
+
+    def capture_baseline():
+        events.append("baseline")
+        return original_baseline()
+
+    bridge.assistant_response_baseline = capture_baseline
+
+    def submit(message):
+        persisted = json.loads(watcher.state_path.read_text(encoding="utf-8"))
+        events.append(("send", persisted, message))
+        bridge.sent.append(message)
+
+    bridge.submit_result_bounded = submit
+    assert watcher.request_post_discussion_envelope_repair(bridge) is True
+    assert events[0] == "baseline" and events[1][0] == "send"
+    persisted, message = events[1][1], events[1][2]
+    assert persisted["postDiscussionProtocolBaseline"]["count"] == 1
+    assert persisted["postDiscussionEnvelopeRepairAttempted"] is True
+    assert "<ORCHESTRATOR_RESULT>" in message
+    assert "classification=<ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT>" in message
+    assert "action=<EXECUTE|HUMAN_REQUIRED|STOP>" in message
+    assert "taskId=task-1" in message
+    assert "documentation=<NOT_REQUIRED|REQUIRED|COMPLETE>" in message
+    assert "promptBegin" in message and "promptEnd" in message
+    assert prompt in message
+    assert "Reproduce the complete staged prompt byte-for-byte" in message
+    assert hashlib.sha256(prompt.encode()).hexdigest().upper() in message
+    assert len(bridge.sent) == 1
+
+
+def test_post_discussion_repair_fails_closed_without_pre_send_baseline(tmp_path):
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"state": "ARCHITECT_RUNNING", "taskId": "task-no-baseline",
+                          "postDiscussionEnvelopeRequired": True, "postDiscussionProtocolTaskId": "task-no-baseline"})
+    bridge = _PostDiscussionBridge([])
+    bridge.assistant_baseline = lambda: {"count": None, "text_hash": "", "entries": []}
+    assert watcher.request_post_discussion_envelope_repair(bridge) is False
+    assert bridge.sent == []
+    assert watcher.state["humanRequiredReason"] == "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE"
+
+
+class _VisibleAssistantWaitBridge(FakeFastSnapshotWaitBridge):
+    def __init__(self, rows_by_poll, generations=None):
+        super().__init__([_wait_snapshot([])] * 64)
+        self.rows_by_poll = iter(rows_by_poll)
+        self.generations = iter(generations or [False] * 64)
+        self.visible_reads = 0
+
+    def current_visible_assistant_response_candidates(self):
+        self.visible_reads += 1
+        try:
+            self._last_visible_rows = next(self.rows_by_poll)
+        except StopIteration:
+            pass
+        return getattr(self, "_last_visible_rows", [])
+
+    def generation_visible(self):
+        try:
+            return next(self.generations)
+        except StopIteration:
+            return False
+
+    def assistant_fast_snapshot(self):
+        try:
+            return super().assistant_fast_snapshot()
+        except StopIteration:
+            self.current = _wait_snapshot([])
+            return self.current
+
+
+def test_post_discussion_waiter_observes_stable_rendered_canonical_result(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    response = envelope("task-rendered", action="STOP")
+    old = {"identity": "assistant-old", "text": "earlier assistant"}
+    new = {"identity": "assistant-new", "text": response}
+    bridge = _VisibleAssistantWaitBridge([[old, new], [old, new]])
+    baseline = {**_wait_snapshot([]), "visibleAssistantCandidates": [old]}
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0.001, hard_timeout=1)
+    assert observed == {"state": "COMPLETED", "text": response}
+    assert parse_orchestrator_result(observed["text"], "task-rendered")["action"] == "STOP"
+    assert bridge.last_wait_diagnostics["completionReason"] == "STABLE_VISIBLE_ASSISTANT_RESPONSE"
+
+
+def test_post_discussion_relationship_accepts_only_waiter_proven_visible_advance(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    response = envelope("task-rendered-relationship", action="STOP")
+    old = {"identity": "assistant-old", "text": "older turn"}
+    new = {"identity": "assistant-new", "text": response}
+    bridge = _VisibleAssistantWaitBridge([[old, new], [old, new]])
+    baseline = {**_wait_snapshot([]), "visibleAssistantCandidates": [old]}
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0.001, hard_timeout=1)
+    watcher = LocalFirstOrchestrator(str(tmp_path), tmp_path / "work")
+    watcher.state.update({"postDiscussionProtocolBaseline": baseline, "postDiscussionProtocolTaskId": "task-rendered-relationship"})
+    assert watcher._post_discussion_baseline_advanced(bridge, observed["text"]) is True
+    assert watcher._post_discussion_baseline_advanced(bridge, observed["text"] + " altered") is False
+
+
+@pytest.mark.parametrize("excluded_source", ["user", "composer", "control"])
+def test_visible_assistant_observer_excludes_user_composer_and_controls(excluded_source):
+    script = watcher_module.assistant_visible_response_candidates_script()
+    assert '[data-message-author-role="user"]' in script
+    assert '[class*="bg-user-message"]' in script
+    assert '[contenteditable="true"]' in script
+    assert "textarea,input" in script
+    assert "button,[role=\"button\"]" in script
+    assert "main.querySelectorAll" in script
+    assert '[data-testid^="conversation-turn-"]' in script
+    assert excluded_source in {"user", "composer", "control"}
+
+
+def test_rendered_malformed_one_line_result_is_observed_but_strict_parser_rejects(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    malformed = "<ORCHESTRATOR_RESULT> taskId=task-rendered classification=ACCEPTED action=EXECUTE documentation=NOT_REQUIRED nextExecutorPrompt=short </ORCHESTRATOR_RESULT>"
+    row = {"identity": "assistant-new", "text": malformed}
+    bridge = _VisibleAssistantWaitBridge([[row], [row]])
+    baseline = {**_wait_snapshot([]), "visibleAssistantCandidates": []}
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0.001, hard_timeout=1)
+    assert observed["state"] == "COMPLETED"
+    with pytest.raises(ValueError, match="ARCHITECT_ENVELOPE_INVALID"):
+        parse_orchestrator_result(observed["text"], "task-rendered")
+
+
+def test_rendered_user_prompt_copy_is_not_a_new_assistant_candidate(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    bridge = _VisibleAssistantWaitBridge([[]])
+    baseline = {**_wait_snapshot([]), "visibleAssistantCandidates": []}
+    observed = bridge.wait_for_new_response(baseline, poll_interval=0.001, inactivity_timeout=0.02, hard_timeout=0.04)
+    assert observed["state"] == "TIMED_OUT"
+    assert bridge.last_wait_diagnostics["completionReason"] in {"HARD_DEADLINE", "NO_PROGRESS_TIMEOUT"}
+
+
+def test_rendered_assistant_changing_candidate_is_not_completed(monkeypatch):
+    class StopPolling(Exception):
+        pass
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: (_ for _ in ()).throw(StopPolling()))
+    rows = {"identity": "assistant-new", "text": envelope("task-changing", action="STOP")}
+    changed = {"identity": "assistant-new", "text": rows["text"] + " changed"}
+    bridge = _VisibleAssistantWaitBridge([[rows], [changed]], generations=[False] * 64)
+    with pytest.raises(StopPolling):
+        bridge.wait_for_new_response({**_wait_snapshot([]), "visibleAssistantCandidates": []}, poll_interval=0.001, hard_timeout=1)
+    assert bridge.last_state == "RUNNING"
+
+
+def test_multiple_new_visible_assistant_candidates_fail_closed(monkeypatch):
+    monkeypatch.setattr(watcher_module.time, "sleep", lambda _delay: None)
+    candidates = [
+        {"identity": "assistant-one", "text": envelope("task-multi", action="STOP")},
+        {"identity": "assistant-two", "text": envelope("task-multi", action="STOP")},
+    ]
+    bridge = _VisibleAssistantWaitBridge([candidates])
+    observed = bridge.wait_for_new_response({**_wait_snapshot([]), "visibleAssistantCandidates": []}, poll_interval=0.001, hard_timeout=1)
+    assert observed["state"] == "BLOCKED"
+    assert bridge.last_wait_diagnostics["completionReason"] == "AMBIGUOUS_VISIBLE_ASSISTANT_RESPONSE_CANDIDATES"
 
 
 def _discussion_bridge_response(text, identifier):
@@ -8653,7 +8826,9 @@ def test_preserved_legacy_transaction_completes_end_to_end_through_public_path(t
     assert len(old_bridge.sent) == 1  # bootstrap only; no resend to old Architect
     assert "Your previous completed response" not in old_bridge.sent[0]
     assert len(fresh_protocol_bridge.sent) == 1
-    assert fresh_protocol_bridge.sent[0].startswith("Your previous completed response")
+    assert fresh_protocol_bridge.sent[0].startswith("Formatting-only recovery of the final machine-readable response.")
+    assert "promptBegin" in fresh_protocol_bridge.sent[0] and "promptEnd" in fresh_protocol_bridge.sent[0]
+    assert "complete staged prompt byte-for-byte" in fresh_protocol_bridge.sent[0]
     assert launches == []
     assert events.count("legacy_handover_validated") == 1
     assert events.count("fresh_created") == 1

@@ -3673,6 +3673,66 @@ def assistant_latest_entry_script() -> str:
             """
 
 
+def assistant_visible_response_candidates_script() -> str:
+    """Read ordered rendered assistant message-content nodes, never transcript text."""
+    return r"""
+      () => {
+        const main = document.querySelector('main');
+        if (!main) return [];
+        const excluded = '[data-message-author-role="user"],[class*="bg-user-message"],' +
+          '[class*="group/user-message"],textarea,input,[contenteditable="true"],' +
+          '[role="textbox"],button,[role="button"],[role="menu"],[role="menuitem"],' +
+          '[aria-hidden="true"],nav,header,footer';
+        const visible = node => {
+          const rect = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          return node.isConnected && rect.width > 0 && rect.height > 0 &&
+            style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+        };
+        const allowed = node => !node.closest(excluded) &&
+          !!node.closest('[data-message-author-role="assistant"],[data-message-id],[data-testid^="conversation-turn-"]') &&
+          visible(node);
+        let nodes = [...main.querySelectorAll('[data-message-content]')].filter(allowed);
+        let source = 'DATA_MESSAGE_CONTENT';
+        if (!nodes.length) {
+          nodes = [...main.querySelectorAll('.text-size-chat.whitespace-pre-wrap')].filter(allowed);
+          source = 'TEXT_SIZE_CHAT';
+        }
+        if (!nodes.length) {
+          nodes = [...main.querySelectorAll('[class*="MarkdownRoot-"]')].filter(allowed);
+          source = 'MARKDOWN_ROOT';
+        }
+        const clean = node => {
+          const clone = node.cloneNode(true);
+          clone.querySelectorAll(excluded + ',script,style,svg').forEach(child => child.remove());
+          return clone.innerText || clone.textContent || '';
+        };
+        const all = [...main.querySelectorAll('*')];
+        const unique = [...new Set(nodes)].filter(node => {
+          const text = clean(node);
+          // Prefer the innermost selected content root when wrappers are nested.
+          return !nodes.some(other => other !== node && node.contains(other) && clean(other) === text);
+        });
+        return unique.map((node, ordinal) => {
+          const text = clean(node);
+          let turn = node;
+          while (turn && turn !== main && !turn.hasAttribute('data-message-id') &&
+                 !turn.hasAttribute('data-testid') && !turn.classList.contains('group')) {
+            turn = turn.parentElement;
+          }
+          const explicit = turn && turn !== main
+            ? (turn.getAttribute('data-message-id') || turn.getAttribute('data-testid')) : null;
+          return {
+            identity: explicit || ('rendered-assistant-order:' + ordinal),
+            domOrder: all.indexOf(node),
+            source,
+            text
+          };
+        }).filter(row => typeof row.text === 'string' && row.text.length > 0);
+      }
+    """
+
+
 def assistant_visible_handover_candidates_script(transaction_id: str, task_id: str) -> str:
     """Return bounded rendered transcript candidates for canonical or legacy handovers.
 
@@ -3990,6 +4050,20 @@ class ArchitectPlaywright:
         entries = self._assistant_entries()
         snapshot = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
         return {"count": len(entries), "text_hash": hashlib.sha256(snapshot.encode()).hexdigest(), "entries": entries}
+
+    def assistant_response_baseline(self) -> dict[str, Any]:
+        """Bind semantic and rendered assistant observations before a response request."""
+        baseline = self.assistant_baseline()
+        baseline["visibleAssistantCandidates"] = self.current_visible_assistant_response_candidates()
+        return baseline
+
+    def current_visible_assistant_response_candidates(self) -> list[dict[str, Any]]:
+        """Read ordered assistant content roots from the rendered transcript only."""
+        evaluate = getattr(getattr(self, "page", None), "evaluate", None)
+        if not callable(evaluate):
+            return []
+        result = evaluate(assistant_visible_response_candidates_script())
+        return [item for item in result if isinstance(item, dict) and isinstance(item.get("text"), str)] if isinstance(result, list) else []
 
     def assistant_count(self) -> int:
         return self.page.locator('[data-message-author-role="assistant"]').count()
@@ -4399,6 +4473,9 @@ class ArchitectPlaywright:
                 "candidateLatestAssistantIdentity": current.get("latestMessageId") if current else None,
                 "candidateLatestAssistantSignature": current.get("latestTextHash") if current else None,
                 "candidateTextSha256": digest if selected_text is not None else None,
+                "visibleResponseCandidateIdentity": visible_response_signature[0] if visible_response_signature else None,
+                "visibleResponseCandidateSha256": visible_response_signature[1] if visible_response_signature else None,
+                "visibleResponseStabilityPollCount": visible_response_stability_polls,
                 "generationVisibleLastSample": last_generation_visible,
                 "generationCheckSkippedForPendingStabilityPoll": generation_check_skipped,
                 "stabilityPollCount": stable_polls,
@@ -4436,6 +4513,9 @@ class ArchitectPlaywright:
         visible_handover_hash = None
         visible_handover_text = None
         visible_handover_stability_polls = 0
+        visible_response_signature = None
+        visible_response_text = None
+        visible_response_stability_polls = 0
 
         def expected_handover_identity() -> tuple[str, str]:
             watcher = getattr(self, "runtime_watcher", None)
@@ -4673,6 +4753,77 @@ class ArchitectPlaywright:
                 visible_handover_hash = None
                 visible_handover_text = None
                 visible_handover_stability_polls = 0
+            # Rendered assistant observation is a bounded fallback only when
+            # semantic history has no candidate. The exact returned text is
+            # still subject to the caller's strict protocol parser.
+            baseline_visible = baseline.get("visibleAssistantCandidates")
+            visible_reader = getattr(self, "current_visible_assistant_response_candidates", None)
+            if (not identity_changed and isinstance(baseline_visible, list)
+                    and callable(visible_reader) and int(current.get("count", 0) or 0) == 0):
+                try:
+                    visible_candidates = visible_reader()
+                except Exception:
+                    visible_candidates = []
+
+                def visible_signature(row: Any) -> tuple[str, str]:
+                    row = row if isinstance(row, dict) else {}
+                    row_text = row.get("text") if isinstance(row.get("text"), str) else ""
+                    return (str(row.get("identity") or ""), hashlib.sha256(row_text.encode("utf-8")).hexdigest())
+
+                baseline_signatures = [visible_signature(row) for row in baseline_visible]
+                current_signatures = [visible_signature(row) for row in visible_candidates]
+                prefix_matches = (len(current_signatures) >= len(baseline_signatures)
+                                  and current_signatures[:len(baseline_signatures)] == baseline_signatures)
+                new_candidates = visible_candidates[len(baseline_visible):] if prefix_matches else []
+                if len(new_candidates) > 1:
+                    self.last_state = "BLOCKED"
+                    return finish({"state": "BLOCKED", "text": ""},
+                                  "AMBIGUOUS_VISIBLE_ASSISTANT_RESPONSE_CANDIDATES", current, "",
+                                  generation_check_skipped)
+                if len(new_candidates) == 1:
+                    candidate = new_candidates[0]
+                    candidate_text = candidate.get("text")
+                    candidate_id = str(candidate.get("identity") or "")
+                    if isinstance(candidate_text, str) and candidate_text:
+                        signature = (candidate_id, hashlib.sha256(candidate_text.encode("utf-8")).hexdigest())
+                        if signature == visible_response_signature and candidate_text == visible_response_text:
+                            visible_response_stability_polls += 1
+                        else:
+                            visible_response_signature = signature
+                            visible_response_text = candidate_text
+                            visible_response_stability_polls = 1
+                        try:
+                            generation_now = self.generation_visible()
+                        except Exception:
+                            generation_now = True
+                        last_generation_visible = bool(generation_now)
+                        if generation_now:
+                            last_progress_at = time.monotonic()
+                            visible_response_stability_polls = 0
+                            self.last_state = "RUNNING"
+                        elif visible_response_stability_polls >= 2:
+                            self.last_state = "COMPLETED"
+                            runtime_log(
+                                getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                                "ARCHITECT_VISIBLE_ASSISTANT_RESPONSE_OBSERVED",
+                                getattr(getattr(self, "runtime_watcher", None), "state", None),
+                                candidateIdentity=candidate_id,
+                                candidateTextSha256=signature[1],
+                                stabilityPollCount=visible_response_stability_polls,
+                            )
+                            return finish({"state": "COMPLETED", "text": candidate_text},
+                                          "STABLE_VISIBLE_ASSISTANT_RESPONSE", current,
+                                          candidate_text, False)
+                        if visible_response_stability_polls < 2 or generation_now:
+                            self.last_state = "RUNNING"
+                            mark_watcher_liveness(getattr(self, "runtime_watcher", None), "WAITER_VISIBLE_RESPONSE_SLEEP_BEGIN")
+                            time.sleep(bounded_sleep_delay())
+                            mark_watcher_liveness(getattr(self, "runtime_watcher", None), "WAITER_VISIBLE_RESPONSE_SLEEP_COMPLETE")
+                            continue
+                else:
+                    visible_response_signature = None
+                    visible_response_text = None
+                    visible_response_stability_polls = 0
             stable_hash = None
             stable_polls = 0
             if identity_changed:
@@ -7663,6 +7814,37 @@ class LocalFirstOrchestrator:
                     return True
                 if current_hash and current_hash != text_hash:
                     return True
+        # Semantic assistant history can remain empty on a rendered-only
+        # ChatGPT turn. Accept relationship evidence only when the waiter has
+        # already proven two stable visible polls for one candidate appended
+        # after the persisted pre-send visible baseline, and the exact returned
+        # text still matches that candidate.
+        baseline_visible = baseline.get("visibleAssistantCandidates")
+        visible_reader = getattr(bridge, "current_visible_assistant_response_candidates", None)
+        diagnostics = getattr(bridge, "last_wait_diagnostics", None)
+        if isinstance(baseline_visible, list) and callable(visible_reader) and isinstance(diagnostics, dict):
+            if (diagnostics.get("completionReason") != "STABLE_VISIBLE_ASSISTANT_RESPONSE"
+                    or not isinstance(diagnostics.get("visibleResponseStabilityPollCount"), int)
+                    or diagnostics["visibleResponseStabilityPollCount"] < 2
+                    or diagnostics.get("candidateTextSha256") != hashlib.sha256(response.encode("utf-8")).hexdigest()):
+                return False
+            try:
+                candidates = visible_reader()
+            except Exception:
+                return False
+
+            def signature(row: Any) -> tuple[str, str]:
+                row = row if isinstance(row, dict) else {}
+                text = row.get("text") if isinstance(row.get("text"), str) else ""
+                return str(row.get("identity") or ""), hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+            baseline_signatures = [signature(row) for row in baseline_visible]
+            current_signatures = [signature(row) for row in candidates]
+            if (len(current_signatures) == len(baseline_signatures) + 1
+                    and current_signatures[:len(baseline_signatures)] == baseline_signatures):
+                candidate = candidates[-1]
+                if isinstance(candidate, dict) and candidate.get("text") == response:
+                    return True
         return False
 
     def _exact_staged_prompt_recovery_task(self, allow_human_required: bool = False) -> str | None:
@@ -8232,27 +8414,75 @@ class LocalFirstOrchestrator:
             self.save()
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="STAGED_PROMPT_EVIDENCE_INVALID")
             return False
-        message = "\n".join([
-            "Your previous completed response did not contain the required final ORCHESTRATOR_RESULT envelope.",
-            "Do not redo or re-evaluate the underlying task or human decision.",
-            "Return only the machine-readable envelope for your already-completed decision, preserving classification, action, documentation disposition, and the complete next Executor prompt where applicable.",
+        staged_prompt = None
+        staged_bytes = None
+        prompt_path_value = self.state.get("nextPromptPath")
+        if prompt_path_value:
+            try:
+                staged_bytes = Path(str(prompt_path_value)).read_bytes()
+                staged_prompt = staged_bytes.decode("utf-8")
+            except (OSError, UnicodeError):
+                if self.state.get("postDiscussionProtocolTransactionId"):
+                    self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID"})
+                    self.save()
+                    return False
+        prompt_identity = []
+        if staged_bytes is not None:
+            prompt_identity = [
+                f"Expected staged prompt SHA256: {hashlib.sha256(staged_bytes).hexdigest().upper()}",
+                f"Expected staged prompt byte length: {len(staged_bytes)}",
+                f"Expected staged prompt character length: {len(staged_prompt or '')}",
+            ]
+        message_lines = [
+            "Formatting-only recovery of the final machine-readable response.",
+            "Do not redo, reconsider, or re-evaluate the completed decision or task.",
+            "Return only the complete final machine-readable envelope below; do not add commentary or Markdown fences.",
+            "Preserve classification, action, documentation disposition, and taskId exactly as in your already-completed decision immediately before this request.",
+            f"The exact required taskId is {task_id}.",
+            "Use this exact field order and field names, which are required by the parser:",
+            "<ORCHESTRATOR_RESULT>",
+            "classification=<ACCEPTED|BLOCKED|INCONCLUSIVE|NO_NEW_REPORT>",
+            "action=<EXECUTE|HUMAN_REQUIRED|STOP>",
             f"taskId={task_id}",
-            "The envelope must be the final content of the response.",
-        ])
-        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_REQUESTED", self.state, taskId=task_id, resumeEpoch=epoch)
+            "documentation=<NOT_REQUIRED|REQUIRED|COMPLETE>",
+            "promptBegin",
+            "<for action=EXECUTE, reproduce the COMPLETE existing staged Executor prompt exactly; otherwise leave the prompt empty>",
+            "promptEnd",
+            "</ORCHESTRATOR_RESULT>",
+            "For action=EXECUTE, do not summarize, abbreviate, omit, or regenerate an equivalent prompt. Reproduce the complete staged prompt byte-for-byte in logical text between promptBegin and promptEnd.",
+            "The envelope must be the entire final response.",
+        ]
+        message_lines.extend(prompt_identity)
+        if staged_prompt is not None:
+            message_lines.extend([
+                "The following is the exact staged prompt reference. Use its complete contents as the prompt field when action=EXECUTE; this reference is not a request to change the decision:",
+                "BEGIN_EXACT_STAGED_PROMPT_REFERENCE",
+                staged_prompt,
+                "END_EXACT_STAGED_PROMPT_REFERENCE",
+            ])
+        message = "\n".join(message_lines)
         sender = getattr(bridge, "submit_result_bounded", None) or getattr(bridge, "submit_result", None)
         if not callable(sender):
             self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"})
             self.save()
             return False
+        baseline_reader = getattr(bridge, "assistant_response_baseline", None)
+        if not callable(baseline_reader):
+            baseline_reader = getattr(bridge, "assistant_baseline", None)
         try:
-            sender(message)
-        except Exception as error:
-            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED"})
+            baseline = baseline_reader() if callable(baseline_reader) else None
+        except Exception:
+            baseline = None
+        if not (isinstance(baseline, dict) and isinstance(baseline.get("count"), int)
+                and baseline["count"] >= 0 and isinstance(baseline.get("text_hash"), str)
+                and bool(baseline["text_hash"])):
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_RELATIONSHIP_INCONCLUSIVE"})
             self.save()
-            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, errorClass=type(error).__name__)
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, reason="PRE_SEND_BASELINE_UNPROVEN")
             return False
-        baseline = bridge.assistant_baseline() if callable(getattr(bridge, "assistant_baseline", None)) else self.state.get("postDiscussionProtocolBaseline")
+        # Persist the one-shot intent and pre-send relationship baseline before
+        # crossing the external submission boundary. Restart can reconcile but
+        # cannot duplicate this user-visible request.
         self.state.update({
             "state": "ARCHITECT_RUNNING",
             "postDiscussionEnvelopeRepairAttempted": True,
@@ -8261,8 +8491,19 @@ class LocalFirstOrchestrator:
             "postDiscussionEnvelopeRepairEpoch": epoch,
             "architectBaseline": baseline,
             "postDiscussionProtocolBaseline": baseline,
+            "postDiscussionEnvelopeRepairState": "REQUESTING",
             "humanRequiredReason": None,
         })
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_REQUESTED", self.state, taskId=task_id, resumeEpoch=epoch)
+        try:
+            sender(message)
+        except Exception as error:
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionProtocolFailure": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED", "postDiscussionEnvelopeRepairAwaiting": False, "postDiscussionEnvelopeRepairState": "SUBMISSION_AMBIGUOUS"})
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_ENVELOPE_REPAIR_FAILED", self.state, taskId=task_id, errorClass=type(error).__name__)
+            return False
+        self.state["postDiscussionEnvelopeRepairState"] = "SUBMITTED"
         self.save()
         return True
 
