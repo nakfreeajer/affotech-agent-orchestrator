@@ -4305,6 +4305,138 @@ def test_visible_user_duplicate_or_ambiguous_content_fails_closed(monkeypatch, b
     assert page.send_attempts == 0
 
 
+class _FreshBootstrapDiagnosticLogger:
+    runtime_context = "QUALIFICATION"
+    def __init__(self): self.events = []
+    def log(self, _level, message, extra): self.events.append((extra["event"], message))
+
+
+class _FreshBootstrapFakeClock:
+    now = 0.0
+    @classmethod
+    def monotonic(cls): return cls.now
+    @classmethod
+    def sleep(cls, delay): cls.now += delay
+
+
+def _fresh_reconcile_bridge(monkeypatch, logger=None):
+    _FreshBootstrapFakeClock.now = 0.0
+    monkeypatch.setattr(watcher_module.time, "monotonic", _FreshBootstrapFakeClock.monotonic)
+    monkeypatch.setattr(watcher_module.time, "sleep", _FreshBootstrapFakeClock.sleep)
+    bridge = ArchitectPlaywright(_VisibleUserContentPage([]))
+    bridge.runtime_logger = logger
+    bridge.runtime_watcher = type("Watcher", (), {"runtime_run_id": "test", "state": {}})()
+    return bridge
+
+
+def test_fresh_bootstrap_diagnostic_normal_exact_succeeds(monkeypatch):
+    payload = "exact bootstrap secret"
+    logger = _FreshBootstrapDiagnosticLogger()
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    bridge.user_message_texts = lambda: [payload]
+    bridge.current_visible_user_message_texts = lambda: []
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.2) == "SENT"
+    assert [event for event, _ in logger.events].count("FRESH_BOOTSTRAP_RECONCILIATION_POLL") == 2
+    assert any("disposition=SENT" in message for event, message in logger.events
+               if event == "FRESH_BOOTSTRAP_RECONCILIATION_COMPLETE")
+    assert all(payload not in message for _, message in logger.events)
+
+
+def test_fresh_bootstrap_late_qualification_observation_keeps_ambiguous_and_never_resends(monkeypatch):
+    payload = "late exact bootstrap secret"
+    logger = _FreshBootstrapDiagnosticLogger()
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    calls = {"semantic": 0, "visible": 0, "send": 0}
+    def semantic(): calls["semantic"] += 1; return []
+    def visible():
+        calls["visible"] += 1
+        return [payload] if calls["visible"] >= 6 else []
+    bridge.user_message_texts = semantic
+    bridge.current_visible_user_message_texts = visible
+    bridge.submit_result = lambda *_args, **_kwargs: calls.update(send=calls["send"] + 1)
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.2) == "AMBIGUOUS"
+    events = [event for event, _ in logger.events]
+    assert any("disposition=AMBIGUOUS" in message for event, message in logger.events
+               if event == "FRESH_BOOTSTRAP_RECONCILIATION_COMPLETE")
+    assert "FRESH_BOOTSTRAP_LATE_OBSERVATION_STABLE" in events
+    assert calls["send"] == 0
+    assert getattr(bridge, "sendActionAcknowledged", False) is not True
+    assert all(payload not in message for _, message in logger.events)
+    stable = next(message for event, message in logger.events if event == "FRESH_BOOTSTRAP_LATE_OBSERVATION_STABLE")
+    assert "firstExactBootstrapObservedSource=VISIBLE_USER_DOM" in stable
+
+
+def test_fresh_bootstrap_late_observation_expires_when_absent(monkeypatch):
+    logger = _FreshBootstrapDiagnosticLogger()
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    bridge.user_message_texts = lambda: []
+    bridge.current_visible_user_message_texts = lambda: []
+    assert bridge.reconcile_fresh_bootstrap_delivery("absent", timeout=0.1) == "AMBIGUOUS"
+    complete = next(message for event, message in logger.events if event == "FRESH_BOOTSTRAP_LATE_OBSERVATION_COMPLETE")
+    assert "found=False" in complete and any(f"pollCount={count}" in complete for count in (80, 81, 82))
+
+
+def test_fresh_bootstrap_late_observation_recovers_after_transient_visible_exception(monkeypatch):
+    payload = "late after transient"
+    logger = _FreshBootstrapDiagnosticLogger()
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    calls = {"visible": 0}
+    bridge.user_message_texts = lambda: []
+    def visible():
+        calls["visible"] += 1
+        if calls["visible"] == 3: raise RuntimeError("temporary reader failure")
+        return [payload] if calls["visible"] >= 4 else []
+    bridge.current_visible_user_message_texts = visible
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.1) == "AMBIGUOUS"
+    polls = [message for event, message in logger.events if event == "FRESH_BOOTSTRAP_LATE_OBSERVATION_POLL"]
+    assert "visibleReaderExceptionClass=RuntimeError" in polls[0]
+    assert any("observedExactMatch=True" in message for message in polls[1:])
+    assert any(event == "FRESH_BOOTSTRAP_LATE_OBSERVATION_STABLE" for event, _ in logger.events)
+
+
+def test_fresh_bootstrap_transient_reader_exceptions_are_recorded_and_later_observation_succeeds(monkeypatch):
+    payload = "transient exact payload"
+    logger = _FreshBootstrapDiagnosticLogger()
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    calls = {"semantic": 0, "visible": 0}
+    def semantic():
+        calls["semantic"] += 1
+        if calls["semantic"] == 1: raise LookupError("transient")
+        return []
+    def visible():
+        calls["visible"] += 1
+        if calls["visible"] == 1: raise ValueError("transient")
+        return [payload]
+    bridge.user_message_texts = semantic
+    bridge.current_visible_user_message_texts = visible
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.2) == "SENT"
+    polls = [message for event, message in logger.events if event == "FRESH_BOOTSTRAP_RECONCILIATION_POLL"]
+    assert "semanticReaderExceptionClass=LookupError" in polls[0]
+    assert "visibleReaderExceptionClass=ValueError" in polls[0]
+    assert any("selectedSource=VISIBLE_USER_DOM" in message and "observedExactMatch=True" in message for message in polls)
+
+
+def test_fresh_bootstrap_duplicate_exact_candidates_stay_ambiguous(monkeypatch):
+    payload = "duplicate exact"
+    logger = _FreshBootstrapDiagnosticLogger()
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    bridge.user_message_texts = lambda: [payload, payload]
+    bridge.current_visible_user_message_texts = lambda: []
+    assert bridge.reconcile_fresh_bootstrap_delivery(payload, timeout=0.1) == "AMBIGUOUS"
+    assert getattr(bridge, "sendActionAcknowledged", False) is not True
+    assert not any(event == "FRESH_BOOTSTRAP_DELIVERY_RECONCILED" for event, _ in logger.events)
+
+
+def test_fresh_bootstrap_late_observation_disabled_outside_qualification(monkeypatch):
+    logger = _FreshBootstrapDiagnosticLogger()
+    logger.runtime_context = "PRODUCTION"
+    bridge = _fresh_reconcile_bridge(monkeypatch, logger)
+    bridge.user_message_texts = lambda: []
+    bridge.current_visible_user_message_texts = lambda: []
+    assert bridge.reconcile_fresh_bootstrap_delivery("absent", timeout=0.1) == "AMBIGUOUS"
+    assert not any(event.startswith("FRESH_BOOTSTRAP_LATE_OBSERVATION") for event, _ in logger.events)
+
+
 def test_semantic_user_content_node_is_preferred_to_cosmetic_class_fallback():
     payload = "semantic content"
     page = _VisibleUserContentPage([{

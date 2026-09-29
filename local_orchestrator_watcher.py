@@ -4371,21 +4371,43 @@ class ArchitectPlaywright:
 
     def reconcile_fresh_bootstrap_delivery(self, payload: str, timeout: float = 2.0) -> str:
         """Observe an ambiguous fresh bootstrap without ever submitting it again."""
-        deadline = time.monotonic() + max(0.0, min(float(timeout), 5.0))
+        started = time.monotonic()
+        deadline = started + max(0.0, min(float(timeout), 5.0))
+        deadline_ms = max(0.0, (deadline - started) * 1000.0)
         target = normalize_prompt(payload)
+        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         prior_identity = None
         stable = 0
+        poll = 0
+        semantic_errors = 0
+        visible_errors = 0
+        disposition = "AMBIGUOUS"
+        logger = getattr(self, "runtime_logger", None)
+        run_id = getattr(getattr(self, "runtime_watcher", None), "runtime_run_id", None)
+        state = getattr(getattr(self, "runtime_watcher", None), "state", None)
         while True:
+            poll += 1
+            semantic_error = None
+            visible_error = None
             try:
                 semantic = self.user_message_texts()
-            except Exception:
+            except Exception as error:
                 semantic = []
+                semantic_error = type(error).__name__
+                semantic_errors += 1
+            try:
+                visible = self.current_visible_user_message_texts()
+            except Exception as error:
+                visible = []
+                visible_error = type(error).__name__
+                visible_errors += 1
+            semantic_matches = [text for text in semantic if isinstance(text, str) and normalize_prompt(text) == target]
+            visible_matches = [text for text in visible if isinstance(text, str) and normalize_prompt(text) == target]
             if semantic:
-                matches = [text for text in semantic if isinstance(text, str) and normalize_prompt(text) == target]
+                matches = semantic_matches
                 source = "SEMANTIC_HISTORY"
             else:
-                visible = self.current_visible_user_message_texts()
-                matches = [text for text in visible if isinstance(text, str) and normalize_prompt(text) == target]
+                matches = visible_matches
                 source = "VISIBLE_USER_DOM"
             # One matching message proves delivery. More than one is a
             # duplicate-send condition and must not be silently accepted.
@@ -4393,17 +4415,104 @@ class ArchitectPlaywright:
             signature = (source, target if observed else None)
             stable = stable + 1 if observed and signature == prior_identity else (1 if observed else 0)
             prior_identity = signature
+            runtime_log(logger, run_id, "FRESH_BOOTSTRAP_RECONCILIATION_POLL", state,
+                        elapsedMs=round((time.monotonic() - started) * 1000, 3), poll=poll,
+                        semanticUserMessageCount=len(semantic), semanticExactMatchCount=len(semantic_matches),
+                        visibleUserMessageCount=len(visible), visibleExactMatchCount=len(visible_matches),
+                        selectedSource=source, observedExactMatch=observed, stabilityCount=stable,
+                        semanticReaderExceptionClass=semantic_error,
+                        visibleReaderExceptionClass=visible_error, deadlineMs=round(deadline_ms, 3),
+                        payloadLength=len(payload), payloadSha256=payload_hash)
             if stable >= 2:
                 self.sendActionAcknowledged = True
-                runtime_log(getattr(self, "runtime_logger", None), getattr(getattr(self, "runtime_watcher", None), "runtime_run_id", None),
-                            "FRESH_BOOTSTRAP_DELIVERY_RECONCILED", getattr(getattr(self, "runtime_watcher", None), "state", None),
-                            observer=source, payloadSha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                disposition = "SENT"
+                runtime_log(logger, run_id,
+                            "FRESH_BOOTSTRAP_DELIVERY_RECONCILED", state,
+                            observer=source, payloadSha256=payload_hash,
                             stableObservations=stable, resubmitted=False)
-                return "SENT"
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return "AMBIGUOUS"
+                break
             time.sleep(min(0.1, remaining))
+        runtime_log(logger, run_id, "FRESH_BOOTSTRAP_RECONCILIATION_COMPLETE", state,
+                    disposition=disposition, deadlineMs=round(deadline_ms, 3), pollCount=poll,
+                    semanticObservationExceptionCount=semantic_errors,
+                    visibleObservationExceptionCount=visible_errors, resubmitted=False,
+                    payloadLength=len(payload), payloadSha256=payload_hash)
+        if disposition == "AMBIGUOUS" and getattr(logger, "runtime_context", None) == "QUALIFICATION":
+            self._observe_late_fresh_bootstrap(payload, target, payload_hash, started)
+        return disposition
+
+    def _observe_late_fresh_bootstrap(self, payload: str, target: str, payload_hash: str,
+                                      reconciliation_started: float) -> None:
+        """Qualification-only read-only timing probe after normal reconciliation expires."""
+        late_started = time.monotonic()
+        deadline = late_started + 8.0
+        logger = getattr(self, "runtime_logger", None)
+        run_id = getattr(getattr(self, "runtime_watcher", None), "runtime_run_id", None)
+        state = getattr(getattr(self, "runtime_watcher", None), "state", None)
+        poll = 0
+        stable = 0
+        prior = None
+        first_at = None
+        first_source = None
+        semantic_errors = 0
+        visible_errors = 0
+        found = False
+        while True:
+            poll += 1
+            semantic_error = visible_error = None
+            try:
+                semantic = self.user_message_texts()
+            except Exception as error:
+                semantic = []
+                semantic_error = type(error).__name__
+                semantic_errors += 1
+            try:
+                visible = self.current_visible_user_message_texts()
+            except Exception as error:
+                visible = []
+                visible_error = type(error).__name__
+                visible_errors += 1
+            semantic_matches = [item for item in semantic if isinstance(item, str) and normalize_prompt(item) == target]
+            visible_matches = [item for item in visible if isinstance(item, str) and normalize_prompt(item) == target]
+            source, matches = (("SEMANTIC_HISTORY", semantic_matches) if semantic
+                               else ("VISIBLE_USER_DOM", visible_matches))
+            exact = len(matches) == 1
+            now_ms = round((time.monotonic() - reconciliation_started) * 1000, 3)
+            if exact and first_at is None:
+                first_at, first_source = now_ms, source
+            signature = (source, target) if exact else None
+            stable = stable + 1 if exact and signature == prior else (1 if exact else 0)
+            prior = signature
+            runtime_log(logger, run_id, "FRESH_BOOTSTRAP_LATE_OBSERVATION_POLL", state,
+                        elapsedMs=now_ms, poll=poll, semanticUserMessageCount=len(semantic),
+                        semanticExactMatchCount=len(semantic_matches), visibleUserMessageCount=len(visible),
+                        visibleExactMatchCount=len(visible_matches), selectedSource=source,
+                        observedExactMatch=exact, stabilityCount=stable,
+                        semanticReaderExceptionClass=semantic_error,
+                        visibleReaderExceptionClass=visible_error, deadlineMs=8000,
+                        payloadLength=len(payload), payloadSha256=payload_hash)
+            if stable >= 2:
+                found = True
+                runtime_log(logger, run_id, "FRESH_BOOTSTRAP_LATE_OBSERVATION_STABLE", state,
+                            firstExactBootstrapObservedAtMs=first_at,
+                            firstExactBootstrapObservedSource=first_source,
+                            stableConfirmationAtMs=now_ms, stableConfirmationPoll=poll,
+                            stableObservations=stable, resubmitted=False,
+                            payloadLength=len(payload), payloadSha256=payload_hash)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+        runtime_log(logger, run_id, "FRESH_BOOTSTRAP_LATE_OBSERVATION_COMPLETE", state,
+                    found=found, firstExactBootstrapObservedAtMs=first_at,
+                    firstExactBootstrapObservedSource=first_source,
+                    pollCount=poll, semanticObservationExceptionCount=semantic_errors,
+                    visibleObservationExceptionCount=visible_errors, deadlineMs=8000,
+                    resubmitted=False, payloadLength=len(payload), payloadSha256=payload_hash)
 
     def control_user_message_count(self) -> int:
         return self.page.locator('[data-message-author-role="user"]').count()
