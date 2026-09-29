@@ -10025,6 +10025,7 @@ def _epoch4_sent_incident_fixture(tmp_path):
     project = Path(__file__).resolve().parent
     state_dir = tmp_path / "orchestrator"
     watcher = LocalFirstOrchestrator(str(project), state_dir)
+    watcher.prompt_artifact_repository_root = tmp_path
     prompt = watcher.prompts_dir / "000103.txt"
     prompt.parent.mkdir(parents=True, exist_ok=True)
     prompt.write_bytes(prompt_bytes)
@@ -10141,6 +10142,7 @@ def test_epoch4_sent_restart_public_path_and_one_shot_operator_continuation_e2e(
 
     # A new process object reloads the exact persisted pre-run state.
     watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), state_dir)
+    watcher.prompt_artifact_repository_root = tmp_path
     launches = []
     launch = lambda received, _result: launches.append(received) or type("Process", (), {"pid": 91003})()
 
@@ -10215,6 +10217,7 @@ def test_epoch4_sent_restart_public_path_and_one_shot_operator_continuation_e2e(
 
     old_page.context.new_page = capture_fresh_page
     watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), state_dir)
+    watcher.prompt_artifact_repository_root = tmp_path
     assert watcher.state["rolloverRecoveryStartedAt"] == now
     assert watcher_module.run_next_prompt_ready_once(
         watcher, launch, "isolated", watcher.discussion_pause_active,
@@ -10294,6 +10297,7 @@ def test_epoch4_sent_stale_timestamp_existing_response_public_recovery_no_resend
     # Restart from persisted epoch-4/SENT state; response is visible only in the
     # controlled page DOM, so the real reconciliation path must consume it.
     watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
+    watcher.prompt_artifact_repository_root = tmp_path
     launches = []
     launch = lambda received, _result: launches.append(received) or type("Process", (), {"pid": 91003})()
     persisted = []
@@ -10437,6 +10441,7 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
     monkeypatch.setattr(watcher_module.time, "monotonic", lambda: virtual_time[0])
     monkeypatch.setattr(watcher_module.time, "sleep", lambda delay: virtual_time.__setitem__(0, virtual_time[0] + max(float(delay), 0.01)))
     watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
+    watcher.prompt_artifact_repository_root = tmp_path
     saved = []
     persist = watcher.session_rollover.persist_validated_handover
 
@@ -10769,6 +10774,8 @@ def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_pa
     assert len(protocol_bridge.sent) == 1
     assert len(launches) == 1 and launches[0].encode("utf-8") == prompt_bytes
     assert watcher.state["nextTaskId"] == "000103"
+    assert Path(watcher.state["promptArtifactPath"]).is_relative_to(tmp_path / ".agent-work" / "prompts")
+    assert Path(watcher.state["promptArtifactPath"]).read_bytes() == prompt_bytes
     assert watcher.state["rolloverRecoveryEpoch"] == 5
     assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
     assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
@@ -10984,6 +10991,7 @@ def test_epoch5_visible_handover_absent_stays_human_required_without_retry_or_fr
     attached = []
     monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(lambda _endpoint, conversation_id=None: attached.append(conversation_id) or ArchitectPlaywright(old)))
     watcher = LocalFirstOrchestrator(str(Path(__file__).resolve().parent), original.state_dir)
+    watcher.prompt_artifact_repository_root = tmp_path
     launches = []
     assert watcher_module.run_human_required_startup_once(watcher, lambda *args: launches.append(args)) == "HUMAN_REQUIRED"
     assert watcher.state["humanRequiredReason"] == "LEGACY_SENT_HANDOVER_RESPONSE_UNAVAILABLE"
@@ -11054,9 +11062,14 @@ def test_epoch4_sent_response_retry_authorization_rejects_mismatched_evidence(tm
     assert prompt.is_file()
 
 
-def test_qualification_synthetic_main_loop_uses_isolated_state_and_fake_launch(tmp_path):
+def test_qualification_synthetic_main_loop_uses_isolated_state_and_fake_launch(tmp_path, monkeypatch):
     # Bootstrap discovery reads repository identity but receives only the
     # harness-created synthetic state path; it never opens production state.
+    persist_artifact = watcher_module.persist_verified_prompt_artifact
+    monkeypatch.setattr(
+        watcher_module, "persist_verified_prompt_artifact",
+        lambda _repository_root, **kwargs: persist_artifact(tmp_path, **kwargs),
+    )
     result = qualification_module.run(Path(__file__).parent)
     assert result["runtimeContext"] == "QUALIFICATION"
     assert result["realBrowser"] is False

@@ -21,6 +21,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from rollover_state_machine import RolloverAction, RolloverDecision, RolloverObservations, evaluate_rollover_state
+from prompt_artifacts import persist_verified_prompt_artifact
 
 COMPLETE = "ARCHITECT_RESPONSE_COMPLETE"
 BEGIN = "EXECUTOR_PROMPT_BEGIN"
@@ -6254,6 +6255,7 @@ class LocalFirstOrchestrator:
     """Small durable local control loop; GitHub is deliberately absent from it."""
     def __init__(self, project_dir: str, state_dir: str | os.PathLike[str] | None = None, process_factory: Callable[[str, Path], Any] | None = None):
         self.project_dir = Path(project_dir)
+        self.prompt_artifact_repository_root = self.project_dir
         self.state_dir = Path(state_dir or self.project_dir / ".agent-work" / "orchestrator")
         self._state_lock = threading.RLock()
         self.results_dir, self.prompts_dir, self.logs_dir = (self.state_dir / name for name in ("results", "prompts", "logs"))
@@ -7823,6 +7825,44 @@ class LocalFirstOrchestrator:
         with self._state_lock:
             return self._accept_architect_response_locked(response)
 
+    def _persist_accepted_prompt_artifact(self, decision: dict[str, str], task_id: str,
+                                          prompt_bytes: bytes | None = None) -> dict[str, Any]:
+        """Persist only a prompt from a result that has passed its authority checks."""
+        if decision.get("action") != "EXECUTE":
+            return {}
+        if prompt_bytes is None:
+            prompt_bytes = decision["prompt"].encode("utf-8")
+        protocol_task = str(self.state.get("postDiscussionProtocolTaskId") or "")
+        rollover_task = str(self.state.get("rolloverTransactionTaskId") or "")
+        transaction_id = None
+        if protocol_task == task_id:
+            transaction_id = self.state.get("postDiscussionProtocolTransactionId")
+        elif rollover_task == task_id:
+            transaction_id = self.state.get("rolloverTransactionId")
+        try:
+            identity = persist_verified_prompt_artifact(
+                self.prompt_artifact_repository_root,
+                task_id=task_id,
+                transaction_id=transaction_id,
+                prompt=prompt_bytes,
+                architect_conversation_id=self.state.get("architectConversationId"),
+                source="ARCHITECT_ORCHESTRATOR_RESULT",
+                classification=decision["classification"],
+                action=decision["action"],
+            )
+            return identity
+        except Exception as error:
+            self.state.update({
+                "state": "HUMAN_REQUIRED",
+                "humanRequiredReason": "PROMPT_ARTIFACT_PERSISTENCE_FAILED",
+                "promptArtifactFailure": str(error)[:200],
+            })
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "PROMPT_ARTIFACT_PERSISTENCE_FAILED", self.state,
+                        taskId=task_id, errorClass=type(error).__name__, reason=str(error)[:200])
+            raise RuntimeError("PROMPT_ARTIFACT_PERSISTENCE_FAILED") from error
+
     def _accept_architect_response_locked(self, response: str) -> dict[str, str]:
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         consumed = self.state.setdefault("consumedArchitectResponses", {})
@@ -7866,6 +7906,7 @@ class LocalFirstOrchestrator:
                 raise RuntimeError("EXECUTOR_PROMPT_EVIDENCE_MISMATCH")
             if not path.exists():
                 atomic_write(path, prompt_bytes)
+            self.state.update(self._persist_accepted_prompt_artifact(decision, next_id, prompt_bytes))
             self.state["architectResultFingerprint"] = fingerprint
             target_text = str(target)
             self.state.update({"state": "NEXT_PROMPT_READY", "nextPromptPath": str(path), "nextTaskId": next_id, "targetProject": target_text, "targetRepo": target_text, "targetWorktree": target_text, "humanRequiredReason": None})
@@ -8498,7 +8539,9 @@ class LocalFirstOrchestrator:
         decision = parse_orchestrator_result(response, task_id)
         if decision["action"] != "EXECUTE":
             raise ValueError("ARCHITECT_STAGED_PROMPT_ENVELOPE_INVALID")
-        prompt = Path(str(self.state["nextPromptPath"])).read_text(encoding="utf-8")
+        staged_path = Path(str(self.state["nextPromptPath"]))
+        prompt = staged_path.read_text(encoding="utf-8")
+        staged_prompt_bytes = staged_path.read_bytes()
         parsed_prompt = decision["prompt"].replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
         staged_prompt = prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
         if hashlib.sha256(parsed_prompt.encode("utf-8")).hexdigest() != hashlib.sha256(staged_prompt.encode("utf-8")).hexdigest():
@@ -8507,6 +8550,9 @@ class LocalFirstOrchestrator:
         consumed = self.state.setdefault("consumedArchitectResponses", {})
         if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:
             return {"action": "DUPLICATE", "taskId": task_id}
+        artifact_identity = self._persist_accepted_prompt_artifact(
+            decision, task_id, prompt_bytes=staged_prompt_bytes)
+        self.state.update(artifact_identity)
         self.state.update({
             "architectResultFingerprint": fingerprint,
             "state": "NEXT_PROMPT_READY",
@@ -8669,7 +8715,12 @@ class LocalFirstOrchestrator:
                 decision = self._accept_exact_staged_prompt_envelope(response, staged_task_id)
             else:
                 decision = self.accept_architect_response(response)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as error:
+            if str(error) == "PROMPT_ARTIFACT_PERSISTENCE_FAILED":
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                            "PROMPT_ARTIFACT_PERSISTENCE_FAILED", self.state, taskId=task_id,
+                            reason=self.state.get("promptArtifactFailure"))
+                return "FAILED"
             runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None), "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION", self.state, taskId=task_id)
             self.state.update({"humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_MISSING_AFTER_DISCUSSION"})
             self.save()
