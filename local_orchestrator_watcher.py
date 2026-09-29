@@ -5397,6 +5397,9 @@ class ArchitectPlaywright:
             fresh_bridge = ArchitectPlaywright(new_page)
             fresh_bridge.diagnostic_trace = self.diagnostic_trace
             fresh_bridge.runtime_watcher = getattr(self, "runtime_watcher", None)
+            fresh_bridge.runtime_logger = getattr(self, "runtime_logger", None)
+            fresh_bridge.runtime_run_id = getattr(self, "runtime_run_id", None)
+            fresh_bridge.runtime_conversation_id = getattr(self, "runtime_conversation_id", None)
             fresh_bridge.liveness_watchdog = getattr(self, "liveness_watchdog", None)
             try:
                 mark_watcher_liveness(getattr(self, "runtime_watcher", None), "FRESH_BOOTSTRAP_SUBMISSION_BEGIN")

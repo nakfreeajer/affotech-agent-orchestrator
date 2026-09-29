@@ -252,6 +252,17 @@ class _OwnedContext:
         })
         return page
 
+    def adopt_page(self, raw: Any, identity: dict[str, Any]) -> _OwnedPage:
+        """Wrap a prior gate's proven owned page without claiming it as newly created."""
+        if not self.inventory_complete:
+            raise RuntimeError("QUALIFICATION_CDP_INVENTORY_REQUIRED")
+        role = identity.get("role")
+        if role not in {"OLD_ARCHITECT", "FRESH_ARCHITECT"}:
+            raise RuntimeError("QUALIFICATION_PAGE_ROLE_INVALID")
+        page = _OwnedPage(raw, self, self._close_requests, identity, self._persist_evidence)
+        self._pages.append(page)
+        return page
+
 
 def _sha(path: Path) -> tuple[str | None, int | None]:
     try:
@@ -472,9 +483,32 @@ def _target_inventory(browser) -> list[dict[str, Any]]:
     return targets
 
 
-def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
+def _inject_post_send_ack_ambiguity(original_submit, handover: str, write_event):
+    """Qualification-only fault injection shared by G3 and the full chain."""
+    state: dict[str, Any] = {"done": False, "payloadSha256": None}
+
+    def submit(bridge, payload: str, timeout: float = 30.0):
+        result = original_submit(bridge, payload, timeout)
+        if (payload.startswith(handover)
+                and "Fresh Architect session bootstrap protocol:" in payload
+                and not state["done"]):
+            state["done"] = True
+            state["payloadSha256"] = hashlib.sha256(payload.encode()).hexdigest()
+            write_event("QUALIFICATION_ACK_AMBIGUITY_INJECTED_AFTER_REAL_SEND", {
+                "payloadSha256": state["payloadSha256"], "sendActionCompleted": True,
+                "observerOnly": True,
+            })
+            raise runtime.ResultSubmissionError(
+                "ARCHITECT_SUBMISSION_ACK_TIMEOUT", "qualification observer-only injection")
+        return result
+
+    return submit, state
+
+
+def run(repository: str | os.PathLike[str], endpoint: str, *, gate_id: str | None = None,
+        run_id: str | None = None, prerequisite_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     repository = Path(repository).resolve()
-    run_id = "qualification-real-" + uuid.uuid4().hex
+    run_id = run_id or "qualification-real-" + uuid.uuid4().hex
     root = repository / ".agent-work" / "orchestrator" / "qualification" / run_id
     state_dir = root / "state"
     (state_dir / "prompts").mkdir(parents=True, exist_ok=False)
@@ -498,6 +532,12 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         "productionLogBytesBefore": production_log_size_before,
         "ownedPages": [], "preExistingTargets": [], "protectedConversationIds": [],
     }
+    if gate_id is not None:
+        evidence["gateId"] = gate_id
+        evidence["result"] = "INCONCLUSIVE"
+        evidence["unintendedMutationCount"] = 0
+        if prerequisite_evidence:
+            evidence["prerequisiteEvidence"] = prerequisite_evidence
 
     def persist_evidence() -> None:
         _atomic_json(evidence_path, evidence)
@@ -668,21 +708,15 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         bootstrap_payload = runtime.fresh_architect_bootstrap_payload(handover)
         input_submitter.bootstrap_payload = bootstrap_payload
         original_submit = runtime.ArchitectPlaywright.submit_result_bounded
-        def submit_then_induce_ack_ambiguity(bridge, payload: str, timeout: float = 30.0):
-            nonlocal bootstrap_payload_hash
-            original_submit(bridge, payload, timeout)
-            if payload.startswith(handover) and "Fresh Architect session bootstrap protocol:" in payload and not forced_ack["done"]:
-                forced_ack["done"] = True
-                bootstrap_payload_hash = hashlib.sha256(payload.encode()).hexdigest()
-                event("QUALIFICATION_ACK_AMBIGUITY_INJECTED_AFTER_REAL_SEND", {"payloadSha256": bootstrap_payload_hash,
-                    "sendActionCompleted": True, "observerOnly": True})
-                raise runtime.ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT", "qualification observer-only injection")
-
-        runtime.ArchitectPlaywright.submit_result_bounded = submit_then_induce_ack_ambiguity
+        submit_with_ack_ambiguity, forced_ack_state = _inject_post_send_ack_ambiguity(
+            original_submit, handover, event)
+        runtime.ArchitectPlaywright.submit_result_bounded = submit_with_ack_ambiguity
         try:
             coordinator_ok = watcher.session_rollover.complete_from_response(old_bridge, handover)
         finally:
             runtime.ArchitectPlaywright.submit_result_bounded = original_submit
+        forced_ack["done"] = forced_ack_state["done"]
+        bootstrap_payload_hash = forced_ack_state["payloadSha256"]
         if not coordinator_ok:
             raise RuntimeError("QUALIFICATION_FRESH_SESSION_COORDINATOR_FAILED")
         fresh_page = old_bridge.page
@@ -756,6 +790,8 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
             "workflowState": watcher.state,
             "terminalStatus": "QUALIFICATION_COMPLETE",
         })
+        if gate_id is not None:
+            evidence["result"] = "PASS"
         persist_evidence()
         _write_event(handle, "QUALIFICATION_EVIDENCE_PERSISTED", {"path": str(evidence_path),
             "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest()})
@@ -768,6 +804,8 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
         return evidence
     except Exception as error:
         evidence["terminalStatus"] = "QUALIFICATION_FAILED"
+        if gate_id is not None:
+            evidence["result"] = "BLOCKED"
         evidence["terminalFailure"] = {"errorClass": type(error).__name__, "reason": str(error)[:300],
                                         "ownedPageCount": len(pages)}
         persist_evidence()
@@ -794,6 +832,25 @@ def run(repository: str | os.PathLike[str], endpoint: str) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[1] != "--run":
-        raise SystemExit("usage: orchestrator_real_browser_qualification.py --run REPOSITORY CDP_ENDPOINT")
-    print(json.dumps(run(sys.argv[2], sys.argv[3]), indent=2, sort_keys=True))
+    if len(sys.argv) == 4 and sys.argv[1] == "--run":
+        print(json.dumps(run(sys.argv[2], sys.argv[3]), indent=2, sort_keys=True))
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--gate":
+        import argparse
+        from qualification_gate_runner import run_gate
+        parser = argparse.ArgumentParser(description="Run one isolated AFFOTECH browser qualification gate.")
+        parser.add_argument("--gate", required=True,
+                            choices=("g1", "g2", "g3", "g4", "g5", "g6", "full",
+                                     "cdp-attach", "old-handover", "fresh-bootstrap", "authority-switch",
+                                     "post-discussion-envelope", "executor-dispatch", "full-chain"))
+        parser.add_argument("--repository", required=True)
+        parser.add_argument("--endpoint", required=True)
+        parser.add_argument("--prerequisite", action="append", default=[],
+                            help="Prior gate qualification-evidence.json; repeat in prerequisite order.")
+        args = parser.parse_args()
+        print(json.dumps(run_gate(args.gate, args.repository, args.endpoint, args.prerequisite),
+                         indent=2, sort_keys=True))
+    else:
+        raise SystemExit(
+            "usage: orchestrator_real_browser_qualification.py --run REPOSITORY CDP_ENDPOINT "
+            "| --gate GATE --repository REPOSITORY --endpoint CDP_ENDPOINT [--prerequisite EVIDENCE.json ...]"
+        )
