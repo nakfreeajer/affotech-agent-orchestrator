@@ -21,7 +21,8 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from rollover_state_machine import RolloverAction, RolloverDecision, RolloverObservations, evaluate_rollover_state
-from prompt_artifacts import persist_verified_prompt_artifact
+from prompt_artifacts import load_verified_staged_prompt, persist_verified_prompt_artifact
+from executor_prompt_transport import build_executor_prompt_artifact_descriptor, has_prompt_artifact_state
 
 COMPLETE = "ARCHITECT_RESPONSE_COMPLETE"
 BEGIN = "EXECUTOR_PROMPT_BEGIN"
@@ -7943,19 +7944,93 @@ class LocalFirstOrchestrator:
                         claimedTaskId=self.state.get("executorLaunchClaimTaskId"))
             return None
         mark_watcher_liveness(self, "EXECUTOR_PROMPT_READ_BEGIN")
-        prompt_path = Path(self.state["nextPromptPath"])
-        prompt = prompt_path.read_text(encoding="utf-8")
+        artifact_backed = has_prompt_artifact_state(self.state)
+        try:
+            if artifact_backed:
+                artifact_bytes = load_verified_staged_prompt(self.prompt_artifact_repository_root, self.state)
+                if str(self.state.get("promptTaskId") or "") != task_id:
+                    raise RuntimeError("PROMPT_ARTIFACT_TASK_MISMATCH")
+                transaction_task = str(self.state.get("rolloverTransactionTaskId") or "")
+                if transaction_task == task_id and self.state.get("promptTransactionId") != self.state.get("rolloverTransactionId"):
+                    raise RuntimeError("PROMPT_ARTIFACT_TRANSACTION_MISMATCH")
+                protocol_task = str(self.state.get("postDiscussionProtocolTaskId") or "")
+                if protocol_task == task_id and self.state.get("promptTransactionId") != self.state.get("postDiscussionProtocolTransactionId"):
+                    raise RuntimeError("PROMPT_ARTIFACT_TRANSACTION_MISMATCH")
+                prompt = artifact_bytes.decode("utf-8", errors="strict")
+                transport_prompt = build_executor_prompt_artifact_descriptor(self.state)
+            else:
+                prompt_path = Path(self.state["nextPromptPath"])
+                prompt = prompt_path.read_text(encoding="utf-8")
+                transport_prompt = prompt
+        except Exception as error:
+            reason = str(error).split(":", 1)[0] or type(error).__name__
+            self.state.update({
+                "state": "HUMAN_REQUIRED",
+                "humanRequiredReason": "PROMPT_ARTIFACT_DISPATCH_BLOCKED" if artifact_backed else "EXECUTOR_PROMPT_UNAVAILABLE",
+                "promptArtifactDispatchFailure": reason if artifact_backed else None,
+            })
+            self.save()
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "PROMPT_ARTIFACT_DISPATCH_BLOCKED" if artifact_backed else "EXECUTOR_PROMPT_READ_FAILED",
+                        self.state, taskId=task_id, reason=reason)
+            return None
         mark_watcher_liveness(self, "EXECUTOR_WORKTREE_RESOLUTION_BEGIN")
         owned = self.state.get("taskWorktrees", {}).get(task_id)
         target = str(owned["worktreePath"]) if isinstance(owned, dict) and owned.get("worktreePath") else resolve_executor_worktree(prompt, self._configured_fallback_project())
         self.state.update({"targetProject": target, "targetRepo": target, "targetWorktree": target})
+        if artifact_backed:
+            dispatch_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.state.update({
+                "executorPromptArtifactId": self.state["promptArtifactId"],
+                "executorPromptArtifactSha256": self.state["promptSha256"],
+                "executorPromptArtifactByteLength": self.state["promptByteLength"],
+                "executorPromptArtifactPath": self.state["promptArtifactPath"],
+                "executorPromptManifestPath": self.state["promptArtifactManifestPath"],
+                "executorPromptDispatchTaskId": task_id,
+                "executorPromptDispatchTransactionId": self.state.get("promptTransactionId"),
+                "executorPromptDispatchAt": dispatch_at,
+            })
+        else:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "EXECUTOR_PROMPT_LEGACY_INLINE_DISPATCH", self.state, taskId=task_id,
+                        dispatchState="LEGACY_INLINE")
         mark_watcher_liveness(self, "EXECUTOR_LAUNCH_CLAIM_WRITE_BEGIN")
         self.state.update({"executorLaunchState": "LAUNCH_CLAIMED", "executorLaunchClaimTaskId": task_id})
         self.save()
+        if artifact_backed:
+            try:
+                final_artifact_bytes = load_verified_staged_prompt(self.prompt_artifact_repository_root, self.state)
+                if (final_artifact_bytes != artifact_bytes
+                        or self.state.get("executorPromptArtifactId") != self.state.get("promptArtifactId")
+                        or self.state.get("executorPromptArtifactSha256") != self.state.get("promptSha256")
+                        or self.state.get("executorPromptArtifactByteLength") != self.state.get("promptByteLength")
+                        or self.state.get("executorPromptDispatchTaskId") != task_id):
+                    raise RuntimeError("PROMPT_ARTIFACT_DISPATCH_IDENTITY_MISMATCH")
+                transport_prompt = build_executor_prompt_artifact_descriptor(self.state)
+            except Exception as error:
+                reason = str(error).split(":", 1)[0] or type(error).__name__
+                self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "PROMPT_ARTIFACT_DISPATCH_BLOCKED",
+                                   "promptArtifactDispatchFailure": reason, "executorLaunchState": "BLOCKED_VERIFICATION"})
+                self.save()
+                runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                            "PROMPT_ARTIFACT_DISPATCH_BLOCKED", self.state, taskId=task_id, reason=reason)
+                return None
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "PROMPT_ARTIFACT_DISPATCH_VERIFIED", self.state,
+                        taskId=task_id, transactionId=self.state.get("promptTransactionId"),
+                        artifactId=self.state.get("promptArtifactId"), sha256=self.state.get("promptSha256"),
+                        byteLength=self.state.get("promptByteLength"), dispatchState="VERIFIED")
         mark_watcher_liveness(self, "EXECUTOR_PROCESS_LAUNCH_BEGIN")
-        process = launcher(prompt, self._result_path(str(self.state["nextTaskId"])))
+        process = launcher(transport_prompt, self._result_path(str(self.state["nextTaskId"])))
         self._active_process = process
         mark_watcher_liveness(self, "EXECUTOR_PROCESS_LAUNCH_RETURNED")
+        if artifact_backed:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "PROMPT_ARTIFACT_DESCRIPTOR_SENT", self.state,
+                        taskId=task_id, transactionId=self.state.get("promptTransactionId"),
+                        artifactId=self.state.get("promptArtifactId"), sha256=self.state.get("promptSha256"),
+                        byteLength=self.state.get("promptByteLength"), descriptorByteLength=len(transport_prompt.encode("utf-8")),
+                        dispatchState="SENT")
         self.mark_executor_started(str(self.state["nextTaskId"]), int(process.pid), self._result_path(str(self.state["nextTaskId"])))
         return process
 

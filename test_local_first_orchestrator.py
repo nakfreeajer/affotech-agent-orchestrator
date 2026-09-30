@@ -42,6 +42,17 @@ def envelope(task, action="EXECUTE", prompt="next task", documentation=None):
             "promptEnd\n</ORCHESTRATOR_RESULT>")
 
 
+def assert_executor_artifact_descriptor(message, task_id, exact_prompt):
+    assert message.startswith("<EXECUTOR_PROMPT_ARTIFACT>\n")
+    assert "</EXECUTOR_PROMPT_ARTIFACT>" in message
+    descriptor = json.loads(message.splitlines()[1])
+    prompt_bytes = exact_prompt.encode("utf-8")
+    assert descriptor["taskId"] == task_id
+    assert descriptor["artifactSha256"] == hashlib.sha256(prompt_bytes).hexdigest()
+    assert descriptor["artifactByteLength"] == len(prompt_bytes)
+    assert exact_prompt not in message
+
+
 def canonical_handover(watcher, body="complete handover", task_id=None, transaction_id=None):
     """Create production-protocol evidence for a test rollover response."""
     transaction_id = transaction_id or watcher.state.get("rolloverTransactionId") or "test-rollover-transaction"
@@ -5838,7 +5849,7 @@ def test_real_architectplaywright_legacy_rollover_protocol_and_dispatch_e2e(tmp_
     assert len(launch_gate_calls) == 1
     assert lifecycle == ["authority_committed"]
     assert events.index("authority_committed") < events.index("page_closed")
-    assert launches[0] == prompt_text
+    assert_executor_artifact_descriptor(launches[0], "000103", prompt_text)
     assert watcher.state["nextTaskId"] == "000103"
     assert watcher.state["postDiscussionEnvelopeRequired"] is False
     assert prompt.read_bytes() == prompt_bytes
@@ -10243,7 +10254,8 @@ def test_epoch4_sent_restart_public_path_and_one_shot_operator_continuation_e2e(
     assert watcher_module.run_next_prompt_ready_once(
         watcher, launch, "isolated", watcher.discussion_pause_active,
     ) is not None
-    assert launches == [prompt_bytes.decode("utf-8")]
+    assert len(launches) == 1
+    assert_executor_artifact_descriptor(launches[0], "000103", prompt_bytes.decode("utf-8"))
     assert watcher.state["executorSessionId"] == "019f842e-98bc-7672-a619-51441d91be00"
     assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
     assert prompt.read_bytes() == prompt_bytes
@@ -10325,7 +10337,8 @@ def test_epoch4_sent_stale_timestamp_existing_response_public_recovery_no_resend
     assert watcher.state["postDiscussionEnvelopeRequired"] is False
     assert prompt.read_bytes() == prompt_bytes
     assert watcher_module.run_next_prompt_ready_once(watcher, launch, "isolated", watcher.discussion_pause_active) is not None
-    assert launches == [prompt_bytes.decode("utf-8")]
+    assert len(launches) == 1
+    assert_executor_artifact_descriptor(launches[0], "000103", prompt_bytes.decode("utf-8"))
     assert len(fresh_pages) == 1
     assert sum("Fresh Architect session bootstrap protocol" in item for item in fresh_page.sent_payloads) == 1
     assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == 3
@@ -10527,7 +10540,8 @@ def test_epoch5_human_required_visible_handover_direct_relay_public_e2e(tmp_path
     assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
     assert prompt.read_bytes() == prompt_bytes
     assert attach_calls[0] == "OLD-ARCHITECT"
-    assert launches == [prompt_bytes.decode("utf-8")]
+    assert len(launches) == 1
+    assert_executor_artifact_descriptor(launches[0], "000103", prompt_bytes.decode("utf-8"))
     assert events.index("assistant_history_scan") < events.index("visible_assistant_dom_scan")
     assert events.index("handover_persisted") < events.index("fresh_architect_created")
     assert events.index("fresh_bootstrap_submitted") < events.index("fresh_ready_materialized")
@@ -10772,7 +10786,8 @@ def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_pa
     assert fresh_page.dom_observers.index("semantic-assistant") < fresh_page.dom_observers.index("visible-assistant-ready")
     assert len(context.pages) == 2
     assert len(protocol_bridge.sent) == 1
-    assert len(launches) == 1 and launches[0].encode("utf-8") == prompt_bytes
+    assert len(launches) == 1
+    assert_executor_artifact_descriptor(launches[0], "000103", prompt_bytes.decode("utf-8"))
     assert watcher.state["nextTaskId"] == "000103"
     assert Path(watcher.state["promptArtifactPath"]).is_relative_to(tmp_path / ".agent-work" / "prompts")
     assert Path(watcher.state["promptArtifactPath"]).read_bytes() == prompt_bytes
@@ -11069,6 +11084,11 @@ def test_qualification_synthetic_main_loop_uses_isolated_state_and_fake_launch(t
     monkeypatch.setattr(
         watcher_module, "persist_verified_prompt_artifact",
         lambda _repository_root, **kwargs: persist_artifact(tmp_path, **kwargs),
+    )
+    load_artifact = watcher_module.load_verified_staged_prompt
+    monkeypatch.setattr(
+        watcher_module, "load_verified_staged_prompt",
+        lambda _repository_root, state: load_artifact(tmp_path, state),
     )
     result = qualification_module.run(Path(__file__).parent)
     assert result["runtimeContext"] == "QUALIFICATION"

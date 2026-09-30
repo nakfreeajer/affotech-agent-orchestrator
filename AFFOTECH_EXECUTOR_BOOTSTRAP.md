@@ -38,7 +38,9 @@ The Project Architect decides architecture, roadmap, acceptance, documentation d
 
 ## Runtime authority
 
-The Local Orchestrator supplies the current prompt, task ID, result path and Orchestrator-owned isolated worktree.
+The Local Orchestrator supplies the current prompt or, for artifact-backed tasks, a compact prompt artifact descriptor, along with task ID, result path and Orchestrator-owned isolated worktree.
+
+When the current message contains `<EXECUTOR_PROMPT_ARTIFACT>`, read the exact local artifact bytes identified by its `artifactPath` and verify the supplied task ID, SHA256, byte length, and manifest identity before executing any task instructions. Execute only the exact verified artifact contents. If any check fails, stop without executing and report `PROMPT_ARTIFACT_INVALID` with a concise reason. Do not reconstruct the prompt from chat history, fetch a latest file, or substitute another path. The descriptor is a locator and verification contract; it does not replace or change Architect authority.
 
 Do not rely on the historical GitHub relay as runtime transport. Runtime communication is local:
 
