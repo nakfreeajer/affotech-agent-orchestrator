@@ -362,6 +362,47 @@ def _prerequisite(paths: list[str], index: int, expected_gate: str, repository: 
     return _load_evidence(paths[index], repository, expected_gate)
 
 
+def _load_recorded_prerequisite(owner: dict[str, Any], owner_path: Path,
+                                expected_gate: str, repository: Path):
+    """Resolve one nested prerequisite only through its persisted provenance record."""
+    references = owner.get("prerequisiteEvidence")
+    if not isinstance(references, list):
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_INVALID:" + expected_gate)
+    matches = [row for row in references if isinstance(row, dict) and row.get("gateId") == expected_gate]
+    if len(matches) != 1:
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_INVALID:" + expected_gate)
+    reference = matches[0]
+    path_value, expected_hash = reference.get("path"), reference.get("sha256")
+    if not isinstance(path_value, str) or not path_value or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_INVALID:" + expected_gate)
+    # Keep any existing convenience fields bound to the same original reference.
+    alias_prefix = expected_gate.split("-", 1)[0]
+    alias_path, alias_hash = owner.get(alias_prefix + "EvidencePath"), owner.get(alias_prefix + "EvidenceSha256")
+    if alias_path is not None and str(Path(str(alias_path)).resolve()) != str(Path(path_value).resolve()):
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_MISMATCH:" + expected_gate)
+    if alias_hash is not None and alias_hash != expected_hash:
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_MISMATCH:" + expected_gate)
+    evidence, evidence_path, digest = _load_evidence(path_value, repository, expected_gate)
+    if digest != expected_hash:
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:" + expected_gate)
+    # The owner file itself must be the immediate gate evidence that supplied
+    # this reference; this also guards accidental use of a sibling run record.
+    if owner_path.name != "qualification-evidence.json" or not _inside(owner_path, repository / ".agent-work" / "orchestrator" / "qualification"):
+        raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_INVALID:" + expected_gate)
+    return evidence, evidence_path, digest
+
+
+def _resolve_g4_provenance(g3: dict[str, Any], g3_path: Path, repository: Path):
+    """Validate G3's G2 provenance and each artifact against its owning run."""
+    g2, g2_path, g2_hash = _load_recorded_prerequisite(g3, g3_path, "g2-old-handover", repository)
+    for key in ("taskId", "transactionId", "oldConversationId", "handoverResponsePath", "handoverResponseSha256"):
+        if g3.get(key) != g2.get(key):
+            raise RuntimeError("QUALIFICATION_PREREQUISITE_PROVENANCE_MISMATCH:g2-old-handover:" + key)
+    bootstrap = _read_evidence_artifact(g3, g3_path, "bootstrapPath", "bootstrapSha256")
+    handover = _read_evidence_artifact(g2, g2_path, "handoverResponsePath", "handoverResponseSha256")
+    return g2, g2_path, g2_hash, bootstrap, handover
+
+
 def _create_watcher(session: _GateSession, values: dict[str, Any], old_id: str,
                     *, fresh_id: str | None = None, prompt_path: str | None = None):
     watcher = runtime.LocalFirstOrchestrator(str(session.repository), session.state_dir)
@@ -458,6 +499,10 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
             loaded.append(evidence)
             prerequisite_refs.append({"gateId": expected, "path": str(path), "sha256": digest})
         session.evidence["prerequisiteEvidence"] = prerequisite_refs
+        g4_provenance = None
+        if gate_id == "g4-authority-switch":
+            g4_provenance = _resolve_g4_provenance(
+                loaded[0], Path(prerequisite_refs[0]["path"]), session.repository)
         session.connect_and_inventory()
 
         if gate_id == "g2-old-handover":
@@ -574,10 +619,8 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
 
         if gate_id == "g4-authority-switch":
             g3 = loaded[0]
-            g2, g2_path, g2_hash = _load_evidence(g3["g2EvidencePath"], session.repository, "g2-old-handover")
-            if g2_hash != g3.get("g2EvidenceSha256"):
-                raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:g2-old-handover")
-            _read_evidence_artifact(g3, Path(prerequisite_refs[0]["path"]), "bootstrapPath", "bootstrapSha256")
+            assert g4_provenance is not None
+            g2, g2_path, g2_hash, _bootstrap, handover_bytes = g4_provenance
             old_id, fresh_id = str(g3["oldConversationId"]), str(g3["freshConversationId"])
             allowed = {old_id, fresh_id}
             session.allow_owned_ids(allowed)
@@ -596,8 +639,7 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
             old_bridge.runtime_watcher = watcher
             old_bridge.runtime_conversation_id = old_id
             old_bridge._fresh_candidate_page = fresh_page
-            handover = _read_evidence_artifact(
-                g3, Path(prerequisite_refs[0]["path"]), "handoverResponsePath", "handoverResponseSha256").decode("utf-8")
+            handover = handover_bytes.decode("utf-8")
             watcher.session_rollover.persist_validated_handover(handover)
             proven = watcher.session_rollover._fresh_candidate_proven(
                 fresh_page, runtime.fresh_architect_bootstrap_payload(handover), fresh_id)
@@ -636,13 +678,10 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
 
         if gate_id == "g5-post-discussion-envelope":
             g4 = loaded[0]
-            g3, g3_path, g3_hash = _load_evidence(g4["g3EvidencePath"], session.repository, "g3-fresh-bootstrap")
-            if g3_hash != g4.get("g3EvidenceSha256"):
-                raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:g3-fresh-bootstrap")
-            g2, _, nested_g2_hash = _load_evidence(g3["g2EvidencePath"], session.repository, "g2-old-handover")
-            if nested_g2_hash != g3.get("g2EvidenceSha256"):
-                raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:g2-old-handover")
-            _read_evidence_artifact(g2, Path(g3["g2EvidencePath"]), "stagedPromptPath", "stagedPromptSha256")
+            g3, g3_path, g3_hash = _load_recorded_prerequisite(
+                g4, Path(prerequisite_refs[0]["path"]), "g3-fresh-bootstrap", session.repository)
+            g2, g2_path, _ = _load_recorded_prerequisite(g3, g3_path, "g2-old-handover", session.repository)
+            _read_evidence_artifact(g2, g2_path, "stagedPromptPath", "stagedPromptSha256")
             fresh_id = str(g4["freshConversationId"])
             session.allow_owned_ids({fresh_id})
             fresh_page = session.adopt(g3, "FRESH_ARCHITECT", {fresh_id})
@@ -697,15 +736,12 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
 
         if gate_id == "g6-executor-dispatch":
             g5 = loaded[0]
-            g4, g4_path, g4_hash = _load_evidence(g5["g4EvidencePath"], session.repository, "g4-authority-switch")
-            if g4_hash != g5.get("g4EvidenceSha256"):
-                raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:g4-authority-switch")
-            g3, _, _ = _load_evidence(g4["g3EvidencePath"], session.repository, "g3-fresh-bootstrap")
-            if _sha_bytes(Path(g4["g3EvidencePath"]).read_bytes()) != g4.get("g3EvidenceSha256"):
-                raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:g3-fresh-bootstrap")
-            g2, _, nested_g2_hash = _load_evidence(g3["g2EvidencePath"], session.repository, "g2-old-handover")
-            if nested_g2_hash != g3.get("g2EvidenceSha256"):
-                raise RuntimeError("QUALIFICATION_PREREQUISITE_HASH_MISMATCH:g2-old-handover")
+            g4, g4_path, g4_hash = _load_recorded_prerequisite(
+                g5, Path(prerequisite_refs[0]["path"]), "g4-authority-switch", session.repository)
+            g3, g3_path, _ = _load_recorded_prerequisite(
+                g4, g4_path, "g3-fresh-bootstrap", session.repository)
+            g2, g2_path, _ = _load_recorded_prerequisite(g3, g3_path, "g2-old-handover", session.repository)
+            _read_evidence_artifact(g2, g2_path, "stagedPromptPath", "stagedPromptSha256")
             fresh_id = str(g5["freshConversationId"])
             session.allow_owned_ids({fresh_id})
             fresh_page = session.adopt(g3, "FRESH_ARCHITECT", {fresh_id})
