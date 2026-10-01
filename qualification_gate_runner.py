@@ -86,6 +86,81 @@ def _read_evidence_artifact(evidence: dict[str, Any], evidence_path: Path,
     return data
 
 
+def _materialize_g5_staged_prompt(session: "_GateSession", g2: dict[str, Any],
+                                 g2_path: Path, task_id: str) -> tuple[Path, bytes, dict[str, Any]]:
+    """Copy the hash-verified G2 staged prompt into G5's isolated runtime root."""
+    if not task_id or str(g2.get("taskId") or "") != task_id:
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_TASK_MISMATCH")
+    source_bytes = _read_evidence_artifact(g2, g2_path, "stagedPromptPath", "stagedPromptSha256")
+    expected_sha = str(g2.get("stagedPromptSha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha) or _sha_bytes(source_bytes) != expected_sha:
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_SOURCE_INVALID")
+    prompts_root = (session.state_dir / "prompts").resolve()
+    local_path = prompts_root / f"{task_id}.txt"
+    if local_path.parent.resolve() != prompts_root or not _inside(local_path, session.state_dir):
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_PATH_INVALID")
+    if local_path.exists():
+        existing = local_path.read_bytes()
+        if existing != source_bytes:
+            raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_CONFLICT")
+    else:
+        temporary = prompts_root / f".{task_id}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(source_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if temporary.read_bytes() != source_bytes:
+                raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_TEMP_VERIFY_FAILED")
+            # The run directory is unique. Refuse a target created concurrently.
+            if local_path.exists():
+                raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_CONFLICT")
+            os.replace(temporary, local_path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    materialized = local_path.read_bytes()
+    if materialized != source_bytes or len(materialized) != len(source_bytes):
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_BYTES_MISMATCH")
+    materialized_sha = _sha_bytes(materialized)
+    if materialized_sha != expected_sha:
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_HASH_MISMATCH")
+    provenance = {
+        "stagedPromptSourceGateId": "g2-old-handover",
+        "stagedPromptSourceEvidencePath": str(g2_path),
+        "stagedPromptSourceSha256": expected_sha,
+        "stagedPromptMaterializedPath": str(local_path),
+        "stagedPromptMaterializedSha256": materialized_sha,
+    }
+    return local_path, materialized, provenance
+
+
+def _verify_g5_local_staged_prompt(path: Path, state_dir: Path, task_id: str,
+                                   expected_sha: str) -> bytes:
+    """Enforce G5's canonical task path and the unchanged staged-prompt hash."""
+    canonical = (state_dir / "prompts" / f"{task_id}.txt").resolve()
+    candidate = path.resolve()
+    if candidate != canonical or not _inside(candidate, state_dir):
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_PATH_INVALID")
+    try:
+        data = candidate.read_bytes()
+    except OSError as error:
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_UNAVAILABLE") from error
+    if _sha_bytes(data) != expected_sha:
+        raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_LOCAL_HASH_MISMATCH")
+    return data
+
+
+def _restore_g5_watcher_state(watcher: Any, accepted_state: dict[str, Any],
+                              local_prompt_path: Path) -> None:
+    """Restore accepted G4 state, rebinding only its qualification prompt path."""
+    watcher.state = dict(accepted_state)
+    watcher.state["nextPromptPath"] = str(local_prompt_path)
+    watcher.save()
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     qualification._atomic_json(path, value)
 
@@ -681,7 +756,12 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
             g3, g3_path, g3_hash = _load_recorded_prerequisite(
                 g4, Path(prerequisite_refs[0]["path"]), "g3-fresh-bootstrap", session.repository)
             g2, g2_path, _ = _load_recorded_prerequisite(g3, g3_path, "g2-old-handover", session.repository)
-            _read_evidence_artifact(g2, g2_path, "stagedPromptPath", "stagedPromptSha256")
+            if (g2.get("taskId") != g4.get("taskId")
+                    or g2.get("transactionId") != g4.get("transactionId")
+                    or g2.get("stagedPromptSha256") != g4.get("stagedPromptSha256")):
+                raise RuntimeError("QUALIFICATION_G5_STAGED_PROMPT_IDENTITY_MISMATCH")
+            local_prompt_path, prompt_bytes, prompt_provenance = _materialize_g5_staged_prompt(
+                session, g2, g2_path, str(g2.get("taskId") or ""))
             fresh_id = str(g4["freshConversationId"])
             session.allow_owned_ids({fresh_id})
             fresh_page = session.adopt(g3, "FRESH_ARCHITECT", {fresh_id})
@@ -690,10 +770,15 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
                 "stagedPromptSha256", "expectedHandoverPath", "expectedHandoverSha256",
                 "completeTaskId", "bootstrapSha256",
             )}
+            # Keep the authoritative staged-prompt identity while moving only
+            # its qualification-local path into G5's isolated runtime.
+            values["stagedPromptPath"] = str(local_prompt_path)
             values["oldRequest"] = ""
             watcher = _create_watcher(session, values, str(g4["oldConversationId"]), fresh_id=fresh_id)
-            watcher.state = dict(g4["postAuthorityWatcherState"])
-            watcher.save()
+            _restore_g5_watcher_state(watcher, g4["postAuthorityWatcherState"], local_prompt_path)
+            session.evidence.update({**prompt_provenance, "stagedPromptPath": str(local_prompt_path),
+                                     "stagedPromptSha256": values["stagedPromptSha256"]})
+            session._persist()
             fresh_bridge = runtime.ArchitectPlaywright(fresh_page)
             fresh_bridge.runtime_logger = session.logger
             fresh_bridge.runtime_run_id = session.runtime_run_id
@@ -701,6 +786,8 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
             fresh_bridge.runtime_conversation_id = fresh_id
             recorder = _install_submit_recorder(session, values)
             recorder.stage_hint = "POST_DISCUSSION_REPAIR_REQUEST"
+            _verify_g5_local_staged_prompt(
+                local_prompt_path, session.state_dir, values["taskId"], values["stagedPromptSha256"])
             if not watcher.request_post_discussion_envelope_repair(fresh_bridge):
                 raise RuntimeError("QUALIFICATION_PROTOCOL_REPAIR_REQUEST_FAILED")
             repair_meta = session.evidence.get("inputs", {}).get("POST_DISCUSSION_REPAIR_REQUEST", {})
@@ -716,11 +803,10 @@ def _run_one(gate_id: str, repository: Path, endpoint: str,
             disposition = watcher.reconcile_post_discussion_response(fresh_bridge, response, completed=True)
             if disposition != "EXECUTE" or watcher.state.get("postDiscussionEnvelopeRequired") is not False:
                 raise RuntimeError("QUALIFICATION_SYNTHETIC_ENVELOPE_NOT_ACCEPTED:" + str(disposition))
-            prompt_bytes = Path(values["stagedPromptPath"]).read_bytes()
-            if _sha_bytes(prompt_bytes) != values["stagedPromptSha256"]:
-                raise RuntimeError("QUALIFICATION_STAGED_PROMPT_HASH_MISMATCH")
+            prompt_bytes = _verify_g5_local_staged_prompt(
+                local_prompt_path, session.state_dir, values["taskId"], values["stagedPromptSha256"])
             fields = {
-                **values, "g4EvidencePath": prerequisite_refs[0]["path"],
+                **values, **prompt_provenance, "g4EvidencePath": prerequisite_refs[0]["path"],
                 "g4EvidenceSha256": prerequisite_refs[0]["sha256"],
                 "g3EvidencePath": str(g3_path), "g3EvidenceSha256": g3_hash,
                 "freshConversationId": fresh_id, "repairRequestCount": 1,
