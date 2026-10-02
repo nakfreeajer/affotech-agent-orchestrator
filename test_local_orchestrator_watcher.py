@@ -20,7 +20,10 @@ from local_orchestrator_watcher import (
 )
 
 
-def _submission_page(*, composer=True, editable=True, send=True, enabled=True, click_error=None, acknowledge=True):
+def _submission_page(*, composer=True, editable=True, send=True, enabled=True, click_error=None, acknowledge=True,
+                     generation_after_send=None, assistant_after_send=False):
+    if generation_after_send is None:
+        generation_after_send = acknowledge
     class Locator:
         def __init__(self, kind): self.kind = kind
         @property
@@ -28,6 +31,7 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
         def is_visible(self, **kwargs):
             if self.kind == "composer": return composer
             if self.kind == "send": return send
+            if self.kind == "stop": return bool(page.sent and generation_after_send)
             return False
         def is_editable(self, **kwargs): return editable
         def focus(self, **kwargs):
@@ -40,6 +44,8 @@ def _submission_page(*, composer=True, editable=True, send=True, enabled=True, c
         def count(self):
             if self.kind == "composer": return int(composer)
             if self.kind == "send": return int(send)
+            if self.kind == "stop": return int(page.sent and generation_after_send)
+            if self.kind == "assistant": return int(page.sent and assistant_after_send)
             return 0
         def fill(self, value, **kwargs):
             if not composer: raise RuntimeError("missing composer")
@@ -225,6 +231,86 @@ def test_send_window_network_trace_records_only_sanitized_passive_metadata():
     assert metadata["status"] == 202
     assert "headers" not in metadata and "body" not in metadata and "url" not in metadata
     assert listeners == {}
+
+
+def test_composer_empty_alone_does_not_acknowledge_send():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page(acknowledge=True, generation_after_send=False)
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = type("Trace", (), {"record": lambda self, *args, **kwargs: records.append((args[2], kwargs))})()
+    with pytest.raises(ResultSubmissionError) as caught:
+        bridge.submit_result_bounded("composer clears only", timeout=0.15)
+    assert caught.value.code == "ARCHITECT_SUBMISSION_GENERATION_NOT_CONFIRMED"
+    assert bridge.sendActionAcknowledged is False
+    ack = [kwargs for operation, kwargs in records if operation == "ACK_WAIT_COMPLETE"][-1]
+    assert ack["composerEmptyObserved"] is True
+    assert ack["result"] == "GENERATION_NOT_CONFIRMED"
+
+
+def test_semantic_assistant_start_acknowledges_without_generation_control():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page(acknowledge=False, generation_after_send=False, assistant_after_send=True)
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("assistant started", timeout=1)
+    assert bridge.sendActionAcknowledged is True
+
+
+def test_retained_network_observer_records_response_and_finish_after_send_returns():
+    from types import SimpleNamespace
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page()
+    listeners = {}
+    page.on = lambda event, handler: listeners.__setitem__(event, handler)
+    page.remove_listener = lambda event, handler: listeners.pop(event, None) if listeners.get(event) is handler else None
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.retain_send_window_network_observer = True
+    bridge.diagnostic_trace = type("Trace", (), {"record": lambda self, *args, **kwargs: records.append((args[2], kwargs))})()
+    request = SimpleNamespace(method="POST", url="https://chatgpt.com/backend-api/conversation?secret=do-not-log", failure=None)
+    request._impl_obj = object()
+    page.send_locator.click = lambda **_: (setattr(page, "sent", True), setattr(page, "value", ""), listeners["request"](request))
+    bridge.submit_result_bounded("network lifecycle", timeout=1)
+    assert "requestfinished" in listeners
+    listeners["response"](SimpleNamespace(request=request, status=200))
+    listeners["requestfinished"](request)
+    rows = bridge.finish_send_window_network_observation()
+    assert rows[0]["status"] == 200
+    assert rows[0]["finishedMonotonicNs"] is not None
+    assert rows[0]["lifecycleDurationMs"] >= 0
+    operations = [operation for operation, _ in records]
+    assert "SEND_WINDOW_NETWORK_RESPONSE" in operations
+    assert "SEND_WINDOW_NETWORK_FINISHED" in operations
+    serialized = json.dumps(records)
+    assert "secret" not in serialized and "do-not-log" not in serialized
+    assert "requestfinished" not in listeners
+
+
+def test_network_failure_lifecycle_records_only_safe_category():
+    from types import SimpleNamespace
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page()
+    listeners = {}
+    page.on = lambda event, handler: listeners.__setitem__(event, handler)
+    page.remove_listener = lambda event, handler: listeners.pop(event, None) if listeners.get(event) is handler else None
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.retain_send_window_network_observer = True
+    bridge.diagnostic_trace = type("Trace", (), {"record": lambda self, *args, **kwargs: records.append((args[2], kwargs))})()
+    request = SimpleNamespace(method="POST", url="https://chatgpt.com/backend-api/conversation", failure="net::ERR_CONNECTION_RESET sensitive detail")
+    request._impl_obj = object()
+    page.send_locator.click = lambda **_: (setattr(page, "sent", True), setattr(page, "value", ""), listeners["request"](request))
+    bridge.submit_result_bounded("network failure", timeout=1)
+    listeners["requestfailed"](request)
+    rows = bridge.finish_send_window_network_observation()
+    assert rows[0]["failureCategory"] == "NET::ERR_CONNECTION_RESET"
+    serialized = json.dumps(records)
+    assert "sensitive detail" not in serialized
+    assert "headers" not in serialized and "body" not in serialized
 
 
 @pytest.mark.parametrize("failure_stage", ["click", "fallback_focus", "fallback_enter"])

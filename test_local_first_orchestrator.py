@@ -982,14 +982,15 @@ class FakeButton:
 class FakeStopButton:
     last = None
 
-    def __init__(self):
+    def __init__(self, page):
+        self.page = page
         self.last = self
 
     def count(self):
-        return 0
+        return int(bool(self.page.sent) and self.page.transition)
 
     def is_visible(self, **_):
-        return False
+        return bool(self.page.sent) and self.page.transition
 
 
 class FakeComposerPage:
@@ -1010,7 +1011,7 @@ class FakeComposerPage:
                 return FakeUnavailable()
             return FakeComposer(self)
         if role == "button" and "stop" in str(_.get("name", "")).lower():
-            return FakeStopButton()
+            return FakeStopButton(self)
         return FakeButton(self)
 
     def locator(self, selector):
@@ -1019,7 +1020,7 @@ class FakeComposerPage:
                 self.page = page
 
             def count(self):
-                return 0
+                return int(bool(self.page.sent) and self.page.transition)
 
         return Count(self)
 
@@ -1323,7 +1324,7 @@ def test_stale_composer_payload_is_not_accepted_when_current_replacement_is_empt
             self.sent = []
         def get_by_role(self, role, **kwargs):
             if role == "textbox": return Locator(self, self.current)
-            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return FakeStopButton()
+            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return FakeStopButton(self)
             return Button(self)
         def locator(self, _):
             class Count:
@@ -1407,7 +1408,7 @@ def test_nonexact_replacement_never_touches_send_control(replacement):
             if role == "textbox":
                 if self.current is None: self.current=self.stale
                 return Locator(self,self.current)
-            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return FakeStopButton()
+            if role == "button" and "stop" in str(kwargs.get("name", "")).lower(): return FakeStopButton(self)
             return Button(self)
         def locator(self, _):
             class Count:
@@ -4926,7 +4927,7 @@ class _SendReadinessPage(FakeComposerPage):
         self.mutate_payload_on_send_query = None
     def get_by_role(self, role, **kwargs):
         if role == "button" and "stop" in str(kwargs.get("name", "")).lower():
-            return FakeStopButton()
+            return FakeStopButton(self)
         if role == "button":
             index = min(self.readiness_queries, len(self.states) - 1)
             self.readiness_queries += 1
@@ -5506,7 +5507,11 @@ class _ArchitectDomLocator:
         if self.selector == 'user':
             return len(self.page.users)
         if self.selector == 'button' and getattr(self.name, "pattern", ""):
-            return 0 if "stop" in self.name.pattern.lower() else 1
+            if "stop" in self.name.pattern.lower():
+                active = self.page.generation_active
+                self.page.generation_active = False
+                return int(active)
+            return 1
         return 1
 
     def nth(self, index):
@@ -5583,6 +5588,7 @@ class _ArchitectDomPage:
         self.staged_prompt = ""
         self.events = []
         self.pending_assistant = None
+        self.generation_active = False
         self.defer_pending_materialization_once = False
         self.visible_handover_candidates = []
         self.keyboard = _ArchitectDomKeyboard(self)
@@ -5610,6 +5616,7 @@ class _ArchitectDomPage:
                 else:
                     self.assistants.append({"id": f"assistant-{len(self.assistants) + 1}", "text": self.pending_assistant})
                     self.pending_assistant = None
+                    self.generation_active = False
                     self.events.append("exact_envelope_materialized")
             latest = self.assistants[-1] if self.assistants else {}
             return {"count": len(self.assistants), "latestMessageId": latest.get("id"),
@@ -5626,13 +5633,14 @@ class _ArchitectDomPage:
         if "window.scrollTo" in script:
             return False
         if "stop-button" in script:
-            return False
+            return self.generation_active
         if "data-message-author-role=\"user\"" in script:
             return [entry["text"] for entry in self.users]
         return {"found": False, "before": None, "after": None}
 
     def submit_current(self):
         payload = self.composer_text
+        self.generation_active = True
         self.composer_text = ""
         self.users.append({"id": f"user-{len(self.users) + 1}", "text": payload})
         self.sent_payloads.append(payload)
@@ -5656,6 +5664,7 @@ class _ArchitectDomPage:
         else:
             response = "UNEXPECTED_CONTROLLED_PAGE_SUBMISSION"
         self.assistants.append({"id": f"assistant-{len(self.assistants) + 1}", "text": response})
+        self.generation_active = False
 
     def close(self):
         self.closed = True
@@ -5828,6 +5837,7 @@ def test_real_architectplaywright_legacy_rollover_protocol_and_dispatch_e2e(tmp_
     assert watcher.state["postDiscussionEnvelopeRequired"] is False, (
         {key: watcher.state.get(key) for key in ("state", "humanRequiredReason", "postDiscussionProtocolBaseline", "postDiscussionEnvelopeRepairAwaiting", "postDiscussionProtocolFailure")},
         fresh_page.sent_payloads, fresh_page.assistants,
+        fresh_page.events, fresh_page.generation_active,
         [(bridge.last_state, getattr(bridge, "last_wait_diagnostics", None)) for bridge in attached_bridges],
     )
     # Crash/restart after the exact staged envelope is accepted but before

@@ -3832,6 +3832,10 @@ class ArchitectPlaywright:
         self._historical_assistant_extraction_count = 0
         self._historical_user_extraction_count = 0
         self._observation_recovery_fallback_count = 0
+        # Diagnostic harnesses may opt to retain passive request listeners
+        # after submit_result_bounded returns. Runtime sends default to false.
+        self.retain_send_window_network_observer = False
+        self._pending_send_window_network_observer = None
 
     def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
         tracer = getattr(self, "diagnostic_trace", None)
@@ -5272,6 +5276,11 @@ class ArchitectPlaywright:
                     "pathCategory": "/" + "/".join(category),
                     "requestMonotonicNs": time.monotonic_ns(),
                     "status": None,
+                    "responseMonotonicNs": None,
+                    "finishedMonotonicNs": None,
+                    "failedMonotonicNs": None,
+                    "lifecycleDurationMs": None,
+                    "failureCategory": None,
                 }
                 if len(rows) < cap:
                     rows.append(row)
@@ -5289,29 +5298,89 @@ class ArchitectPlaywright:
             except Exception:
                 pass
 
+        def request_finished(request: Any) -> None:
+            try:
+                row = requests.get(id(getattr(request, "_impl_obj", request)))
+                if row is not None:
+                    finished_ns = time.monotonic_ns()
+                    row["finishedMonotonicNs"] = finished_ns
+                    row["lifecycleDurationMs"] = round((finished_ns - row["requestMonotonicNs"]) / 1_000_000, 3)
+            except Exception:
+                pass
+
+        def request_failed(request: Any) -> None:
+            try:
+                row = requests.get(id(getattr(request, "_impl_obj", request)))
+                if row is None:
+                    return
+                failed_ns = time.monotonic_ns()
+                row["failedMonotonicNs"] = failed_ns
+                row["lifecycleDurationMs"] = round((failed_ns - row["requestMonotonicNs"]) / 1_000_000, 3)
+                failure = str(getattr(request, "failure", "") or "").upper()
+                safe_code = re.search(r"(?:NET::ERR_[A-Z0-9_]+|NS_ERROR_[A-Z0-9_]+)", failure)
+                row["failureCategory"] = safe_code.group(0) if safe_code else ("TIMEOUT" if "TIMEOUT" in failure else "REQUEST_FAILED")
+            except Exception:
+                pass
+
         try:
             add_listener("request", request_started)
             add_listener("response", response_received)
+            add_listener("requestfinished", request_finished)
+            add_listener("requestfailed", request_failed)
         except Exception:
             try:
-                remove_listener("request", request_started)
-                remove_listener("response", response_received)
+                for event, handler in (("request", request_started), ("response", response_received),
+                                       ("requestfinished", request_finished), ("requestfailed", request_failed)):
+                    remove_listener(event, handler)
             except Exception:
                 pass
             return None
         return {"page": page, "remove": remove_listener, "requestHandler": request_started,
-                "responseHandler": response_received, "rows": rows}
+                "responseHandler": response_received, "finishedHandler": request_finished,
+                "failedHandler": request_failed, "rows": rows, "started": time.monotonic()}
 
-    def _stop_send_window_network_observer(self, observer: dict[str, Any] | None, started: float) -> None:
+    def _stop_send_window_network_observer(self, observer: dict[str, Any] | None, started: float) -> list[dict[str, Any]]:
         if not observer:
-            return
-        try:
-            observer["remove"]("request", observer["requestHandler"])
-            observer["remove"]("response", observer["responseHandler"])
-        except Exception:
-            pass
+            return []
+        for event, key in (("request", "requestHandler"), ("response", "responseHandler"),
+                           ("requestfinished", "finishedHandler"), ("requestfailed", "failedHandler")):
+            try:
+                observer["remove"](event, observer[key])
+            except Exception:
+                pass
         for row in observer["rows"]:
             self._send_diagnostic_record("SEND_WINDOW_NETWORK", "OBSERVED", started, **row)
+            if row.get("status") is not None:
+                self._send_diagnostic_record("SEND_WINDOW_NETWORK_RESPONSE", "OBSERVED", started,
+                                             method=row["method"], host=row["host"], pathCategory=row["pathCategory"],
+                                             status=row["status"], responseMonotonicNs=row["responseMonotonicNs"])
+            if row.get("finishedMonotonicNs") is not None:
+                self._send_diagnostic_record("SEND_WINDOW_NETWORK_FINISHED", "OBSERVED", started,
+                                             method=row["method"], host=row["host"], pathCategory=row["pathCategory"],
+                                             finishedMonotonicNs=row["finishedMonotonicNs"],
+                                             lifecycleDurationMs=row["lifecycleDurationMs"])
+            elif row.get("failedMonotonicNs") is not None:
+                self._send_diagnostic_record("SEND_WINDOW_NETWORK_FAILED", "OBSERVED", started,
+                                             method=row["method"], host=row["host"], pathCategory=row["pathCategory"],
+                                             failedMonotonicNs=row["failedMonotonicNs"],
+                                             lifecycleDurationMs=row["lifecycleDurationMs"],
+                                             failureCategory=row["failureCategory"])
+            else:
+                self._send_diagnostic_record("SEND_WINDOW_NETWORK_LIFECYCLE", "ACTIVE_AT_OBSERVATION_END", started,
+                                             method=row["method"], host=row["host"], pathCategory=row["pathCategory"],
+                                             firstRequestMonotonicNs=row["requestMonotonicNs"])
+        first_request = min((row["requestMonotonicNs"] for row in observer["rows"]), default=None)
+        self._send_diagnostic_record("SEND_WINDOW_NETWORK_SUMMARY", "OBSERVED", started,
+                                     requestCount=len(observer["rows"]), firstRequestMonotonicNs=first_request)
+        return [dict(row) for row in observer["rows"]]
+
+    def finish_send_window_network_observation(self) -> list[dict[str, Any]]:
+        """End an explicitly retained diagnostic observer without page mutation."""
+        observer = getattr(self, "_pending_send_window_network_observer", None)
+        self._pending_send_window_network_observer = None
+        if observer is None:
+            return []
+        return self._stop_send_window_network_observer(observer, observer["started"])
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         _qualification_assert_page_allowed(self.page, "send")
@@ -5487,8 +5556,7 @@ class ArchitectPlaywright:
             self._send_diagnostic_record("ACK_WAIT_BEGIN", "BEGIN", action_started,
                                          existingTimeoutMs=5000)
             ack_started = time.monotonic()
-            # Keep these acknowledgment conditions unchanged: empty composer,
-            # visible generation control, or an increased semantic assistant count.
+            composer_empty_seen = False
             ack_deadline = min(deadline, time.monotonic() + 5.0)
             while time.monotonic() < ack_deadline:
                 try:
@@ -5496,7 +5564,8 @@ class ArchitectPlaywright:
                     stop = self.page.get_by_role("button", name=re.compile(r"stop(?: generating)?", re.I)).last
                     generation_visible = stop.count() > 0 and stop.is_visible(timeout=1000)
                     assistant_started = self.assistant_count() > assistant_count_before
-                    if composer_empty or generation_visible or assistant_started:
+                    composer_empty_seen = composer_empty_seen or composer_empty
+                    if generation_visible or assistant_started:
                         self.sendActionAcknowledged = True
                         self._send_diagnostic_record("ACK_WAIT_COMPLETE", "END", ack_started,
                                                      result="ACKNOWLEDGED", composerEmpty=composer_empty,
@@ -5509,18 +5578,26 @@ class ArchitectPlaywright:
                     last_error = error
                 time.sleep(0.1)
             detail = type(last_error).__name__ if last_error else None
+            failure_code = ("ARCHITECT_SUBMISSION_GENERATION_NOT_CONFIRMED" if composer_empty_seen
+                            else "ARCHITECT_SUBMISSION_ACK_TIMEOUT")
             self._send_diagnostic_record("ACK_WAIT_COMPLETE", "END", ack_started,
-                                         result="TIMED_OUT", exceptionClass=detail,
+                                         result="GENERATION_NOT_CONFIRMED" if composer_empty_seen else "TIMED_OUT",
+                                         composerEmptyObserved=composer_empty_seen, exceptionClass=detail,
                                          existingTimeoutMs=5000)
-            self._trace_operation("submit_result_bounded", "ERROR", errorClass="TimeoutError", errorMessage="ARCHITECT_SUBMISSION_ACK_TIMEOUT", mutation=True)
-            raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT", detail) from last_error
+            self._trace_operation("submit_result_bounded", "ERROR", errorClass="TimeoutError", errorMessage=failure_code, mutation=True)
+            raise ResultSubmissionError(failure_code, detail) from last_error
         except BaseException as error:
             terminal_exception_class = type(error).__name__
             terminal_reason = getattr(error, "code", None) or type(error).__name__
             terminal_detail = getattr(error, "detail", None)
             raise
         finally:
-            self._stop_send_window_network_observer(network_observer, action_started)
+            if network_observer is not None and getattr(self, "retain_send_window_network_observer", False):
+                self._pending_send_window_network_observer = network_observer
+                self._send_diagnostic_record("SEND_WINDOW_NETWORK_RETAINED", "OBSERVED", action_started,
+                                             disposition="DIAGNOSTIC_OPT_IN")
+            else:
+                self._stop_send_window_network_observer(network_observer, action_started)
             self._send_diagnostic_record("SUBMIT_ACTION_TERMINAL", "END", action_started,
                                          disposition=disposition,
                                          terminalReason=terminal_reason or disposition,
