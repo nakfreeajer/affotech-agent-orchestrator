@@ -5160,6 +5160,159 @@ class ArchitectPlaywright:
             raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_UNAVAILABLE")
         raise ResultSubmissionError("ARCHITECT_SEND_CONTROL_DISABLED_TIMEOUT")
 
+    def _send_diagnostic_record(self, operation: str, phase: str, started: float, **fields: Any) -> None:
+        """Emit best-effort send diagnostics without changing submission outcomes."""
+        tracer = getattr(self, "diagnostic_trace", None)
+        if tracer is None:
+            return
+        try:
+            tracer.record(
+                "PLAYWRIGHT", "submit_result_bounded", operation, phase, {},
+                duration_ms=(time.monotonic() - started) * 1000,
+                actionMonotonicNs=time.monotonic_ns(),
+                connectionId=getattr(self, "_diagnostic_connection_id", None),
+                **fields,
+            )
+        except Exception:
+            pass
+
+    def _send_diagnostic_snapshot(self, started: float) -> dict[str, Any]:
+        """Read bounded state summaries only; never include message contents."""
+        snapshot: dict[str, Any] = {
+            "elapsedMs": round((time.monotonic() - started) * 1000, 3),
+            "actionMonotonicNs": time.monotonic_ns(),
+        }
+
+        def capture(name: str, read: Callable[[], Any], transform: Callable[[Any], Any] | None = None) -> None:
+            try:
+                value = read()
+                snapshot[name] = transform(value) if transform else value
+            except Exception as error:
+                snapshot[name + "ErrorClass"] = type(error).__name__
+
+        def composer_summary() -> dict[str, Any]:
+            text = self._live_composer().inner_text(timeout=250)
+            if not isinstance(text, str):
+                return {"available": False}
+            return {
+                "available": True,
+                "textLength": len(text),
+                "textSha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "empty": not text.strip(),
+            }
+
+        def send_summary() -> dict[str, Any]:
+            locator = self.page.get_by_role("button", name=re.compile(r"^\s*send(?:\s+prompt)?\s*$", re.I))
+            count = int(locator.count()) if callable(getattr(locator, "count", None)) else None
+            row: dict[str, Any] = {}
+            if count:
+                candidate = locator.last
+                try:
+                    row["visible"] = bool(candidate.is_visible(timeout=250))
+                except Exception as error:
+                    row["visibleErrorClass"] = type(error).__name__
+                try:
+                    row["enabled"] = bool(candidate.is_enabled(timeout=250))
+                except Exception as error:
+                    row["enabledErrorClass"] = type(error).__name__
+            return {"present": bool(count), "count": count, "lastControl": row}
+
+        def dom_counts() -> dict[str, Any]:
+            body = self.page.locator("body")
+            return body.evaluate("""
+            body => {
+              const visible = node => {
+                const style = getComputedStyle(node), rect = node.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                  style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+              };
+              const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+              const assistants = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+              const stops = [...document.querySelectorAll('[data-testid="stop-button"]')];
+              return {
+                semanticUserCount: users.length,
+                visibleUserCount: users.filter(visible).length,
+                semanticAssistantCount: assistants.length,
+                visibleAssistantCount: assistants.filter(visible).length,
+                generationVisible: stops.some(node => !node.disabled && visible(node))
+              };
+            }
+            """, timeout=250)
+
+        capture("composer", composer_summary)
+        capture("sendButton", send_summary)
+        capture("domCounts", dom_counts)
+        snapshot["elapsedMs"] = round((time.monotonic() - started) * 1000, 3)
+        return snapshot
+
+    def _start_send_window_network_observer(self) -> dict[str, Any] | None:
+        """Passively collect sanitized request metadata when Playwright supports detachable listeners."""
+        page = getattr(self, "page", None)
+        add_listener = getattr(page, "on", None)
+        remove_listener = getattr(page, "remove_listener", None) or getattr(page, "off", None)
+        if not callable(add_listener) or not callable(remove_listener):
+            return None
+        rows: list[dict[str, Any]] = []
+        requests: dict[int, dict[str, Any]] = {}
+        cap = 100
+
+        def request_started(request: Any) -> None:
+            try:
+                parsed = urlsplit(str(request.url))
+                segments = [part for part in parsed.path.split("/") if part]
+                category = []
+                for part in segments[:4]:
+                    if re.fullmatch(r"[0-9a-fA-F-]{16,}", part) or len(part) >= 32:
+                        category.append("{id}")
+                    else:
+                        category.append(part[:48])
+                row = {
+                    "method": str(request.method)[:12],
+                    "host": (parsed.hostname or "")[:128],
+                    "pathCategory": "/" + "/".join(category),
+                    "requestMonotonicNs": time.monotonic_ns(),
+                    "status": None,
+                }
+                if len(rows) < cap:
+                    rows.append(row)
+                    requests[id(getattr(request, "_impl_obj", request))] = row
+            except Exception:
+                pass
+
+        def response_received(response: Any) -> None:
+            try:
+                request = response.request
+                row = requests.get(id(getattr(request, "_impl_obj", request)))
+                if row is not None:
+                    row["status"] = int(response.status)
+                    row["responseMonotonicNs"] = time.monotonic_ns()
+            except Exception:
+                pass
+
+        try:
+            add_listener("request", request_started)
+            add_listener("response", response_received)
+        except Exception:
+            try:
+                remove_listener("request", request_started)
+                remove_listener("response", response_received)
+            except Exception:
+                pass
+            return None
+        return {"page": page, "remove": remove_listener, "requestHandler": request_started,
+                "responseHandler": response_received, "rows": rows}
+
+    def _stop_send_window_network_observer(self, observer: dict[str, Any] | None, started: float) -> None:
+        if not observer:
+            return
+        try:
+            observer["remove"]("request", observer["requestHandler"])
+            observer["remove"]("response", observer["responseHandler"])
+        except Exception:
+            pass
+        for row in observer["rows"]:
+            self._send_diagnostic_record("SEND_WINDOW_NETWORK", "OBSERVED", started, **row)
+
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         _qualification_assert_page_allowed(self.page, "send")
         self._trace_operation("submit_result_bounded", "BEGIN", payloadLength=len(result), payloadSha256=hashlib.sha256(result.encode()).hexdigest(), mutation=True)
@@ -5263,55 +5416,117 @@ class ArchitectPlaywright:
             raise ResultSubmissionError("ARCHITECT_COMPOSER_INPUT_REJECTED", detail)
         assistant_count_before = self.assistant_count()
         send = self.wait_for_live_send_control(expected_payload, deadline)
+        action_started = time.monotonic()
+        disposition = "FAILED"
+        terminal_reason = None
+        terminal_detail = None
+        terminal_exception_class = None
+        network_observer = None
         try:
-            self.sendActionAttempted = True
-            if self.diagnostic_trace:
-                self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send Architect payload", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
-            send.click(timeout=1000)
-            self.last_send_method = "playwright.click"
-            self.sendMethod = self.last_send_method
-            self.initialSendMethod = self.last_send_method
-            self.initialSendActionReturned = True
-        except Exception as error:
-            if type(error).__name__ != "TimeoutError":
-                raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(error).__name__) from error
-            # A visible, enabled button can still be actionability-blocked by
-            # transient layout.  Enter is a Playwright-only fallback on the
-            # already confirmed active composer; transition confirmation below
-            # remains the delivery authority.
             try:
                 self.sendActionAttempted = True
-                composer = self._live_composer()
-                composer.focus(timeout=1000)
+                begin_snapshot = self._send_diagnostic_snapshot(action_started)
+                self._send_diagnostic_record("SUBMIT_ACTION_BEGIN", "BEGIN", action_started,
+                                             snapshot=begin_snapshot)
+                network_observer = self._start_send_window_network_observer()
+                self._send_diagnostic_record("SEND_CLICK_BEGIN", "BEGIN", action_started,
+                                             exactSubstage="SEND_BUTTON_CLICK")
                 if self.diagnostic_trace:
-                    self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send fallback Enter", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
-                composer.press("Enter", timeout=1000)
-                self.last_send_method = "playwright.composer.press(Enter)"
-                self.initialSendMethod = self.last_send_method
-                self.initialSendActionReturned = True
-            except Exception as fallback_error:
-                raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(fallback_error).__name__) from fallback_error
+                    self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send Architect payload", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
+                try:
+                    send.click(timeout=1000)
+                except Exception as error:
+                    self._send_diagnostic_record("SEND_CLICK_EXCEPTION", "ERROR", action_started,
+                                                 exceptionClass=type(error).__name__,
+                                                 elapsedMs=round((time.monotonic() - action_started) * 1000, 3),
+                                                 exactSubstage="SEND_BUTTON_CLICK")
+                    if type(error).__name__ != "TimeoutError":
+                        raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(error).__name__) from error
+                    # Preserve the existing timeout-only Enter fallback and its order.
+                    self._send_diagnostic_record("FALLBACK_BEGIN", "BEGIN", action_started,
+                                                 reason="SEND_BUTTON_CLICK_TIMEOUT")
+                    self.sendActionAttempted = True
+                    try:
+                        composer = self._live_composer()
+                        composer.focus(timeout=1000)
+                    except Exception as focus_error:
+                        self._send_diagnostic_record("FALLBACK_FOCUS_EXCEPTION", "ERROR", action_started,
+                                                     exceptionClass=type(focus_error).__name__,
+                                                     exactSubstage="FALLBACK_COMPOSER_FOCUS")
+                        raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(focus_error).__name__) from focus_error
+                    self._send_diagnostic_record("FALLBACK_FOCUS_COMPLETE", "END", action_started,
+                                                 exactSubstage="FALLBACK_COMPOSER_FOCUS")
+                    if self.diagnostic_trace:
+                        self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send fallback Enter", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
+                    self._send_diagnostic_record("FALLBACK_ENTER_BEGIN", "BEGIN", action_started,
+                                                 exactSubstage="FALLBACK_ENTER")
+                    try:
+                        composer.press("Enter", timeout=1000)
+                    except Exception as enter_error:
+                        self._send_diagnostic_record("FALLBACK_ENTER_EXCEPTION", "ERROR", action_started,
+                                                     exceptionClass=type(enter_error).__name__,
+                                                     exactSubstage="FALLBACK_ENTER")
+                        raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(enter_error).__name__) from enter_error
+                    self._send_diagnostic_record("FALLBACK_ENTER_COMPLETE", "END", action_started,
+                                                 exactSubstage="FALLBACK_ENTER")
+                    self.last_send_method = "playwright.composer.press(Enter)"
+                    self.initialSendMethod = self.last_send_method
+                    self.initialSendActionReturned = True
+                else:
+                    self.last_send_method = "playwright.click"
+                    self.sendMethod = self.last_send_method
+                    self.initialSendMethod = self.last_send_method
+                    self.initialSendActionReturned = True
+                    self._send_diagnostic_record("SEND_CLICK_COMPLETE", "END", action_started,
+                                                 exactSubstage="SEND_BUTTON_CLICK")
+            finally:
+                post_snapshot = self._send_diagnostic_snapshot(action_started)
+                self._send_diagnostic_record("POST_ACTION_SNAPSHOT", "OBSERVED", action_started,
+                                             snapshot=post_snapshot)
 
-        # A bounded acknowledgement is the first observable post-send state:
-        # the live composer no longer contains the submitted result.  Do not
-        # interpret a timeout as a composer-discovery failure.
-        ack_deadline = min(deadline, time.monotonic() + 5.0)
-        while time.monotonic() < ack_deadline:
-            try:
-                composer_empty = not self._live_composer().inner_text(timeout=1000).strip()
-                stop = self.page.get_by_role("button", name=re.compile(r"stop(?: generating)?", re.I)).last
-                generation_visible = stop.count() > 0 and stop.is_visible(timeout=1000)
-                assistant_started = self.assistant_count() > assistant_count_before
-                if composer_empty or generation_visible or assistant_started:
-                    self.sendActionAcknowledged = True
-                    self._trace_operation("submit_result_bounded", "END", result="ACKNOWLEDGED", sendActionAttempted=self.sendActionAttempted, mutation=True)
-                    return
-            except Exception as error:
-                last_error = error
-            time.sleep(0.1)
-        detail = type(last_error).__name__ if last_error else None
-        self._trace_operation("submit_result_bounded", "ERROR", errorClass="TimeoutError", errorMessage="ARCHITECT_SUBMISSION_ACK_TIMEOUT", mutation=True)
-        raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT", detail) from last_error
+            self._send_diagnostic_record("ACK_WAIT_BEGIN", "BEGIN", action_started,
+                                         existingTimeoutMs=5000)
+            ack_started = time.monotonic()
+            # Keep these acknowledgment conditions unchanged: empty composer,
+            # visible generation control, or an increased semantic assistant count.
+            ack_deadline = min(deadline, time.monotonic() + 5.0)
+            while time.monotonic() < ack_deadline:
+                try:
+                    composer_empty = not self._live_composer().inner_text(timeout=1000).strip()
+                    stop = self.page.get_by_role("button", name=re.compile(r"stop(?: generating)?", re.I)).last
+                    generation_visible = stop.count() > 0 and stop.is_visible(timeout=1000)
+                    assistant_started = self.assistant_count() > assistant_count_before
+                    if composer_empty or generation_visible or assistant_started:
+                        self.sendActionAcknowledged = True
+                        self._send_diagnostic_record("ACK_WAIT_COMPLETE", "END", ack_started,
+                                                     result="ACKNOWLEDGED", composerEmpty=composer_empty,
+                                                     generationVisible=generation_visible,
+                                                     semanticAssistantCountIncreased=assistant_started)
+                        self._trace_operation("submit_result_bounded", "END", result="ACKNOWLEDGED", sendActionAttempted=self.sendActionAttempted, mutation=True)
+                        disposition = "ACKNOWLEDGED"
+                        return
+                except Exception as error:
+                    last_error = error
+                time.sleep(0.1)
+            detail = type(last_error).__name__ if last_error else None
+            self._send_diagnostic_record("ACK_WAIT_COMPLETE", "END", ack_started,
+                                         result="TIMED_OUT", exceptionClass=detail,
+                                         existingTimeoutMs=5000)
+            self._trace_operation("submit_result_bounded", "ERROR", errorClass="TimeoutError", errorMessage="ARCHITECT_SUBMISSION_ACK_TIMEOUT", mutation=True)
+            raise ResultSubmissionError("ARCHITECT_SUBMISSION_ACK_TIMEOUT", detail) from last_error
+        except BaseException as error:
+            terminal_exception_class = type(error).__name__
+            terminal_reason = getattr(error, "code", None) or type(error).__name__
+            terminal_detail = getattr(error, "detail", None)
+            raise
+        finally:
+            self._stop_send_window_network_observer(network_observer, action_started)
+            self._send_diagnostic_record("SUBMIT_ACTION_TERMINAL", "END", action_started,
+                                         disposition=disposition,
+                                         terminalReason=terminal_reason or disposition,
+                                         terminalDetail=terminal_detail,
+                                         terminalExceptionClass=terminal_exception_class,
+                                         totalElapsedMs=round((time.monotonic() - action_started) * 1000, 3))
 
     def generation_visible(self) -> bool:
         started = time.monotonic()

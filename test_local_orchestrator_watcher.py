@@ -140,6 +140,144 @@ def test_result_submission_keyboard_path_does_not_call_blocking_fill():
     assert page.sent is True and page.focused is True
 
 
+def test_send_substage_instrumentation_preserves_click_fallback_order_and_timeouts(monkeypatch):
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page(click_error=TimeoutError("click timeout"))
+    events = []
+    trace = type("Trace", (), {"record": lambda self, *args, **kwargs: events.append((args[2], args[3], kwargs))})()
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = trace
+    original_click = page.send_locator.click
+
+    def click(**kwargs):
+        events.append(("ACTION", "click", kwargs.copy()))
+        original_click(**kwargs)
+
+    page.send_locator.click = click
+    original_focus = page.composer_locator.focus
+    def focus(**kwargs):
+        events.append(("ACTION", "focus", kwargs.copy()))
+        original_focus(**kwargs)
+    page.composer_locator.focus = focus
+
+    def press(key, **kwargs):
+        events.append(("ACTION", key, kwargs.copy()))
+        if key == "ControlOrMeta+A":
+            page.value = ""
+        elif key == "Enter":
+            page.sent = True
+            page.value = ""
+    page.composer_locator.press = press
+
+    bridge.submit_result_bounded("trace-safe payload", timeout=1)
+
+    actions = [row[1] for row in events if row[0] == "ACTION"]
+    assert actions[-3:] == ["click", "focus", "Enter"]
+    assert [row[2]["timeout"] for row in events if row[0] == "ACTION"][-3:] == [1000, 1000, 1000]
+    operations = [row[0] for row in events if row[0] != "ACTION"]
+    assert operations.index("SUBMIT_ACTION_BEGIN") < operations.index("SEND_CLICK_BEGIN")
+    assert operations.index("SEND_CLICK_EXCEPTION") < operations.index("FALLBACK_BEGIN")
+    assert operations.index("FALLBACK_FOCUS_COMPLETE") < operations.index("FALLBACK_ENTER_BEGIN")
+    assert operations.index("FALLBACK_ENTER_COMPLETE") < operations.index("POST_ACTION_SNAPSHOT")
+    assert operations.index("POST_ACTION_SNAPSHOT") < operations.index("ACK_WAIT_BEGIN")
+    assert operations[-1] == "SUBMIT_ACTION_TERMINAL"
+    snapshot = next(row[2]["snapshot"] for row in events if row[0] == "POST_ACTION_SNAPSHOT")
+    assert snapshot["composer"]["empty"] is True
+    assert "trace-safe payload" not in json.dumps(events)
+    assert page.sent is True
+
+
+def test_send_window_network_trace_records_only_sanitized_passive_metadata():
+    from types import SimpleNamespace
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page()
+    listeners = {}
+    page.on = lambda event, handler: listeners.__setitem__(event, handler)
+    def remove_listener(event, handler):
+        if listeners.get(event) is handler:
+            listeners.pop(event)
+    page.remove_listener = remove_listener
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = type("Trace", (), {"record": lambda self, *args, **kwargs: records.append((args[2], kwargs))})()
+    request = SimpleNamespace(
+        method="POST",
+        url="https://chatgpt.com/backend-api/conversation/0123456789abcdef0123456789abcdef",
+    )
+    request._impl_obj = object()
+    original_click = page.send_locator.click
+    def click(**kwargs):
+        original_click(**kwargs)
+        listeners["request"](request)
+        listeners["response"](SimpleNamespace(request=request, status=202))
+    page.send_locator.click = click
+
+    bridge.submit_result_bounded("network-safe payload", timeout=1)
+
+    network_rows = [row for row in records if row[0] == "SEND_WINDOW_NETWORK"]
+    assert len(network_rows) == 1
+    metadata = network_rows[0][1]
+    assert metadata["method"] == "POST"
+    assert metadata["host"] == "chatgpt.com"
+    assert metadata["pathCategory"] == "/backend-api/conversation/{id}"
+    assert metadata["status"] == 202
+    assert "headers" not in metadata and "body" not in metadata and "url" not in metadata
+    assert listeners == {}
+
+
+@pytest.mark.parametrize("failure_stage", ["click", "fallback_focus", "fallback_enter"])
+def test_send_substage_post_snapshot_runs_after_exceptions_and_preserves_failures(failure_stage):
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page(click_error=TimeoutError("click timeout") if failure_stage != "click" else RuntimeError("click failed"))
+    if failure_stage == "fallback_focus":
+        original_focus = page.composer_locator.focus
+        focus_calls = {"count": 0}
+        def focus(**kwargs):
+            focus_calls["count"] += 1
+            if focus_calls["count"] == 2:
+                raise TimeoutError("focus timeout")
+            return original_focus(**kwargs)
+        page.composer_locator.focus = focus
+    elif failure_stage == "fallback_enter":
+        original_focus = page.composer_locator.focus
+        page.composer_locator.focus = lambda **kwargs: original_focus(**kwargs)
+        def press(key, **_kwargs):
+            if key == "ControlOrMeta+A":
+                page.value = ""
+            elif key == "Enter":
+                raise TimeoutError("enter timeout")
+        page.composer_locator.press = press
+
+    operations = []
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = type("Trace", (), {"record": lambda self, *args, **_kwargs: operations.append(args[2])})()
+    with pytest.raises(ResultSubmissionError) as caught:
+        bridge.submit_result_bounded("failure payload", timeout=1)
+    assert caught.value.code == "ARCHITECT_SEND_ACTION_FAILED"
+    assert "POST_ACTION_SNAPSHOT" in operations
+    assert operations[-1] == "SUBMIT_ACTION_TERMINAL"
+    assert "ACK_WAIT_BEGIN" not in operations
+
+
+def test_rendered_user_turn_does_not_shortcut_existing_acknowledgment(monkeypatch):
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page(acknowledge=False)
+    bridge = ArchitectPlaywright(page)
+    bridge.current_visible_user_message_texts = lambda: ["visible only"]
+    operations = []
+    bridge.diagnostic_trace = type("Trace", (), {"record": lambda self, *args, **_kwargs: operations.append(args[2])})()
+    with pytest.raises(ResultSubmissionError) as caught:
+        bridge.submit_result_bounded("visible only", timeout=0.15)
+    assert caught.value.code == "ARCHITECT_SUBMISSION_ACK_TIMEOUT"
+    assert "ACK_WAIT_BEGIN" in operations
+    assert "ACK_WAIT_COMPLETE" in operations
+    assert operations[-1] == "SUBMIT_ACTION_TERMINAL"
+
+
 def make_bootstrap(tmp_path):
     (tmp_path / "AFFOTECH_EXECUTOR_BOOTSTRAP.md").write_text("AFFOTECH EXECUTOR TEST BOOTSTRAP\n", encoding="utf-8")
 
