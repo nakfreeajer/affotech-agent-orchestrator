@@ -174,6 +174,49 @@ Ordinary discussion is not machine authority.
 
 Presence of the literal opening marker `<ORCHESTRATOR_RESULT>` means the response is attempting machine authority. An attempted but invalid envelope fails closed and must never be silently downgraded into ordinary prose.
 
+## Approved prompt-transport target — hybrid immutable Markdown artifact
+
+Architecture decision date: 2026-10-04.
+
+Rony approved `HYBRID_MD_ARTIFACT_RECOMMENDED` as the target AFFOTECH prompt-transport architecture. This is a future migration target, not the currently active production wire format.
+
+The intended boundary is:
+
+```text
+Architect
+-> small deterministic control envelope
++ exact immutable Executor .md prompt artifact
+-> deterministic Orchestrator verification
+-> Orchestrator task allocation / workflow binding / authorization
+-> existing compact <EXECUTOR_PROMPT_ARTIFACT> descriptor
+-> bounded Executor
+```
+
+Authority remains:
+
+- Rony is final human authority;
+- Architect owns prompt meaning and exact prompt content;
+- the deterministic Orchestrator owns task numbering, artifact materialization, independent verification, workflow binding, authorization, dispatch and recovery;
+- Executor owns neither prompt selection nor prompt authorization.
+
+The active v1 protocol above remains valid during migration. Existing `promptBegin ... promptEnd` handling must not be removed, reinterpreted or silently upgraded while any recoverable production state depends on it. The protected pre-upgrade rollover lineage `7fdbd798659f42295a18dd2d / 000103` remains outside the migration surface unless Rony separately authorizes a change.
+
+The v2 direction is compatibility-first:
+
+1. add an explicit v2 control-envelope/artifact protocol alongside v1;
+2. qualify Architect-authored artifact ingress and exact SHA-256 / byte-length verification;
+3. compare v1 inline prompt identity with v2 artifact identity using synthetic qualification tasks without duplicate execution;
+4. run one controlled artifact-only transaction;
+5. qualify restart, HUMAN_REQUIRED, F9/F10, documentation closure, rollover and same-task correction;
+6. make v2 the default only after accepted evidence;
+7. retire `promptBegin/promptEnd` only when no recoverable production state depends on v1.
+
+The first proposed bounded milestone is `PROMPT.ARTIFACT.V2.DUALPROTOCOL.1A`: qualification-only dual-protocol parsing plus durable, verified, unbound prompt-ingress foundation. It must not yet authorize v2 dispatch, allocate a next task merely from artifact ingress, alter current task sequencing, or migrate existing production state. Before implementation it must perform a read-only live-state preflight and fail closed if the protected/in-flight lineage could be disturbed.
+
+For v2, filenames, Windows Downloads, browser download names and "latest file" discovery are never workflow authority. The authoritative identity is based on immutable artifact identity plus independently verified SHA-256, byte length and current workflow ownership. A local path is an Orchestrator implementation detail, not Architect authority.
+
+To preserve the existing task-bound artifact model, distinguish Architect/source ingress identity from the final Orchestrator-bound artifact identity. The source artifact may carry a stable `promptSourceArtifactId`, SHA-256 and byte length; after the Orchestrator accepts the control decision and allocates the next task, it binds the exact verified bytes into the canonical task/transaction-bound `promptArtifactId` already used by downstream Executor dispatch.
+
 ## Resident HUMAN_REQUIRED contract
 
 `HUMAN_REQUIRED` has more than one cause. Technical failure states remain fail-closed according to their reason.
@@ -341,6 +384,16 @@ It does not use RAW-CDP as the ChatGPT mutation/control path.
 Project application/browser validation is separate and remains governed by that project's own rules.
 
 Browser object ownership includes thread ownership. A Playwright Sync bridge must be created, used and closed on its owning thread.
+
+### Future browser-observation integration candidate
+
+`Chrome-Dual-Layer-Debugger` (`nakfreeajer/Chrome-Dual-Layer-Debugger`) is acknowledged only as a future AFFOTECH integration candidate. It remains an independent project and is not an AFFOTECH dependency.
+
+Its current architectural direction combines Playwright for appropriate high-level browser ownership/UI actions with RAW-CDP/CDP for appropriate low-level observation such as network, runtime, execution-context and request/response lifecycle evidence. AFFOTECH must not wait for that project before qualifying the hybrid .md prompt transport, and the .md migration must not redesign AFFOTECH browser observation as a side effect.
+
+Until Rony explicitly authorizes a separate integration review, AFFOTECH must not import or copy unfinished debugger code, add it as a dependency, weaken existing browser protections, replace accepted Playwright/browser behavior or change current browser authority because the debugger exists.
+
+When the debugger reaches a sufficiently accepted milestone, the Architect will conduct a separate integration assessment covering which responsibilities remain Playwright, which observation duties may safely move to CDP, browser/session ownership conflicts, renderer-memory/DOM-polling effects, rollover observation, overlap with existing GAS/RAW-CDP mechanisms, reusable packaging options and interaction with the hybrid prompt-artifact architecture.
 
 ## Architect rollover
 
