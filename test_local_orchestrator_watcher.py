@@ -348,6 +348,145 @@ def test_send_substage_post_snapshot_runs_after_exceptions_and_preserves_failure
     assert "ACK_WAIT_BEGIN" not in operations
 
 
+def test_send_exception_records_sanitized_playwright_call_log_and_action_timing():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    call_log = ("Timeout 1000ms exceeded.\nCall log:\n"
+                "  - attempting click action\n"
+                "  - waiting for scheduled navigations to finish")
+    page = _submission_page(click_error=TimeoutError(call_log))
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = type("Trace", (), {
+        "record": lambda self, *args, **kwargs: records.append((args[2], kwargs))
+    })()
+    def fallback_press(key, **_kwargs):
+        if key == "ControlOrMeta+A":
+            page.value = ""
+        elif key == "Enter":
+            page.sent = True
+            page.value = ""
+    page.composer_locator.press = fallback_press
+    bridge.submit_result_bounded("private control payload", timeout=1)
+
+    event = next(fields for operation, fields in records if operation == "SEND_CLICK_EXCEPTION")
+    assert event["exceptionType"] == "TimeoutError"
+    assert event["exceptionMessage"] == call_log
+    assert event["playwrightActionCompletedBeforeWaitTimeout"] is True
+    assert event["beginMonotonicNs"] <= event["completionMonotonicNs"]
+    assert "private control payload" not in json.dumps(records)
+    focus = next(fields for operation, fields in records if operation == "FALLBACK_FOCUS_COMPLETE")
+    assert focus["beginMonotonicNs"] <= focus["completionMonotonicNs"]
+
+
+def test_fallback_focus_exception_records_exact_sanitized_playwright_message():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page(click_error=TimeoutError("click timed out"))
+    original_focus = page.composer_locator.focus
+    count = {"value": 0}
+    def focus(**kwargs):
+        count["value"] += 1
+        if count["value"] == 2:
+            raise TimeoutError("Timeout 1000ms exceeded. Call log: - waiting for locator(#composer)")
+        return original_focus(**kwargs)
+    page.composer_locator.focus = focus
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = type("Trace", (), {
+        "record": lambda self, *args, **kwargs: records.append((args[2], kwargs))
+    })()
+    with pytest.raises(ResultSubmissionError) as caught:
+        bridge.submit_result_bounded("focus control text", timeout=1)
+    assert caught.value.code == "ARCHITECT_SEND_ACTION_FAILED"
+    focus_event = next(fields for operation, fields in records if operation == "FALLBACK_FOCUS_EXCEPTION")
+    assert focus_event["exceptionType"] == "TimeoutError"
+    assert focus_event["exceptionMessage"] == "Timeout 1000ms exceeded. Call log: - waiting for locator(#composer)"
+    assert focus_event["playwrightActionCompletedBeforeWaitTimeout"] is False
+    assert focus_event["beginMonotonicNs"] <= focus_event["completionMonotonicNs"]
+    operations = [operation for operation, _ in records]
+    assert operations.index("FALLBACK_FOCUS_BEGIN") < operations.index("FALLBACK_FOCUS_EXCEPTION")
+    assert operations.index("FALLBACK_FOCUS_EXCEPTION") < operations.index("POST_ACTION_SNAPSHOT")
+
+
+def test_send_cdp_observer_correlates_conversation_post_lifecycle_by_request_id():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    class CdpSession:
+        def __init__(self):
+            self.listeners = {}
+            self.sent = []
+            self.detached = False
+        def send(self, method, params=None): self.sent.append((method, params))
+        def on(self, event, handler): self.listeners[event] = handler
+        def remove_listener(self, event, handler):
+            if self.listeners.get(event) is handler: self.listeners.pop(event)
+        def detach(self): self.detached = True
+
+    page = _submission_page()
+    session = CdpSession()
+    page.context = type("Context", (), {"new_cdp_session": lambda _self, target: session})()
+    records = []
+    bridge = ArchitectPlaywright(page)
+    bridge.diagnostic_trace = type("Trace", (), {
+        "record": lambda self, *args, **kwargs: records.append((args[2], kwargs))
+    })()
+    started = time.monotonic()
+    observer = bridge._start_send_window_cdp_observer(started)
+    assert observer is not None
+    assert ("Network.enable", None) in session.sent
+    assert ("Page.enable", None) in session.sent
+
+    session.listeners["Network.requestWillBeSent"]({
+        "requestId": "req-17", "loaderId": "loader-3", "frameId": "frame-2",
+        "type": "Fetch", "timestamp": 12.5,
+        "request": {"url": "https://chatgpt.com/backend-api/f/conversation?secret=hidden",
+                     "method": "POST", "postData": "private body"},
+        "initiator": {"type": "script", "stack": {"callFrames": [
+            {"functionName": "submit", "url": "https://chatgpt.com/assets/app.js?token=hidden",
+             "lineNumber": 4, "columnNumber": 8}]}}
+    })
+    session.listeners["Network.responseReceived"]({
+        "requestId": "req-17", "type": "Fetch", "timestamp": 13.0,
+        "response": {"status": 200, "headers": {"authorization": "must-not-log"}},
+    })
+    session.listeners["Network.loadingFailed"]({
+        "requestId": "req-17", "timestamp": 14.0, "errorText": "net::ERR_ABORTED",
+        "canceled": True, "blockedReason": "inspector"
+    })
+    session.listeners["Page.frameNavigated"]({"frame": {
+        "id": "frame-2", "loaderId": "loader-4", "url": "https://chatgpt.com/c/1234567890abcdef1234567890abcdef?secret=x"
+    }})
+    session.listeners["Inspector.detached"]({"reason": "Render process gone"})
+    bridge._stop_send_window_cdp_observer(observer, started)
+
+    summary = next(fields for operation, fields in records if operation == "CDP_CONVERSATION_POST_LIFECYCLE")
+    assert summary["requestId"] == "req-17"
+    assert summary["loaderId"] == "loader-3" and summary["frameId"] == "frame-2"
+    assert summary["resourceType"] == "Fetch"
+    assert summary["initiator"]["type"] == "script"
+    assert summary["responseStatus"] == 200
+    assert summary["errorText"] == "NET::ERR_ABORTED"
+    assert summary["canceled"] is True
+    serialized = json.dumps(records)
+    for forbidden in ("private body", "secret=hidden", "must-not-log", "postData", "headers"):
+        assert forbidden not in serialized
+    assert "CDP_PAGE_FRAME_NAVIGATED" in [operation for operation, _ in records]
+    assert "CDP_INSPECTOR_DETACHED" in [operation for operation, _ in records]
+    assert session.detached is True
+
+
+def test_send_cdp_observer_is_disabled_by_default():
+    from local_orchestrator_watcher import ArchitectPlaywright
+
+    page = _submission_page()
+    created = []
+    page.context = type("Context", (), {"new_cdp_session": lambda _self, target: created.append(target)})()
+    bridge = ArchitectPlaywright(page)
+    bridge.submit_result_bounded("normal runtime", timeout=1)
+    assert created == []
+
+
 def test_rendered_user_turn_does_not_shortcut_existing_acknowledgment(monkeypatch):
     from local_orchestrator_watcher import ArchitectPlaywright
 

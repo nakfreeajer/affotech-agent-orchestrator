@@ -3836,6 +3836,7 @@ class ArchitectPlaywright:
         # after submit_result_bounded returns. Runtime sends default to false.
         self.retain_send_window_network_observer = False
         self._pending_send_window_network_observer = None
+        self._pending_send_window_cdp_observer = None
 
     def _trace_operation(self, operation: str, phase: str, started: float | None = None, **fields: Any) -> None:
         tracer = getattr(self, "diagnostic_trace", None)
@@ -5180,6 +5181,266 @@ class ArchitectPlaywright:
         except Exception:
             pass
 
+    @staticmethod
+    def _safe_playwright_exception(error: BaseException, submitted_text: str = "") -> dict[str, Any]:
+        """Keep Playwright's useful call log while excluding prompt/URL secrets."""
+        message = str(error)
+        if submitted_text:
+            message = message.replace(submitted_text, "[REDACTED_SUBMITTED_TEXT]")
+        message = re.sub(r"(?i)(https?://[^\s?#\"']+)\?[^\s#\"']*", r"\1?[REDACTED]", message)
+        message = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+", r"\1[REDACTED]", message)
+        message = re.sub(r"(?i)(cookie\s*[:=]\s*)([^\r\n]+)", r"\1[REDACTED]", message)
+        message = re.sub(r"(?i)((?:access|refresh)?_?token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+",
+                         r"\1=[REDACTED]", message)
+        message = message[:6000]
+        call_log = message.split("Call log:", 1)[1] if "Call log:" in message else ""
+        lines = [line.strip(" \t-•") for line in call_log.splitlines() if line.strip(" \t-•")]
+        last_line = lines[-1][:500] if lines else None
+        lowered = message.lower()
+        if "waiting for scheduled navigations" in lowered and any(
+            marker in lowered for marker in ("performing click", "attempting click")
+        ):
+            action_completed: bool | None = True
+            completion_evidence = "PLAYWRIGHT_CALL_LOG_WAITING_FOR_SCHEDULED_NAVIGATION"
+        elif any(marker in (last_line or "").lower() for marker in (
+            "waiting for element", "element is not", "intercepts pointer events",
+            "not visible", "not enabled", "not stable", "waiting for locator",
+        )):
+            action_completed = False
+            completion_evidence = "PLAYWRIGHT_CALL_LOG_LAST_LINE_BEFORE_ACTION_COMPLETION"
+        else:
+            action_completed = None
+            completion_evidence = "CALL_LOG_DOES_NOT_ESTABLISH_ACTION_COMPLETION"
+        return {
+            "exceptionType": type(error).__name__[:200],
+            "exceptionMessage": message,
+            "playwrightCallLogLastLine": last_line,
+            "playwrightActionCompletedBeforeWaitTimeout": action_completed,
+            "actionCompletionEvidence": completion_evidence,
+        }
+
+    @staticmethod
+    def _safe_cdp_url_category(value: Any) -> str:
+        try:
+            parsed = urlsplit(str(value or ""))
+            if not parsed.scheme or not parsed.hostname:
+                return ""
+            segments = [part for part in parsed.path.split("/") if part]
+            safe_segments = [
+                "{id}" if re.fullmatch(r"[0-9a-fA-F-]{16,}", part) or len(part) >= 32 else part[:48]
+                for part in segments[:6]
+            ]
+            return f"{parsed.scheme}://{parsed.hostname[:128]}/" + "/".join(safe_segments)
+        except Exception:
+            return ""
+
+    def _start_send_window_cdp_observer(self, started: float) -> dict[str, Any] | None:
+        """Opt-in passive CDP lifecycle capture, retained with the send diagnostic window."""
+        page = getattr(self, "page", None)
+        context = getattr(page, "context", None)
+        create_session = getattr(context, "new_cdp_session", None)
+        if not callable(create_session):
+            return None
+        session = None
+        try:
+            session = create_session(page)
+            session.send("Network.enable")
+            session.send("Page.enable")
+            try:
+                session.send("Page.setLifecycleEventsEnabled", {"enabled": True})
+            except Exception:
+                pass
+            rows: dict[str, dict[str, Any]] = {}
+            event_handlers: list[tuple[str, Callable[..., Any]]] = []
+            page_handlers: list[tuple[str, Callable[..., Any]]] = []
+            cap = 300
+            cap_reported = [False]
+
+            def emit(operation: str, **fields: Any) -> None:
+                self._send_diagnostic_record(operation, "OBSERVED", started, **fields)
+
+            def safe_stack(initiator: Any) -> dict[str, Any]:
+                if not isinstance(initiator, dict):
+                    return {"type": ""}
+                stack = initiator.get("stack") if isinstance(initiator.get("stack"), dict) else {}
+                frames = []
+                for frame in (stack.get("callFrames") or [])[:8]:
+                    if not isinstance(frame, dict):
+                        continue
+                    function_name = str(frame.get("functionName") or "")
+                    if not re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]{0,79}", function_name):
+                        function_name = "[NON_IDENTIFIER]" if function_name else ""
+                    frames.append({
+                        "functionName": function_name,
+                        "scriptPathCategory": self._safe_cdp_url_category(frame.get("url")),
+                        "lineNumber": frame.get("lineNumber") if isinstance(frame.get("lineNumber"), int) else None,
+                        "columnNumber": frame.get("columnNumber") if isinstance(frame.get("columnNumber"), int) else None,
+                    })
+                return {"type": str(initiator.get("type") or "")[:80],
+                        "stackDepth": len(stack.get("callFrames") or []), "frames": frames}
+
+            def listen(event: str, callback: Callable[[dict[str, Any]], None]) -> None:
+                session.on(event, callback)
+                event_handlers.append((event, callback))
+
+            def request_will_be_sent(params: dict[str, Any]) -> None:
+                request = params.get("request") if isinstance(params.get("request"), dict) else {}
+                path_category = self._safe_cdp_url_category(request.get("url"))
+                row = {
+                    "requestId": str(params.get("requestId") or "")[:200],
+                    "loaderId": str(params.get("loaderId") or "")[:200],
+                    "frameId": str(params.get("frameId") or "")[:200],
+                    "method": str(request.get("method") or "")[:12],
+                    "pathCategory": path_category,
+                    "resourceType": str(params.get("type") or "")[:80],
+                    "initiator": safe_stack(params.get("initiator")),
+                    "timestamp": params.get("timestamp"),
+                    "monotonicNs": time.monotonic_ns(),
+                    "responseStatus": None,
+                    "responseTimestamp": None,
+                    "finishedTimestamp": None,
+                    "failedTimestamp": None,
+                    "errorText": None,
+                    "canceled": None,
+                    "blockedReason": None,
+                    "conversationPost": str(request.get("method") or "").upper() == "POST"
+                        and urlsplit(str(request.get("url") or "")).path.rstrip("/").endswith("/backend-api/f/conversation"),
+                }
+                request_id = row["requestId"]
+                if not request_id:
+                    return
+                if request_id not in rows and len(rows) >= cap:
+                    if not cap_reported[0]:
+                        cap_reported[0] = True
+                        emit("CDP_OBSERVER_REQUEST_CAP_REACHED", requestCap=cap)
+                    return
+                rows[request_id] = row
+                emit("CDP_NETWORK_REQUEST_WILL_BE_SENT", **row)
+
+            def row_for(params: dict[str, Any]) -> dict[str, Any] | None:
+                return rows.get(str(params.get("requestId") or ""))
+
+            def response_received(params: dict[str, Any]) -> None:
+                row = row_for(params)
+                response = params.get("response") if isinstance(params.get("response"), dict) else {}
+                if row is None:
+                    return
+                row["responseStatus"] = response.get("status")
+                row["responseTimestamp"] = params.get("timestamp")
+                emit("CDP_NETWORK_RESPONSE_RECEIVED", requestId=row["requestId"],
+                     status=response.get("status"), resourceType=str(params.get("type") or row["resourceType"])[:80],
+                     timestamp=params.get("timestamp"), conversationPost=row["conversationPost"])
+
+            def loading_finished(params: dict[str, Any]) -> None:
+                row = row_for(params)
+                if row is not None:
+                    row["finishedTimestamp"] = params.get("timestamp")
+                emit("CDP_NETWORK_LOADING_FINISHED", requestId=str(params.get("requestId") or "")[:200],
+                     timestamp=params.get("timestamp"), conversationPost=bool(row and row["conversationPost"]))
+
+            def loading_failed(params: dict[str, Any]) -> None:
+                row = row_for(params)
+                error_text = str(params.get("errorText") or "")
+                safe_error = re.search(r"(?:net::)?ERR_[A-Z0-9_]+|NS_ERROR_[A-Z0-9_]+", error_text, re.I)
+                error_category = safe_error.group(0).upper() if safe_error else ("CANCELED" if params.get("canceled") else "REQUEST_FAILED")
+                blocked_reason = str(params.get("blockedReason") or "")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", blocked_reason):
+                    blocked_reason = "OTHER" if blocked_reason else ""
+                if row is not None:
+                    row.update({"failedTimestamp": params.get("timestamp"), "errorText": error_category,
+                                "canceled": params.get("canceled"), "blockedReason": blocked_reason or None})
+                emit("CDP_NETWORK_LOADING_FAILED", requestId=str(params.get("requestId") or "")[:200],
+                     timestamp=params.get("timestamp"), errorText=error_category,
+                     canceled=params.get("canceled"), blockedReason=blocked_reason or None,
+                     conversationPost=bool(row and row["conversationPost"]))
+
+            def frame_navigated(params: dict[str, Any]) -> None:
+                frame = params.get("frame") if isinstance(params.get("frame"), dict) else {}
+                emit("CDP_PAGE_FRAME_NAVIGATED", frameId=str(frame.get("id") or "")[:200],
+                     parentFrameId=str(frame.get("parentId") or "")[:200], loaderId=str(frame.get("loaderId") or "")[:200],
+                     urlCategory=self._safe_cdp_url_category(frame.get("url")))
+
+            def lifecycle(params: dict[str, Any]) -> None:
+                emit("CDP_PAGE_LIFECYCLE", frameId=str(params.get("frameId") or "")[:200],
+                     loaderId=str(params.get("loaderId") or "")[:200], name=str(params.get("name") or "")[:80],
+                     timestamp=params.get("timestamp"))
+
+            def frame_detached(params: dict[str, Any]) -> None:
+                emit("CDP_PAGE_FRAME_DETACHED", frameId=str(params.get("frameId") or "")[:200],
+                     reason=str(params.get("reason") or "")[:80])
+
+            def inspector_detached(params: dict[str, Any]) -> None:
+                reason = str(params.get("reason") or "")
+                safe_reason = reason if re.fullmatch(r"[A-Za-z0-9_. -]{1,100}", reason) else "OTHER"
+                emit("CDP_INSPECTOR_DETACHED", reason=safe_reason)
+
+            for event, callback in (("Network.requestWillBeSent", request_will_be_sent),
+                                    ("Network.responseReceived", response_received),
+                                    ("Network.loadingFinished", loading_finished),
+                                    ("Network.loadingFailed", loading_failed),
+                                    ("Page.frameNavigated", frame_navigated),
+                                    ("Page.lifecycleEvent", lifecycle),
+                                    ("Page.frameDetached", frame_detached),
+                                    ("Inspector.detached", inspector_detached),
+                                    ("Target.detachedFromTarget", inspector_detached)):
+                listen(event, callback)
+
+            add_page_listener = getattr(page, "on", None)
+            if callable(add_page_listener):
+                for event, operation in (("close", "PLAYWRIGHT_PAGE_CLOSED"), ("crash", "PLAYWRIGHT_PAGE_CRASHED"),
+                                         ("framenavigated", "PLAYWRIGHT_FRAME_NAVIGATED")):
+                    def handler(frame: Any = None, *, _event: str = event, _operation: str = operation) -> None:
+                        if _event == "framenavigated":
+                            url = getattr(frame, "url", "")
+                            emit(_operation, urlCategory=self._safe_cdp_url_category(url),
+                                 isMainFrame=bool(getattr(frame, "parent_frame", None) is None))
+                        else:
+                            emit(_operation)
+                    add_page_listener(event, handler)
+                    page_handlers.append((event, handler))
+            return {"session": session, "rows": rows, "eventHandlers": event_handlers,
+                    "page": page, "pageHandlers": page_handlers, "started": started}
+        except Exception as error:
+            try:
+                session.detach()
+            except Exception:
+                pass
+            self._send_diagnostic_record("CDP_OBSERVER_ATTACH_FAILED", "ERROR", started,
+                                         exceptionType=type(error).__name__[:120])
+            return None
+
+    def _stop_send_window_cdp_observer(self, observer: dict[str, Any] | None, started: float) -> None:
+        if not observer:
+            return
+        session = observer.get("session")
+        remove = getattr(session, "remove_listener", None) or getattr(session, "off", None)
+        if callable(remove):
+            for event, handler in observer.get("eventHandlers", []):
+                try:
+                    remove(event, handler)
+                except Exception:
+                    pass
+        page = observer.get("page")
+        page_remove = getattr(page, "remove_listener", None) or getattr(page, "off", None)
+        if callable(page_remove):
+            for event, handler in observer.get("pageHandlers", []):
+                try:
+                    page_remove(event, handler)
+                except Exception:
+                    pass
+        try:
+            session.detach()
+        except Exception:
+            pass
+        rows = observer.get("rows", {})
+        for row in rows.values():
+            if row.get("conversationPost"):
+                self._send_diagnostic_record("CDP_CONVERSATION_POST_LIFECYCLE", "SUMMARY", started,
+                                             **{key: row.get(key) for key in (
+                                                 "requestId", "loaderId", "frameId", "resourceType", "initiator",
+                                                 "timestamp", "responseStatus", "responseTimestamp", "finishedTimestamp",
+                                                 "failedTimestamp", "errorText", "canceled", "blockedReason")})
+
     def _send_diagnostic_snapshot(self, started: float) -> dict[str, Any]:
         """Read bounded state summaries only; never include message contents."""
         snapshot: dict[str, Any] = {
@@ -5378,9 +5639,14 @@ class ArchitectPlaywright:
         """End an explicitly retained diagnostic observer without page mutation."""
         observer = getattr(self, "_pending_send_window_network_observer", None)
         self._pending_send_window_network_observer = None
+        cdp_observer = getattr(self, "_pending_send_window_cdp_observer", None)
+        self._pending_send_window_cdp_observer = None
         if observer is None:
-            return []
-        return self._stop_send_window_network_observer(observer, observer["started"])
+            rows = []
+        else:
+            rows = self._stop_send_window_network_observer(observer, observer["started"])
+        self._stop_send_window_cdp_observer(cdp_observer, cdp_observer["started"] if cdp_observer else time.monotonic())
+        return rows
 
     def submit_result_bounded(self, result: str, timeout: float = 30.0) -> None:
         _qualification_assert_page_allowed(self.page, "send")
@@ -5491,6 +5757,7 @@ class ArchitectPlaywright:
         terminal_detail = None
         terminal_exception_class = None
         network_observer = None
+        cdp_observer = None
         try:
             try:
                 self.sendActionAttempted = True
@@ -5498,15 +5765,25 @@ class ArchitectPlaywright:
                 self._send_diagnostic_record("SUBMIT_ACTION_BEGIN", "BEGIN", action_started,
                                              snapshot=begin_snapshot)
                 network_observer = self._start_send_window_network_observer()
+                # CDP lifecycle capture is diagnostic opt-in only. The default
+                # runtime path does not create an additional CDP session.
+                if getattr(self, "retain_send_window_network_observer", False):
+                    cdp_observer = self._start_send_window_cdp_observer(action_started)
+                click_begin_ns = time.monotonic_ns()
                 self._send_diagnostic_record("SEND_CLICK_BEGIN", "BEGIN", action_started,
-                                             exactSubstage="SEND_BUTTON_CLICK")
+                                             exactSubstage="SEND_BUTTON_CLICK",
+                                             beginMonotonicNs=click_begin_ns)
                 if self.diagnostic_trace:
                     self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send Architect payload", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
                 try:
                     send.click(timeout=1000)
                 except Exception as error:
+                    click_end_ns = time.monotonic_ns()
                     self._send_diagnostic_record("SEND_CLICK_EXCEPTION", "ERROR", action_started,
+                                                 **self._safe_playwright_exception(error, result),
                                                  exceptionClass=type(error).__name__,
+                                                 beginMonotonicNs=click_begin_ns,
+                                                 completionMonotonicNs=click_end_ns,
                                                  elapsedMs=round((time.monotonic() - action_started) * 1000, 3),
                                                  exactSubstage="SEND_BUTTON_CLICK")
                     if type(error).__name__ != "TimeoutError":
@@ -5515,16 +5792,27 @@ class ArchitectPlaywright:
                     self._send_diagnostic_record("FALLBACK_BEGIN", "BEGIN", action_started,
                                                  reason="SEND_BUTTON_CLICK_TIMEOUT")
                     self.sendActionAttempted = True
+                    focus_begin_ns = time.monotonic_ns()
+                    self._send_diagnostic_record("FALLBACK_FOCUS_BEGIN", "BEGIN", action_started,
+                                                 exactSubstage="FALLBACK_COMPOSER_FOCUS",
+                                                 beginMonotonicNs=focus_begin_ns)
                     try:
                         composer = self._live_composer()
                         composer.focus(timeout=1000)
                     except Exception as focus_error:
+                        focus_end_ns = time.monotonic_ns()
                         self._send_diagnostic_record("FALLBACK_FOCUS_EXCEPTION", "ERROR", action_started,
+                                                     **self._safe_playwright_exception(focus_error, result),
                                                      exceptionClass=type(focus_error).__name__,
+                                                     beginMonotonicNs=focus_begin_ns,
+                                                     completionMonotonicNs=focus_end_ns,
                                                      exactSubstage="FALLBACK_COMPOSER_FOCUS")
                         raise ResultSubmissionError("ARCHITECT_SEND_ACTION_FAILED", type(focus_error).__name__) from focus_error
                     self._send_diagnostic_record("FALLBACK_FOCUS_COMPLETE", "END", action_started,
-                                                 exactSubstage="FALLBACK_COMPOSER_FOCUS")
+                                                 exactSubstage="FALLBACK_COMPOSER_FOCUS",
+                                                 beginMonotonicNs=focus_begin_ns,
+                                                 completionMonotonicNs=time.monotonic_ns(),
+                                                 actionCompletedBeforeWaitTimeout=True)
                     if self.diagnostic_trace:
                         self.diagnostic_trace.record("PLAYWRIGHT", "submit_result_bounded", "PLAYWRIGHT_VISIBLE_MUTATION", "BEGIN", {}, reason="send fallback Enter", callingFunction="submit_result_bounded", connectionId=self._diagnostic_connection_id, mutation=True)
                     self._send_diagnostic_record("FALLBACK_ENTER_BEGIN", "BEGIN", action_started,
@@ -5547,7 +5835,10 @@ class ArchitectPlaywright:
                     self.initialSendMethod = self.last_send_method
                     self.initialSendActionReturned = True
                     self._send_diagnostic_record("SEND_CLICK_COMPLETE", "END", action_started,
-                                                 exactSubstage="SEND_BUTTON_CLICK")
+                                                 exactSubstage="SEND_BUTTON_CLICK",
+                                                 beginMonotonicNs=click_begin_ns,
+                                                 completionMonotonicNs=time.monotonic_ns(),
+                                                 actionCompletedBeforeWaitTimeout=True)
             finally:
                 post_snapshot = self._send_diagnostic_snapshot(action_started)
                 self._send_diagnostic_record("POST_ACTION_SNAPSHOT", "OBSERVED", action_started,
@@ -5592,12 +5883,15 @@ class ArchitectPlaywright:
             terminal_detail = getattr(error, "detail", None)
             raise
         finally:
-            if network_observer is not None and getattr(self, "retain_send_window_network_observer", False):
+            retain_observation = getattr(self, "retain_send_window_network_observer", False)
+            if retain_observation and (network_observer is not None or cdp_observer is not None):
                 self._pending_send_window_network_observer = network_observer
+                self._pending_send_window_cdp_observer = cdp_observer
                 self._send_diagnostic_record("SEND_WINDOW_NETWORK_RETAINED", "OBSERVED", action_started,
                                              disposition="DIAGNOSTIC_OPT_IN")
             else:
                 self._stop_send_window_network_observer(network_observer, action_started)
+                self._stop_send_window_cdp_observer(cdp_observer, action_started)
             self._send_diagnostic_record("SUBMIT_ACTION_TERMINAL", "END", action_started,
                                          disposition=disposition,
                                          terminalReason=terminal_reason or disposition,
