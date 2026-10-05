@@ -10087,6 +10087,169 @@ def _epoch4_sent_incident_fixture(tmp_path):
     return watcher, prompt, prompt_bytes
 
 
+def _configure_epoch5_ambiguous_candidate_recovery(watcher, prompt):
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    fresh_id = "6ab8b6d4-1628-83ec-9079-670b78f653f2"
+    handover = (
+        "AFFOTECH ARCHITECT SESSION HANDOVER\n"
+        "Preserved existing transaction for the exact staged task.\n"
+        f"Rollover transaction ID: {tx}\nTarget task 000103.\nARCHITECT_HANDOVER_READY"
+    )
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+    authorization = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4,
+        "qualificationEpoch": 5, "executorLaunchAuthorized": False,
+        "requiresNormalRolloverCompletion": True,
+    }
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED", "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+        "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "taskSequence": 102,
+        "nextTaskId": "000103", "nextPromptPath": str(prompt),
+        "rolloverTransactionId": tx, "rolloverTransactionTaskId": "000103",
+        "rolloverRecoveryEpoch": 5, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5,
+        "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": False,
+        "handoverRequested": False, "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "DEFERRED", "rolloverFreshPageCreated": True,
+        "rolloverFreshCandidateConversationId": fresh_id,
+        "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+        "rolloverFreshBootstrapPayloadHash": hashlib.sha256(bootstrap.encode()).hexdigest(),
+        "rolloverHandoverResponseIdentity": hashlib.sha256(handover.encode()).hexdigest(),
+        "pending_handover": handover,
+        "rolloverSentResponseRetryAuthorization": authorization,
+        "rolloverSentResponseRetryAuthorizations": [authorization],
+        "postDiscussionEnvelopeRequired": True, "postDiscussionResumeEpoch": 7,
+        "postDiscussionProtocolTaskId": "000103", "postDiscussionProtocolTransactionId": tx,
+        "postDiscussionProtocolRolloverCommittedTransactionId": None,
+        "postDiscussionEnvelopeRepairTaskId": "000103", "postDiscussionEnvelopeRepairEpoch": 7,
+        "discussionPauseActive": False,
+        "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorSessionMode": "PERSISTENT", "executorProcessState": "COMPLETED_WITH_RESULT",
+        "executorActiveWriter": False, "governedExecutorActiveWriter": False,
+        "architectConversationId": "old-architect-not-open",
+    })
+    watcher.save()
+    return tx, fresh_id, handover, bootstrap
+
+
+class _RecoveryCandidatePage:
+    def __init__(self, conversation_id, bootstrap=None, ready=True):
+        self.url = f"https://chatgpt.com/c/{conversation_id}"
+        self.closed = False
+        self.context = None
+        self.bootstrap = bootstrap
+        self.ready = ready
+        self.new_page_calls = 0
+        self.submission_calls = 0
+    def evaluate(self, script):
+        if "stop-button" in script:
+            return False
+        if "fresh-user-dom-fallback" in script:
+            return [self.bootstrap] if self.bootstrap else []
+        if "fresh-assistant-ready-dom-fallback" in script:
+            return ["ARCHITECT_SESSION_READY"] if self.ready else []
+        if 'data-message-author-role="user"' in script or 'data-message-author-role="assistant"' in script:
+            return []
+        return False
+    def close(self):
+        self.closed = True
+    def goto(self, *_args, **_kwargs):
+        raise AssertionError("recovery must not navigate")
+    def reload(self, *_args, **_kwargs):
+        raise AssertionError("recovery must not reload")
+
+
+def _recovery_bridge(anchor_page, contexts):
+    bridge = ArchitectPlaywright(anchor_page)
+    bridge._browser = type("Browser", (), {"contexts": contexts})()
+    return bridge
+
+
+def test_protected_recovery_uses_exact_existing_candidate_and_keeps_pages_open(tmp_path, monkeypatch):
+    watcher, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx, fresh_id, handover, bootstrap = _configure_epoch5_ambiguous_candidate_recovery(watcher, prompt)
+    assert watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher)
+
+    unrelated = _RecoveryCandidatePage("unrelated-existing-page")
+    candidate = _RecoveryCandidatePage(fresh_id, bootstrap, True)
+    context = type("Context", (), {"pages": [unrelated, candidate],
+                                  "new_page": lambda _self: (_ for _ in ()).throw(AssertionError("page creation forbidden"))})()
+    unrelated.context = candidate.context = context
+    attaches = []
+    def attach(endpoint, conversation_id=None):
+        attaches.append((endpoint, conversation_id))
+        if conversation_id == watcher.state["architectConversationId"]:
+            assert all(watcher.state["architectConversationId"] not in page.url for page in context.pages)
+            raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+        assert conversation_id is None
+        return _recovery_bridge(unrelated, [context])
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach))
+    with pytest.raises(RuntimeError, match="ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND"):
+        ArchitectPlaywright.attach("endpoint", watcher.state["architectConversationId"])
+    assert attaches[-1] == ("endpoint", watcher.state["architectConversationId"])
+    monkeypatch.setattr(watcher, "process_pending_handover_response",
+                        lambda bridge, response: watcher.session_rollover.complete_from_response(bridge, response))
+
+    result = watcher_module._recover_ambiguous_fresh_candidate_once(watcher, "endpoint")
+
+    assert result == "NEXT_PROMPT_READY"
+    assert watcher.state["state"] == "NEXT_PROMPT_READY"
+    assert watcher.state.get("humanRequiredReason") is None
+    assert watcher.state["architectConversationId"] == fresh_id
+    assert watcher.state["postDiscussionProtocolRolloverCommittedTransactionId"] == tx
+    assert watcher.state["nextTaskId"] == "000103"
+    assert watcher.state["rolloverPending"] is False
+    assert watcher.state["rolloverDue"] is False
+    assert watcher.state["rolloverInProgress"] is False
+    assert watcher.state["handoverRequested"] is False
+    assert not watcher.state.get("v2AcceptancePreparation")
+    assert not candidate.closed and not unrelated.closed
+    assert candidate.new_page_calls == unrelated.new_page_calls == 0
+    assert candidate.submission_calls == unrelated.submission_calls == 0
+    assert attaches.count(("endpoint", None)) == 1
+    assert prompt.read_bytes() == prompt_bytes
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest().upper() == "70D6ECCAB4FED573CD03C4DDF3867073E087C47927EBDF25DBFC63554F6EDE85"
+
+
+@pytest.mark.parametrize("failure", ["zero", "multiple", "bootstrap", "ready", "stability", "attach"])
+def test_protected_recovery_candidate_failures_are_closed(tmp_path, monkeypatch, failure):
+    watcher, prompt, _prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    _tx, fresh_id, _handover, bootstrap = _configure_epoch5_ambiguous_candidate_recovery(watcher, prompt)
+    unrelated = _RecoveryCandidatePage("unrelated-existing-page")
+    candidate_bootstrap = "wrong bootstrap" if failure == "bootstrap" else bootstrap
+    candidate = _RecoveryCandidatePage(fresh_id, candidate_bootstrap, failure != "ready")
+    duplicate = _RecoveryCandidatePage(fresh_id, bootstrap, True)
+    pages = [unrelated]
+    if failure != "zero" and failure != "attach":
+        pages.append(duplicate if failure == "multiple" else candidate)
+    if failure == "multiple":
+        candidate.bootstrap = bootstrap
+        pages.append(candidate)
+    context = type("Context", (), {"pages": pages,
+                                  "new_page": lambda _self: (_ for _ in ()).throw(AssertionError("page creation forbidden"))})()
+    for page in pages:
+        page.context = context
+    def attach(_endpoint, conversation_id=None):
+        assert conversation_id is None
+        if failure == "attach":
+            raise RuntimeError("CDP_ATTACH_FAILED")
+        return _recovery_bridge(unrelated, [context])
+    monkeypatch.setattr(ArchitectPlaywright, "attach", staticmethod(attach))
+    if failure == "stability":
+        monkeypatch.setattr(watcher.session_rollover, "_fresh_candidate_proven", lambda *_args, **_kwargs: False)
+
+    assert watcher_module._recover_ambiguous_fresh_candidate_once(watcher, "endpoint") == "HUMAN_REQUIRED"
+    assert watcher.state["state"] == "HUMAN_REQUIRED"
+    assert watcher.state["architectConversationId"] == "old-architect-not-open"
+    assert watcher.state.get("postDiscussionProtocolRolloverCommittedTransactionId") is None
+    assert not any(page.closed for page in pages)
+    assert all(page.new_page_calls == 0 and page.submission_calls == 0 for page in pages)
+
+
 def test_f10_preserves_exact_protected_epoch5_recovery_context(tmp_path, monkeypatch):
     watcher, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
     tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
@@ -10817,8 +10980,9 @@ def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_pa
 
     old_page = CandidatePage(old_id)
     fresh_page = CandidatePage(fresh_id, bootstrap, True)
-    context = type("Context", (), {"pages": [old_page, fresh_page], "new_page": lambda _self: (_ for _ in ()).throw(AssertionError("must not create a second tab"))})()
-    old_page.context = fresh_page.context = context
+    unrelated_page = CandidatePage("unrelated-chatgpt-page")
+    context = type("Context", (), {"pages": [old_page, fresh_page, unrelated_page], "new_page": lambda _self: (_ for _ in ()).throw(AssertionError("must not create a second tab"))})()
+    old_page.context = fresh_page.context = unrelated_page.context = context
 
     class ProtocolBridge(_PostDiscussionBridge):
         def __init__(self):
@@ -10850,6 +11014,8 @@ def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_pa
     def attach(_endpoint, conversation_id=None):
         attaches.append(conversation_id)
         if conversation_id == old_id:
+            raise RuntimeError("ARCHITECT_CURRENT_CONVERSATION_NOT_FOUND")
+        if conversation_id is None:
             return ArchitectPlaywright(old_page)
         if conversation_id == fresh_id:
             return protocol_bridge
@@ -10908,11 +11074,11 @@ def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_pa
     assert watcher.state["postDiscussionEnvelopeRequired"] is False
     assert "postDiscussionProtocolRolloverCommittedTransactionId" not in watcher.state
     assert commits == [1]
-    assert old_page.closed is True and fresh_page.closed is False
+    assert old_page.closed is False and fresh_page.closed is False and unrelated_page.closed is False
     assert fresh_page.send_count == 0
     assert fresh_page.dom_observers.index("semantic-user") < fresh_page.dom_observers.index("visible-user")
     assert fresh_page.dom_observers.index("semantic-assistant") < fresh_page.dom_observers.index("visible-assistant-ready")
-    assert len(context.pages) == 2
+    assert len(context.pages) == 3
     assert len(protocol_bridge.sent) == 1
     assert len(launches) == 1
     assert_executor_artifact_descriptor(launches[0], "000103", prompt_bytes.decode("utf-8"))
@@ -10923,11 +11089,10 @@ def test_main_recovers_exact_existing_fresh_candidate_after_ack_ambiguity(tmp_pa
     assert watcher.state["rolloverAutomaticRecoveryEpochCount"] == watcher.state["rolloverAutomaticRecoveryMaxEpochs"] == 3
     assert watcher.state["executorSessionId"] == watcher_module.AFFOTECH_EXECUTOR_SESSION_ID
     assert prompt.read_bytes() == prompt_bytes
-    assert events.index("authority_committed") < events.index("old_architect_retired")
-    assert events.count("old_architect_retired") == 1
-    assert events.index("old_architect_retired") < events.index("formatting_repair_submitted")
+    assert "old_architect_retired" not in events
     assert events.index("formatting_repair_submitted") < events.index("executor_launch_spy")
-    assert attaches.count(old_id) == 1
+    assert old_id not in attaches
+    assert attaches.count(None) == 1
     assert attaches.count(fresh_id) >= 1
 
 

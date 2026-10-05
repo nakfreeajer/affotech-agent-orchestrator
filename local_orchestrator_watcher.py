@@ -3264,16 +3264,17 @@ class ArchitectSessionRollover:
             self.watcher.save()
             mark_watcher_liveness(self.watcher, "FRESH_AUTHORITY_COMMIT_DURABLE")
             committed = True
+            old_page_close_allowed = old_page is not new_page and hasattr(old_page, "close")
             runtime_log(getattr(self.watcher, "runtime_logger", None), getattr(self.watcher, "runtime_run_id", None), "ARCHITECT_AUTHORITY_COMMIT_DECISION", self.watcher.state,
                         oldConversationId=old_conversation_id, newConversationId=conversation_id, sessionReadyProven=True,
-                        commitAllowed=True, commitCompleted=True, oldPageCloseAllowed=True, reason="DURABLE_AUTHORITY_COMMITTED")
+                        commitAllowed=True, commitCompleted=True, oldPageCloseAllowed=old_page_close_allowed, reason="DURABLE_AUTHORITY_COMMITTED")
             if tracer:
                 tracer.record("ROLLOVER", "complete_from_response", "AUTHORITY_COMMIT_END", "END", self.watcher.state, conversationId=conversation_id)
             bridge.page = new_page
             bind_memory = getattr(self.watcher, "bind_architect_session_memory", None)
             if callable(bind_memory):
                 bind_memory(bridge, conversation_id)
-            if hasattr(old_page, "close"):
+            if old_page is not new_page and hasattr(old_page, "close"):
                 _qualification_assert_page_allowed(old_page, "retire-old-architect")
                 mark_watcher_liveness(self.watcher, "OLD_ARCHITECT_RETIRE_BEGIN")
                 if tracer:
@@ -11227,23 +11228,47 @@ def _recover_ambiguous_fresh_candidate_once(watcher: LocalFirstOrchestrator, end
     handover = str(watcher.state["pending_handover"])
     bridge = None
     try:
-        bridge = ArchitectPlaywright.attach(endpoint, watcher.state.get("architectConversationId"))
-        pages = getattr(getattr(getattr(bridge, "page", None), "context", None), "pages", [])
-        candidate_page = None
+        # This production recovery is guarded by the dedicated persisted-
+        # evidence recognizer above. The former Architect tab may have been
+        # closed, so production attaches without targeting that stale identity
+        # and inspects existing pages only. The isolated qualification harness
+        # retains its explicit owned-page attach restriction.
+        qualification_recovery = _qualification_context_active(watcher)
+        attach_target = watcher.state.get("architectConversationId") if qualification_recovery else None
+        bridge = ArchitectPlaywright.attach(endpoint, attach_target)
+        browser_contexts = getattr(getattr(bridge, "_browser", None), "contexts", None)
+        if browser_contexts is not None:
+            pages = [page for context in browser_contexts for page in getattr(context, "pages", [])]
+        else:
+            pages = getattr(getattr(getattr(bridge, "page", None), "context", None), "pages", [])
+        candidate_matches = []
         for page in pages:
             try:
                 page_id = architect_conversation_id_from_url(getattr(page, "url", ""))
             except (RuntimeError, StopIteration, TypeError):
                 continue
             if architect_conversation_ids_equivalent(candidate_id, page_id):
-                candidate_page = page
-                break
+                candidate_matches.append(page)
         bootstrap = fresh_architect_bootstrap_payload(handover)
-        if candidate_page is None or not watcher.session_rollover._fresh_candidate_proven(candidate_page, bootstrap, candidate_id):
+        if len(candidate_matches) != 1:
+            reason = "PERSISTED_CANDIDATE_NOT_FOUND" if not candidate_matches else "PERSISTED_CANDIDATE_AMBIGUOUS"
+            runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
+                        "EXISTING_FRESH_CANDIDATE_RECOVERY_BLOCKED", watcher.state,
+                        candidateConversationId=candidate_id, candidateMatchCount=len(candidate_matches), reason=reason,
+                        resubmitted=False)
+            return "HUMAN_REQUIRED"
+        candidate_page = candidate_matches[0]
+        if not watcher.session_rollover._fresh_candidate_proven(candidate_page, bootstrap, candidate_id):
             runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
                         "EXISTING_FRESH_CANDIDATE_RECOVERY_BLOCKED", watcher.state,
                         candidateConversationId=candidate_id, reason="EXACT_BOOTSTRAP_AND_READY_NOT_PROVEN", resubmitted=False)
             return "HUMAN_REQUIRED"
+        if not qualification_recovery:
+            # Production's untargeted attach may initially select an unrelated
+            # tab. Reconciliation must use the proven candidate instead. This
+            # makes complete_from_response see old_page is new_page, while its
+            # close guard below prevents retiring the candidate itself.
+            bridge.page = candidate_page
         runtime_log(getattr(watcher, "runtime_logger", None), getattr(watcher, "runtime_run_id", None),
                     "EXISTING_FRESH_CANDIDATE_RECOVERY_BEGIN", watcher.state,
                     candidateConversationId=candidate_id, transactionId=transaction_id,
