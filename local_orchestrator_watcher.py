@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 from rollover_state_machine import RolloverAction, RolloverDecision, RolloverObservations, evaluate_rollover_state
 from prompt_artifacts import load_verified_staged_prompt, persist_verified_prompt_artifact
+from prompt_source_artifacts import load_verified_prompt_source
+from orchestrator_result_v2 import is_attempted_v2_control, parse_v2_control_envelope
 from executor_prompt_transport import build_executor_prompt_artifact_descriptor, has_prompt_artifact_state
 
 COMPLETE = "ARCHITECT_RESPONSE_COMPLETE"
@@ -8450,7 +8452,265 @@ class LocalFirstOrchestrator:
                         taskId=task_id, errorClass=type(error).__name__, reason=str(error)[:200])
             raise RuntimeError("PROMPT_ARTIFACT_PERSISTENCE_FAILED") from error
 
+    def _persist_v2_bound_prompt_artifact(self, decision: dict[str, Any], task_id: str,
+                                          transaction_id: str, prompt_bytes: bytes) -> dict[str, Any]:
+        """Bind verified V2 source bytes without V1 transaction discovery behavior."""
+        identity = persist_verified_prompt_artifact(
+            self.prompt_artifact_repository_root,
+            task_id=task_id,
+            transaction_id=transaction_id,
+            prompt=prompt_bytes,
+            architect_conversation_id=self.state.get("architectConversationId"),
+            source="ARCHITECT_V2_VERIFIED_SOURCE",
+            classification=decision["classification"],
+            action="EXECUTE",
+        )
+        readback = load_verified_staged_prompt(self.prompt_artifact_repository_root, identity)
+        if readback != prompt_bytes:
+            raise RuntimeError("PROMPT_ARTIFACT_HASH_MISMATCH")
+        return identity
+
+    def _v2_human_required(self, reason: str, fingerprint: str,
+                           preparation: dict[str, Any] | None = None) -> dict[str, str]:
+        if preparation is not None:
+            self.state["v2AcceptancePreparation"] = preparation
+        self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": reason})
+        self.save()
+        runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                    "V2_ACCEPTANCE_BLOCKED", self.state, hash=fingerprint, reason=reason)
+        return {"action": "HUMAN_REQUIRED", "reason": reason}
+
+    def _v2_rollover_active(self, completed_task_id: str) -> bool:
+        return bool(
+            self.state.get("rolloverPending") or self.state.get("rolloverDue")
+            or self.state.get("rolloverInProgress") or self.state.get("handoverRequested")
+            or self.state.get("rolloverMaintenanceState") not in (None, "", "COMPLETE")
+            or self.state.get("rolloverAttemptedForTaskId") == completed_task_id
+            or str(self.state.get("rolloverTransactionTaskId") or "") == completed_task_id
+        )
+
+    def _accept_v2_architect_response_locked(self, response: str) -> dict[str, str]:
+        fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        consumed = self.state.setdefault("consumedArchitectResponses", {})
+        if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:
+            return {"action": "DUPLICATE"}
+        completed_task_id = str(self.state.get("taskId") or "")
+        if not completed_task_id:
+            raise ValueError("ORCHESTRATOR_RESULT_V2_TASK_MISMATCH")
+        decision = parse_v2_control_envelope(response, completed_task_id)
+        documentation = decision["documentation"]
+        pending_documentation = bool(self.state.get("documentationClosurePending"))
+        if documentation == "REQUIRED" and (decision["classification"] != "ACCEPTED" or decision["action"] != "EXECUTE"):
+            raise ValueError("DOCUMENTATION_DISPOSITION_INVALID")
+        if pending_documentation and documentation != "COMPLETE":
+            self.state.update({"state": "HUMAN_REQUIRED", "humanRequiredReason": "DOCUMENTATION_CLOSURE_REQUIRED"})
+            self.save()
+            return {"action": "HUMAN_REQUIRED", "reason": "DOCUMENTATION_CLOSURE_REQUIRED"}
+
+        if decision["action"] in {"HUMAN_REQUIRED", "STOP"}:
+            candidate = dict(self.state)
+            candidate.update({"formatRecoveryCount": 0, "formatRecoveryExhausted": False,
+                              "architectFormatRecoveryTaskId": None, "postDiscussionEnvelopeRequired": False,
+                              "postDiscussionEnvelopeRepairAwaiting": False, "postDiscussionProtocolFailure": None})
+            if documentation == "COMPLETE":
+                candidate.update({"documentationClosurePending": False,
+                                  "documentationClosureCompletedTaskId": completed_task_id,
+                                  "documentationClosureFingerprint": fingerprint})
+            if decision["action"] == "HUMAN_REQUIRED":
+                candidate.update({"architectResultFingerprint": fingerprint, "state": "HUMAN_REQUIRED",
+                                  "nextPromptPath": None, "humanRequiredReason": "ARCHITECT_DECISION_HUMAN_REQUIRED",
+                                  "architectDiscussionBaseline": candidate.get("architectBaseline")})
+            else:
+                candidate.update({"architectResultFingerprint": fingerprint, "state": "IDLE",
+                                  "nextPromptPath": None, "humanRequiredReason": None})
+            candidate.setdefault("consumedArchitectResponses", {})[fingerprint] = {
+                "taskId": completed_task_id, "classification": decision["classification"],
+                "action": decision["action"], "state": "RECEIVED",
+                "origin": "BOOTSTRAP" if candidate.get("architectBootstrapAwaiting") else "RESULT_REVIEW",
+            }
+            self.state = candidate
+            self.save()
+            return decision
+
+        if decision["classification"] != "ACCEPTED":
+            raise ValueError("ORCHESTRATOR_RESULT_V2_INVALID")
+        if documentation == "REQUIRED" and (decision["classification"] != "ACCEPTED" or decision["action"] != "EXECUTE"):
+            raise ValueError("DOCUMENTATION_DISPOSITION_INVALID")
+        if self.discussion_pause_active():
+            return self._v2_human_required("V2_AUTHORIZATION_PREPARATION_INVALID", fingerprint)
+        if self._v2_rollover_active(completed_task_id):
+            return self._v2_human_required("V2_ROLLOVER_NOT_QUALIFIED", fingerprint)
+
+        if self.state.get("state") == "NEXT_PROMPT_READY":
+            return self._v2_human_required("V2_PROMPT_CORRECTION_REQUIRED", fingerprint,
+                                           self.state.get("v2AcceptancePreparation"))
+
+        previous = self.state.get("v2AcceptancePreparation")
+        source_id = str(decision["promptSourceArtifactId"])
+        source_sha = str(decision["promptSha256"])
+        source_length = int(decision["promptByteLength"])
+        if isinstance(previous, dict):
+            same_intent = (previous.get("completedTaskId") == completed_task_id
+                           and previous.get("architectResultFingerprint") == fingerprint
+                           and previous.get("promptSourceArtifactId") == source_id
+                           and previous.get("promptSha256") == source_sha
+                           and previous.get("promptByteLength") == source_length)
+            if not same_intent:
+                return self._v2_human_required("V2_PROMPT_CORRECTION_REQUIRED", fingerprint, previous)
+
+        try:
+            prompt_bytes = load_verified_prompt_source(
+                self.prompt_artifact_repository_root, source_id, source_sha, source_length)
+        except Exception as error:
+            code = str(error).split(":", 1)[0]
+            unavailable = code == "PROMPT_SOURCE_UNAVAILABLE"
+            waiting = dict(previous or {})
+            waiting.update({"schemaVersion": 1, "completedTaskId": completed_task_id,
+                            "architectResultFingerprint": fingerprint, "promptSourceArtifactId": source_id,
+                            "promptSha256": source_sha, "promptByteLength": source_length,
+                            "documentation": documentation, "classification": decision["classification"],
+                            "taskSequenceAtReceipt": self.state.get("taskSequence", 0),
+                            "state": "WAITING_FOR_SOURCE"})
+            return self._v2_human_required("V2_PROMPT_SOURCE_UNAVAILABLE" if unavailable else "V2_PROMPT_SOURCE_INVALID",
+                                           fingerprint, waiting)
+
+        try:
+            prompt_text = prompt_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return self._v2_human_required("V2_PROMPT_SOURCE_INVALID", fingerprint, previous)
+        if hashlib.sha256(prompt_bytes).hexdigest() != source_sha or len(prompt_bytes) != source_length:
+            return self._v2_human_required("V2_PROMPT_SOURCE_INVALID", fingerprint, previous)
+
+        try:
+            calculated_next = self._canonical_next_task_id(completed_task_id)
+        except Exception:
+            return self._v2_human_required("V2_AUTHORIZATION_PREPARATION_INVALID", fingerprint, previous)
+        if previous and previous.get("state") != "WAITING_FOR_SOURCE":
+            next_id = str(previous.get("nextTaskId") or "")
+            transaction_id = str(previous.get("transactionId") or "")
+            if not next_id or not transaction_id:
+                return self._v2_human_required("V2_PROMPT_TRANSACTION_MISSING", fingerprint, previous)
+            if next_id != calculated_next:
+                return self._v2_human_required("V2_PROMPT_CORRECTION_REQUIRED", fingerprint, previous)
+            tx_raw = (completed_task_id + "\0" + next_id + "\0" + fingerprint + "\0" + source_id).encode("utf-8")
+            expected_transaction_id = "v2-accept-" + hashlib.sha256(tx_raw).hexdigest()
+            if transaction_id != expected_transaction_id:
+                return self._v2_human_required("V2_PROMPT_TRANSACTION_MISSING", fingerprint, previous)
+        else:
+            if (previous and previous.get("taskSequenceAtReceipt") != self.state.get("taskSequence", 0)):
+                return self._v2_human_required("V2_PROMPT_CORRECTION_REQUIRED", fingerprint, previous)
+            next_id = calculated_next
+            tx_raw = (completed_task_id + "\0" + next_id + "\0" + fingerprint + "\0" + source_id).encode("utf-8")
+            transaction_id = "v2-accept-" + hashlib.sha256(tx_raw).hexdigest()
+
+        preparation = {"schemaVersion": 1, "completedTaskId": completed_task_id,
+                       "nextTaskId": next_id, "transactionId": transaction_id,
+                       "architectResultFingerprint": fingerprint, "promptSourceArtifactId": source_id,
+                       "promptSha256": source_sha, "promptByteLength": source_length,
+                       "documentation": documentation, "classification": decision["classification"],
+                       "state": "PREPARING"}
+        if previous != preparation:
+            self.state["v2AcceptancePreparation"] = preparation
+            self.save()
+
+        prompt_path = self.prompts_dir / f"{next_id}.txt"
+        try:
+            target = self._owned_task_worktree(next_id, prompt_text, context_task_id=completed_task_id)
+            if target is None:
+                raise RuntimeError("EXECUTOR_PROJECT_CONTEXT_MISSING")
+            self.prompts_dir.mkdir(parents=True, exist_ok=True)
+            if prompt_path.exists() and prompt_path.read_bytes() != prompt_bytes:
+                return self._v2_human_required("V2_PROMPT_BINDING_CONFLICT", fingerprint, preparation)
+            if not prompt_path.exists():
+                atomic_write(prompt_path, prompt_bytes)
+            identity = self._persist_v2_bound_prompt_artifact(decision, next_id, transaction_id, prompt_bytes)
+        except Exception as error:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "V2_PROMPT_BINDING_FAILED", self.state, hash=fingerprint,
+                        errorClass=type(error).__name__, detail=str(error)[:200])
+            reason = "V2_PROMPT_BINDING_CONFLICT" if "CONFLICT" in str(error) or "MISMATCH" in str(error) else "V2_AUTHORIZATION_PREPARATION_INVALID"
+            return self._v2_human_required(reason, fingerprint, preparation)
+
+        try:
+            bound_bytes = load_verified_staged_prompt(self.prompt_artifact_repository_root, identity)
+            if bound_bytes != prompt_bytes:
+                raise RuntimeError("PROMPT_ARTIFACT_HASH_MISMATCH")
+        except Exception as error:
+            runtime_log(getattr(self, "runtime_logger", None), getattr(self, "runtime_run_id", None),
+                        "V2_BOUND_ARTIFACT_REVERIFY_FAILED", self.state, hash=fingerprint, detail=str(error)[:200])
+            return self._v2_human_required("V2_PROMPT_BINDING_CONFLICT", fingerprint, preparation)
+
+        candidate = dict(self.state)
+        target_text = str(target)
+        candidate.update(identity)
+        candidate.update({"architectProtocolVersion": 2, "promptTransport": "ARTIFACT_V1",
+                          "promptSourceArtifactId": source_id, "promptSourceSha256": source_sha,
+                          "promptSourceByteLength": source_length,
+                          "architectResultFingerprint": fingerprint, "state": "NEXT_PROMPT_READY",
+                          "nextPromptPath": str(prompt_path), "nextTaskId": next_id,
+                          "targetProject": target_text, "targetRepo": target_text,
+                          "targetWorktree": target_text, "humanRequiredReason": None,
+                          "formatRecoveryCount": 0, "formatRecoveryExhausted": False,
+                          "architectFormatRecoveryTaskId": None, "postDiscussionEnvelopeRequired": False,
+                          "postDiscussionEnvelopeRepairAwaiting": False, "postDiscussionProtocolFailure": None})
+        if documentation == "COMPLETE":
+            candidate.update({"documentationClosurePending": False,
+                              "documentationClosureCompletedTaskId": completed_task_id,
+                              "documentationClosureFingerprint": fingerprint})
+        elif documentation == "REQUIRED":
+            candidate.update({"documentationClosurePending": True,
+                              "documentationClosureSourceTaskId": completed_task_id,
+                              "documentationClosureTaskId": next_id})
+        candidate.setdefault("consumedArchitectResponses", {})[fingerprint] = {
+            "taskId": completed_task_id, "classification": decision["classification"],
+            "action": decision["action"], "state": "RECEIVED",
+            "origin": "BOOTSTRAP" if candidate.get("architectBootstrapAwaiting") else "RESULT_REVIEW",
+        }
+        authorized_preparation = dict(preparation)
+        authorized_preparation["state"] = "AUTHORIZED"
+        candidate["v2AcceptancePreparation"] = authorized_preparation
+        original = self.state
+        self.state = candidate
+        try:
+            self.save()
+        except Exception:
+            # Resolve a save error from durable state; never infer authority from artifacts.
+            try:
+                persisted = self._load_state()
+            except Exception:
+                self.state = original
+                raise RuntimeError("V2_AUTHORIZATION_COMMIT_AMBIGUOUS")
+            authorization_fields = {
+                "state": "NEXT_PROMPT_READY", "nextTaskId": next_id,
+                "promptArtifactId": identity.get("promptArtifactId"),
+                "promptTaskId": next_id, "promptTransactionId": transaction_id,
+                "promptSha256": source_sha, "promptByteLength": source_length,
+                "promptState": "STAGED", "architectProtocolVersion": 2,
+                "promptTransport": "ARTIFACT_V1", "promptSourceArtifactId": source_id,
+                "promptSourceSha256": source_sha, "promptSourceByteLength": source_length,
+                "architectResultFingerprint": fingerprint,
+            }
+            if (all(persisted.get(key) == value for key, value in authorization_fields.items())
+                    and isinstance(persisted.get("consumedArchitectResponses"), dict)
+                    and fingerprint in persisted["consumedArchitectResponses"]
+                    and isinstance(persisted.get("v2AcceptancePreparation"), dict)
+                    and persisted["v2AcceptancePreparation"].get("state") == "AUTHORIZED"):
+                self.state = persisted
+                return decision
+            if (persisted.get("state") != "NEXT_PROMPT_READY"
+                    and isinstance(persisted.get("v2AcceptancePreparation"), dict)
+                    and persisted["v2AcceptancePreparation"].get("architectResultFingerprint") == fingerprint
+                    and fingerprint not in (persisted.get("consumedArchitectResponses") or {})):
+                self.state = persisted
+                return self._v2_human_required("V2_AUTHORIZATION_PREPARATION_INVALID", fingerprint,
+                                               persisted["v2AcceptancePreparation"])
+            self.state = original
+            raise RuntimeError("V2_AUTHORIZATION_COMMIT_AMBIGUOUS")
+        return decision
+
     def _accept_architect_response_locked(self, response: str) -> dict[str, str]:
+        if is_attempted_v2_control(response):
+            return self._accept_v2_architect_response_locked(response)
         fingerprint = hashlib.sha256(response.encode("utf-8")).hexdigest()
         consumed = self.state.setdefault("consumedArchitectResponses", {})
         if fingerprint == self.state.get("architectResultFingerprint") or fingerprint in consumed:

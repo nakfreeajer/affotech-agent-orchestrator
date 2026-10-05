@@ -142,3 +142,54 @@ def ingest_verified_prompt_source(
         "manifestPath": str(manifest_path),
         "artifactState": _ARTIFACT_STATE,
     }
+
+
+def load_verified_prompt_source(
+    repository_root: str | os.PathLike[str],
+    prompt_source_artifact_id: str,
+    prompt_sha256: str,
+    prompt_byte_length: int,
+) -> bytes:
+    """Load one source artifact by its declared identity and reverify it."""
+    match = _ID_RE.fullmatch(prompt_source_artifact_id or "")
+    if not match or not isinstance(prompt_sha256, str) or not _SHA_RE.fullmatch(prompt_sha256):
+        _fail("PROMPT_SOURCE_ID_INVALID")
+    if match.group(1) != prompt_sha256:
+        _fail("PROMPT_SOURCE_ID_MISMATCH")
+    if isinstance(prompt_byte_length, bool) or not isinstance(prompt_byte_length, int) or prompt_byte_length <= 0:
+        _fail("PROMPT_SOURCE_LENGTH_INVALID")
+    root = _root(repository_root)
+    artifact_path = root / f"{prompt_sha256}.md"
+    manifest_path = root / f"{prompt_sha256}.json"
+    try:
+        resolved_root = root.resolve()
+        if artifact_path.resolve().parent != resolved_root or manifest_path.resolve().parent != resolved_root:
+            _fail("PROMPT_SOURCE_PATH_INVALID")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="strict"))
+        data = artifact_path.read_bytes()
+    except RuntimeError:
+        raise
+    except FileNotFoundError as error:
+        raise RuntimeError("PROMPT_SOURCE_UNAVAILABLE") from error
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("PROMPT_SOURCE_MANIFEST_INVALID") from error
+    expected_manifest = {
+        "schemaVersion": 1,
+        "promptSourceArtifactId": prompt_source_artifact_id,
+        "promptSha256": prompt_sha256,
+        "promptByteLength": prompt_byte_length,
+        "encoding": "UTF-8",
+        "promptSourceArtifactPath": str(artifact_path),
+        "artifactState": _ARTIFACT_STATE,
+    }
+    if not isinstance(manifest, dict) or manifest != expected_manifest:
+        _fail("PROMPT_SOURCE_MANIFEST_INVALID")
+    if len(data) != prompt_byte_length:
+        _fail("PROMPT_SOURCE_LENGTH_MISMATCH")
+    if hashlib.sha256(data).hexdigest() != prompt_sha256:
+        _fail("PROMPT_SOURCE_HASH_MISMATCH")
+    try:
+        data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("PROMPT_SOURCE_UTF8_INVALID") from error
+    return data

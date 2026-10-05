@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 
-from orchestrator_result_v2 import parse_dual_protocol_control, parse_v2_control_envelope
+from orchestrator_result_v2 import is_attempted_v2_control, parse_dual_protocol_control, parse_v2_control_envelope
 
 
 TASK = "000102"
@@ -67,3 +67,10 @@ def test_explicit_malformed_v2_never_falls_back_to_v1():
 
 def test_dual_api_routes_valid_v2():
     assert parse_dual_protocol_control(EXECUTE, TASK)["protocolVersion"] == 2
+
+
+def test_v2_only_fields_are_attempted_v2_without_schema_and_do_not_fall_through():
+    text = EXECUTE.replace("schemaVersion=2\n", "")
+    assert is_attempted_v2_control(text)
+    with pytest.raises(ValueError):
+        parse_dual_protocol_control(text, TASK)

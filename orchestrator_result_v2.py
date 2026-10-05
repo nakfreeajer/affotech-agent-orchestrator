@@ -14,7 +14,7 @@ _DOC = r"(?:NOT_REQUIRED|REQUIRED|COMPLETE)"
 _DIGEST = r"[0-9a-f]{64}"
 _OPEN = "<ORCHESTRATOR_RESULT>"
 _CLOSE = "</ORCHESTRATOR_RESULT>"
-_V2_HEADER_RE = re.compile(r"(?m)^schemaVersion=")
+_V2_MARKER_RE = re.compile(r"(?m)^(?:schemaVersion|promptTransport|promptSourceArtifactId|promptSha256|promptByteLength)=")
 _V2_EXECUTE_RE = re.compile(
     rf"{re.escape(_OPEN)}\n"
     rf"schemaVersion=2\nclassification=({_CLASS})\n"
@@ -77,10 +77,7 @@ def parse_dual_protocol_control(text: str, completed_task_id: str) -> dict[str, 
     """Qualification API that selects v2 explicitly and delegates v1 unchanged."""
     if not isinstance(text, str):
         raise ValueError("ORCHESTRATOR_RESULT_INVALID")
-    opening = text.find(_OPEN)
-    closing = text.find(_CLOSE, opening + len(_OPEN)) if opening >= 0 else -1
-    header = text[opening + len(_OPEN):closing] if opening >= 0 and closing >= 0 else ""
-    if _V2_HEADER_RE.search(header):
+    if is_attempted_v2_control(text):
         parsed = parse_v2_control_envelope(text, completed_task_id)
         return parsed
 
@@ -89,3 +86,17 @@ def parse_dual_protocol_control(text: str, completed_task_id: str) -> dict[str, 
 
     result = parse_orchestrator_result(text, completed_task_id)
     return {"protocolVersion": 1, **result}
+
+
+def is_attempted_v2_control(text: str) -> bool:
+    """Return true for explicit v2 or v2-only fields in the envelope header."""
+    if not isinstance(text, str):
+        return False
+    opening = text.find(_OPEN)
+    if opening < 0:
+        return False
+    closing = text.find(_CLOSE, opening + len(_OPEN))
+    begin = text.find("promptBegin", opening + len(_OPEN), closing if closing >= 0 else len(text))
+    header_end = begin if begin >= 0 else (closing if closing >= 0 else len(text))
+    header = text[opening + len(_OPEN):header_end]
+    return _V2_MARKER_RE.search(header) is not None

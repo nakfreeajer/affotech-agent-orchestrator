@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from prompt_source_artifacts import ingest_verified_prompt_source
+from prompt_source_artifacts import ingest_verified_prompt_source, load_verified_prompt_source
 
 
 def ingress(root, data, **overrides):
@@ -114,3 +114,30 @@ def test_state_isolation_and_no_task_binding(tmp_path):
     assert state.read_bytes() == before
     assert not any(key in result for key in ("taskId", "transactionId", "promptArtifactId"))
     assert not (tmp_path / ".agent-work" / "prompts").exists()
+
+
+def test_verified_source_loader_rechecks_identity_manifest_and_bytes(tmp_path):
+    data = "exact café\r\nbytes".encode("utf-8")
+    identity = ingress(tmp_path, data)
+    assert load_verified_prompt_source(tmp_path, identity["promptSourceArtifactId"],
+                                       identity["promptSha256"], identity["promptByteLength"]) == data
+    artifact = tmp_path / ".agent-work" / "prompt-ingress" / f"{identity['promptSha256']}.md"
+    artifact.write_bytes(data[:-1])
+    with pytest.raises(RuntimeError, match="PROMPT_SOURCE_LENGTH_MISMATCH|PROMPT_SOURCE_HASH_MISMATCH"):
+        load_verified_prompt_source(tmp_path, identity["promptSourceArtifactId"],
+                                    identity["promptSha256"], identity["promptByteLength"])
+
+
+def test_verified_source_loader_rejects_manifest_identity_and_missing_artifact(tmp_path):
+    data = b"source"
+    identity = ingress(tmp_path, data)
+    root = tmp_path / ".agent-work" / "prompt-ingress"
+    manifest = root / f"{identity['promptSha256']}.json"
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    record["artifactState"] = "AUTHORIZED"
+    manifest.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="PROMPT_SOURCE_MANIFEST_INVALID"):
+        load_verified_prompt_source(tmp_path, identity["promptSourceArtifactId"], identity["promptSha256"], len(data))
+    manifest.unlink()
+    with pytest.raises(RuntimeError, match="PROMPT_SOURCE_UNAVAILABLE"):
+        load_verified_prompt_source(tmp_path, identity["promptSourceArtifactId"], identity["promptSha256"], len(data))
