@@ -7081,6 +7081,24 @@ class LocalFirstOrchestrator:
     def _restore_machine_protocol_after_discussion(self) -> None:
         """Durably create one machine-protocol epoch for the current task."""
         with self._state_lock:
+            if (self.discussion_pause_active()
+                    and _ambiguous_fresh_candidate_recovery_eligible(self)):
+                # F10 only releases the pause for this already-established,
+                # exact protected recovery. Its protocol/rollover ownership
+                # must remain untouched for the bounded recovery path.
+                prior_state = dict(self.state)
+                self.state["discussionPauseActive"] = False
+                resumed_marker = False
+                try:
+                    self.save()
+                    self._write_discussion_pause_marker(resumed_marker)
+                except Exception:
+                    self.state = prior_state
+                    try:
+                        self.save()
+                    finally:
+                        raise
+                return
             staged_task_id = self._exact_staged_prompt_recovery_task()
             task_id = staged_task_id or str(self.state.get("taskId") or self.state.get("nextTaskId") or "")
             needs_protocol = (

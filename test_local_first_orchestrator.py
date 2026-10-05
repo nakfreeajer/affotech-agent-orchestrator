@@ -10087,6 +10087,124 @@ def _epoch4_sent_incident_fixture(tmp_path):
     return watcher, prompt, prompt_bytes
 
 
+def test_f10_preserves_exact_protected_epoch5_recovery_context(tmp_path, monkeypatch):
+    watcher, prompt, prompt_bytes = _epoch4_sent_incident_fixture(tmp_path)
+    tx = watcher_module.LEGACY_COMPAT_TRANSACTION_ID
+    fresh_id = "6ab8b6d4-1628-83ec-9079-670b78f653f2"
+    handover = (
+        "AFFOTECH ARCHITECT SESSION HANDOVER\n"
+        "Preserved existing transaction for the exact staged task.\n"
+        f"Rollover transaction ID: {tx}\nTarget task 000103.\nARCHITECT_HANDOVER_READY"
+    )
+    bootstrap = watcher_module.fresh_architect_bootstrap_payload(handover)
+    authorization = {
+        "transactionId": tx, "taskId": "000103", "priorEpoch": 4,
+        "qualificationEpoch": 5, "executorLaunchAuthorized": False,
+        "requiresNormalRolloverCompletion": True,
+    }
+    watcher.state.update({
+        "state": "HUMAN_REQUIRED",
+        "humanRequiredReason": "ARCHITECT_PROTOCOL_ENVELOPE_REPAIR_FAILED",
+        "postDiscussionProtocolFailure": "ARCHITECT_STAGED_PROMPT_EVIDENCE_INVALID",
+        "taskId": "000102", "lastCompletedTaskId": "000102", "taskSequence": 102,
+        "nextTaskId": "000103", "nextPromptPath": str(prompt),
+        "rolloverTransactionId": tx, "rolloverTransactionTaskId": "000103",
+        "rolloverRecoveryEpoch": 5, "rolloverAutomaticRecoveryEpochCount": 3,
+        "rolloverAutomaticRecoveryMaxEpochs": 3,
+        "rolloverLegacyHandoverReemissionTransactionId": tx,
+        "rolloverLegacyHandoverReemissionAttemptedEpoch": 5,
+        "rolloverLegacyHandoverReemissionState": "WAIT_TIMEOUT",
+        "rolloverDue": True, "rolloverPending": True, "rolloverInProgress": False,
+        "handoverRequested": False, "rolloverHandoverSendState": "AMBIGUOUS",
+        "rolloverMaintenanceState": "DEFERRED",
+        "rolloverFreshPageCreated": True,
+        "rolloverFreshCandidateConversationId": fresh_id,
+        "rolloverFreshCandidateState": "SUBMISSION_AMBIGUOUS",
+        "rolloverFreshBootstrapPayloadHash": hashlib.sha256(bootstrap.encode()).hexdigest(),
+        "rolloverHandoverResponseIdentity": hashlib.sha256(handover.encode()).hexdigest(),
+        "pending_handover": handover,
+        "rolloverSentResponseRetryAuthorization": authorization,
+        "rolloverSentResponseRetryAuthorizations": [authorization],
+        "postDiscussionEnvelopeRequired": True,
+        "postDiscussionResumeEpoch": 7,
+        "postDiscussionResumePauseEpoch": 6,
+        "postDiscussionProtocolTaskId": "000103",
+        "postDiscussionProtocolTransactionId": tx,
+        "postDiscussionProtocolRolloverCommittedTransactionId": None,
+        "postDiscussionEnvelopeRepairAttempted": False,
+        "postDiscussionEnvelopeRepairAwaiting": False,
+        "postDiscussionEnvelopeRepairTaskId": "000103",
+        "postDiscussionEnvelopeRepairEpoch": 7,
+        "discussionPauseActive": True,
+        "discussionPauseEpoch": 8,
+        "executorSessionId": watcher_module.AFFOTECH_EXECUTOR_SESSION_ID,
+        "executorSessionMode": "PERSISTENT",
+        "executorProcessState": "COMPLETED_WITH_RESULT",
+        "executorLaunchState": "LAUNCHED",
+        "executorActiveWriter": False,
+        "governedExecutorActiveWriter": False,
+        "architectConversationId": "6ab532e4-d274-83ec-b684-5dc204d84661",
+    })
+    watcher._write_discussion_pause_marker(True)
+    watcher.save()
+    monkeypatch.setattr(LocalWatcher, "process_alive", staticmethod(lambda _pid: False))
+    assert prompt.read_bytes() == prompt_bytes
+    assert watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher)
+
+    preserved_fields = (
+        "state", "humanRequiredReason", "taskId", "lastCompletedTaskId", "taskSequence",
+        "nextTaskId", "nextPromptPath", "rolloverTransactionId", "rolloverTransactionTaskId",
+        "rolloverRecoveryEpoch", "rolloverAutomaticRecoveryEpochCount",
+        "rolloverAutomaticRecoveryMaxEpochs", "rolloverLegacyHandoverReemissionTransactionId",
+        "rolloverLegacyHandoverReemissionAttemptedEpoch", "rolloverLegacyHandoverReemissionState",
+        "rolloverDue", "rolloverPending", "rolloverInProgress", "handoverRequested",
+        "rolloverHandoverSendState", "rolloverMaintenanceState", "rolloverFreshPageCreated",
+        "rolloverFreshCandidateConversationId", "rolloverFreshCandidateState",
+        "rolloverFreshBootstrapPayloadHash", "rolloverHandoverResponseIdentity", "pending_handover",
+        "rolloverSentResponseRetryAuthorization", "rolloverSentResponseRetryAuthorizations",
+        "postDiscussionEnvelopeRequired", "postDiscussionResumeEpoch", "postDiscussionProtocolTaskId",
+        "postDiscussionProtocolTransactionId", "postDiscussionProtocolRolloverCommittedTransactionId",
+        "postDiscussionEnvelopeRepairAttempted", "postDiscussionEnvelopeRepairAwaiting",
+        "postDiscussionEnvelopeRepairTaskId", "postDiscussionEnvelopeRepairEpoch",
+        "postDiscussionProtocolFailure", "architectConversationId", "executorSessionId",
+        "executorSessionMode", "executorProcessState", "executorLaunchState", "executorActiveWriter",
+        "governedExecutorActiveWriter", "taskWorktrees",
+    )
+    before = json.loads(json.dumps({key: watcher.state.get(key) for key in preserved_fields}))
+    prompt_sha = hashlib.sha256(prompt_bytes).hexdigest().upper()
+    recovery_calls = []
+    monkeypatch.setattr(
+        watcher_module, "_recover_ambiguous_fresh_candidate_once",
+        lambda *_args, **_kwargs: recovery_calls.append(True),
+    )
+    monkeypatch.setattr(
+        ArchitectPlaywright, "attach",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("F10 must not attach a browser"))),
+    )
+    controller = DiscussionHotkeyController(watcher, emit=lambda _message: None)
+    assert controller.dispatch("F10") is True
+    assert watcher.discussion_pause_active() is False
+    assert watcher.state["discussionPauseActive"] is False
+    assert (watcher.state_dir / "discussion-pause.marker").read_text(encoding="ascii").strip() == "RESUMED"
+    assert watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher)
+    assert {key: watcher.state.get(key) for key in preserved_fields} == before
+    assert watcher.state["postDiscussionProtocolTaskId"] == "000103"
+    assert watcher.state["postDiscussionProtocolTransactionId"] == tx
+    assert watcher.state["postDiscussionResumeEpoch"] == 7
+    assert watcher.state["postDiscussionEnvelopeRepairTaskId"] == "000103"
+    assert hashlib.sha256(prompt.read_bytes()).hexdigest().upper() == prompt_sha
+    assert recovery_calls == []
+
+    resumed_state = json.loads(json.dumps(watcher.state))
+    resumed_state_bytes = watcher.state_path.read_bytes()
+    assert controller.dispatch("F10") is True
+    assert watcher.state == resumed_state
+    assert watcher.state_path.read_bytes() == resumed_state_bytes
+    assert watcher_module._ambiguous_fresh_candidate_recovery_eligible(watcher)
+    assert watcher.discussion_pause_active() is False
+    assert recovery_calls == []
+
+
 def _epoch4_request_log_line():
     return (
         "2026-09-27 00:55:54,235 level=INFO runId=20260927-005538-19332 "
